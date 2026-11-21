@@ -1,56 +1,180 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import test from "node:test";
+import type { TranscriptContext } from "@earendil-works/pi-ai";
 import {
-  AGY_MAX_INPUT_BYTES,
-  assembleBoundedAgyPrompt,
-  boundRestoredPiTranscript,
-  restoredPiContextPrompt,
-  stripPiToolInventory,
-  utf8Tail,
-} from "../lib/prompt.ts";
+  collectTurnToolResults,
+  extractSystemPromptAppend,
+  extractTrailingUserPrompt,
+} from "../src/provider/prompt.ts";
+import {
+  AGY_STATE_ENTRY_TYPE,
+  findActiveAgyConversation,
+  parseAgyStateEntry,
+} from "../src/provider/state.ts";
 
-test("utf8Tail keeps valid UTF-8 codepoint boundaries", () => {
-  const emoji = "🚀".repeat(10); // 4 bytes each = 40 bytes
-  const tail = utf8Tail(emoji, 10);
-  assert.ok(Buffer.byteLength(tail, "utf8") <= 10);
-  assert.equal(tail, "🚀🚀");
-});
+function asTranscript(messages: TranscriptContext["messages"]): TranscriptContext["messages"] {
+  return messages;
+}
 
-test("assembleBoundedAgyPrompt preserves user request while trimming historyBootstrap first", () => {
-  const hugeHistory = restoredPiContextPrompt("Line of prior chat history.\n".repeat(12_000));
-  assert.ok(Buffer.byteLength(hugeHistory, "utf8") > AGY_MAX_INPUT_BYTES);
-
-  const bounded = assembleBoundedAgyPrompt(
+test("extractSystemPromptAppend strips tools, skills, and cwd structurally without regex", () => {
+  const messages = asTranscript([
     {
-      historyBootstrap: hugeHistory,
-      prompt: "CRITICAL USER REQUEST: do not drop this",
+      role: "system",
+      content: "Base instructions.",
+      sections: {
+        tools: "Available tools:\n- bash\n- read",
+        skills: "<available_skills>foo</available_skills>",
+        cwd: "/tmp/work",
+        projectContext: "# Project Rules\nFollow strict types.",
+      },
+      timestamp: 1,
     },
-    AGY_MAX_INPUT_BYTES,
+    {
+      role: "system",
+      content: "",
+      sections: {
+        hindsight: "Recall enabled.",
+      },
+      timestamp: 2,
+    },
+  ]);
+
+  const append = extractSystemPromptAppend(messages);
+  assert.equal(
+    append,
+    "Base instructions.\n\n# Project Rules\nFollow strict types.\n\nRecall enabled.",
   );
-
-  assert.ok(Buffer.byteLength(bounded, "utf8") <= AGY_MAX_INPUT_BYTES);
-  assert.ok(bounded.endsWith("CRITICAL USER REQUEST: do not drop this"));
-  assert.ok(bounded.includes("Restored pi conversation context"));
+  assert.equal(append?.includes("Available tools"), false);
+  assert.equal(append?.includes("available_skills"), false);
+  assert.equal(append?.includes("/tmp/work"), false);
 });
 
-test("boundRestoredPiTranscript omits history when budget is too small", () => {
-  assert.equal(boundRestoredPiTranscript("hello world", 5), undefined);
+test("extractTrailingUserPrompt merges contiguous user turns, strips system messages, and caps UTF-8 bytes", () => {
+  const messages = asTranscript([
+    {
+      role: "assistant",
+      content: [],
+      api: "a",
+      provider: "antigravity",
+      model: "m",
+      usage: {} as never,
+      stopReason: "stop",
+      timestamp: 1,
+    },
+    { role: "user", content: "<memory>recalled context</memory>", timestamp: 2 },
+    { role: "system", content: "mid notification", timestamp: 3 },
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "actual user prompt" },
+        { type: "image", data: "Zm9v", mimeType: "image/png" },
+      ],
+      timestamp: 4,
+    },
+  ]);
+
+  const blocks = extractTrailingUserPrompt(messages, { allowImages: true });
+  assert.deepEqual(blocks, [
+    { type: "text", text: "<memory>recalled context</memory>" },
+    { type: "text", text: "actual user prompt" },
+    { type: "image", data: "Zm9v", mimeType: "image/png" },
+  ]);
+
+  const textOnly = extractTrailingUserPrompt(messages, { allowImages: false });
+  assert.equal(textOnly[2]?.type, "text");
+
+  const huge = asTranscript([
+    { role: "user", content: "prefix ".repeat(500), timestamp: 1 },
+    { role: "user", content: "final question", timestamp: 2 },
+  ]);
+  const capped = extractTrailingUserPrompt(huge, { maxBytes: 200 });
+  const totalBytes = capped.reduce(
+    (sum, b) => sum + (b.type === "text" ? Buffer.byteLength(b.text, "utf8") : 0),
+    0,
+  );
+  assert.ok(totalBytes <= 200);
+  const last = capped.at(-1);
+  assert.equal(last?.type === "text" ? last.text : "", "final question");
 });
 
-test("stripPiToolInventory removes Pi tool list boilerplate", () => {
-  const raw = [
-    "Available tools:",
-    "- read: Read file contents",
-    "- bash: Execute bash commands",
-    "",
-    "In addition to the tools above, you have access to:",
-    "- skills",
-    "",
-    "Guidelines:",
-    "- Keep code clean.",
-  ].join("\n");
+test("collectTurnToolResults gathers trailing matching tool results", () => {
+  const results = collectTurnToolResults(
+    asTranscript([
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "c1", name: "read", arguments: {} }],
+        api: "a",
+        provider: "antigravity",
+        model: "m",
+        usage: {} as never,
+        stopReason: "toolUse",
+        timestamp: 1,
+      },
+      {
+        role: "toolResult",
+        toolCallId: "c1",
+        toolName: "read",
+        content: [{ type: "text", text: "ok" }],
+        isError: false,
+        timestamp: 2,
+      },
+      { role: "system", content: "ignored", timestamp: 3 },
+    ]),
+    new Set(["c1"]),
+  );
+  assert.equal(results.length, 1);
+  assert.equal(results[0]?.callId, "c1");
+});
 
-  const stripped = stripPiToolInventory(raw);
-  assert.equal(stripped.includes("Read file contents"), false);
-  assert.ok(stripped.includes("Keep code clean."));
+test("findActiveAgyConversation enforces session ownership and invalidation markers", () => {
+  const validMarker = {
+    type: "custom",
+    customType: AGY_STATE_ENTRY_TYPE,
+    data: {
+      version: 1,
+      kind: "conversation",
+      sessionId: "pi-1",
+      conversationId: "acp-1",
+      cwd: "/work",
+      modelId: "gemini-4-hydrogen",
+      turns: 2,
+      usage: { input_tokens: 10 },
+    },
+  };
+
+  assert.equal(parseAgyStateEntry({ version: 2 }), undefined);
+  assert.equal(findActiveAgyConversation("pi-1", "/work", [validMarker])?.conversationId, "acp-1");
+  assert.equal(
+    findActiveAgyConversation("pi-1", "/work", [validMarker, { type: "model_change" }])
+      ?.conversationId,
+    "acp-1",
+  );
+  assert.equal(findActiveAgyConversation("pi-fork", "/work", [validMarker]), undefined);
+  assert.equal(findActiveAgyConversation("pi-1", "/other", [validMarker]), undefined);
+  assert.equal(
+    findActiveAgyConversation("pi-1", "/work", [
+      validMarker,
+      { type: "message", message: { role: "user" } },
+    ])?.conversationId,
+    "acp-1",
+  );
+  assert.equal(
+    findActiveAgyConversation("pi-1", "/work", [
+      validMarker,
+      { type: "message", message: { role: "assistant" } },
+      { type: "message", message: { role: "user" } },
+    ]),
+    undefined,
+  );
+  assert.equal(
+    findActiveAgyConversation("pi-1", "/work", [
+      validMarker,
+      {
+        type: "custom",
+        customType: AGY_STATE_ENTRY_TYPE,
+        data: { version: 1, kind: "reset", sessionId: "pi-1", cwd: "/work" },
+      },
+    ]),
+    undefined,
+  );
 });

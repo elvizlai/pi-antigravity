@@ -21,8 +21,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { ImageContent, JsonObject, TextContent } from "@earendil-works/pi-ai";
-import { WRAPPER_TOOL_NAME } from "./prompt.ts";
-import type { AgyToolMode } from "./tool-mode.ts";
+export const WRAPPER_TOOL_NAME = "antigravity";
+export type AgyToolMode = "pi" | "native";
 
 export const BRIDGE_SERVER_NAME = "pi-bridge";
 export const BRIDGE_TOOL_PREFIX = "pi__";
@@ -232,6 +232,10 @@ export class AgyPiBridge {
 
   get pendingCount(): number {
     return this.#pending.size;
+  }
+
+  get pendingCallIds(): string[] {
+    return [...this.#pending.keys()];
   }
 
   start(): Promise<void> {

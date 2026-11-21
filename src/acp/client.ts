@@ -1,13 +1,13 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import {
-  installAgyDeathHooks,
-  killAgyTree,
-  trackAgyChild,
-  untrackAgyChild,
-} from "./agy-children.ts";
-import { withAgyAutoUpdateDisabled } from "./diagnostics.ts";
+import { withAgyAutoUpdateDisabled } from "./binary.ts";
 import type { AgyAcpConfigOption } from "./models.ts";
+import {
+  killProcessTree,
+  registerProcessGroupDeathHooks,
+  trackProcessGroup,
+  untrackProcessGroup,
+} from "./process-tree.ts";
 
 export type AcpContentBlock =
   | { type: "text"; text: string }
@@ -178,12 +178,14 @@ export class AgyAcpClient {
     const spawner = options.spawnProcess ?? spawn;
     this.#child = spawner(options.binary, args, {
       cwd: options.cwd,
-      env: withAgyAutoUpdateDisabled(options.env),
+      env: withAgyAutoUpdateDisabled(
+        options.env ? { ...process.env, ...options.env } : process.env,
+      ),
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
     });
-    installAgyDeathHooks();
-    trackAgyChild(this.#child);
+    registerProcessGroupDeathHooks();
+    trackProcessGroup(this.#child.pid);
 
     // Guard against unhandled EPIPE if agy closes stdin right as we write.
     this.#child.stdin.on("error", () => {});
@@ -204,7 +206,7 @@ export class AgyAcpClient {
         if (this.#exited) return;
         this.#exited = true;
         rl.close();
-        untrackAgyChild(this.#child);
+        untrackProcessGroup(this.#child.pid);
         this.#exitError = err;
         for (const [id, pending] of this.#pending.entries()) {
           this.#pending.delete(id);
@@ -566,7 +568,7 @@ export class AgyAcpClient {
       }),
     ]);
     if (!exitedEarly && !this.#exited) {
-      killAgyTree(this.#child);
+      killProcessTree(this.#child.pid);
       const exitedAfterKill = await Promise.race([
         this.#exitPromise.then(() => true),
         new Promise<boolean>((resolve) => {

@@ -6,11 +6,11 @@ import path from "node:path";
 import { gte, prerelease, rcompare, valid } from "semver";
 import which from "which";
 import {
-  installAgyDeathHooks,
-  killAgyTree,
-  trackAgyChild,
-  untrackAgyChild,
-} from "./agy-children.ts";
+  killProcessTree,
+  registerProcessGroupDeathHooks,
+  trackProcessGroup,
+  untrackProcessGroup,
+} from "./process-tree.ts";
 
 /** Minimum `agy` CLI version required for `agy acp` (`--process-per-session`, `_meta`, `session/resume`). */
 export const MIN_AGY_VERSION = "1.5.0";
@@ -118,8 +118,8 @@ function defaultVersionRunner(binary: string, signal?: AbortSignal): Promise<str
       detached: process.platform !== "win32",
       env: withAgyAutoUpdateDisabled(),
     });
-    installAgyDeathHooks();
-    trackAgyChild(child);
+    registerProcessGroupDeathHooks();
+    trackProcessGroup(child.pid);
 
     let stdout = "";
     let stderr = "";
@@ -130,13 +130,13 @@ function defaultVersionRunner(binary: string, signal?: AbortSignal): Promise<str
       settled = true;
       clearTimeout(timeout);
       signal?.removeEventListener("abort", onAbort);
-      untrackAgyChild(child);
+      untrackProcessGroup(child.pid);
       if (err) reject(err);
       else resolve(`${stdout}\n${stderr}`.trim());
     };
 
     const onAbort = () => {
-      killAgyTree(child);
+      killProcessTree(child.pid);
       const err = new Error("Antigravity version probe aborted.");
       err.name = "AbortError";
       finish(err);
@@ -149,7 +149,7 @@ function defaultVersionRunner(binary: string, signal?: AbortSignal): Promise<str
     signal?.addEventListener("abort", onAbort, { once: true });
 
     const timeout = setTimeout(() => {
-      killAgyTree(child);
+      killProcessTree(child.pid);
       finish(
         new Error(`Timed out waiting for \`${binary} --version\` after ${AGY_PROBE_TIMEOUT_MS}ms.`),
       );
@@ -232,35 +232,4 @@ export function sortVersionsDesc(versions: readonly string[]): string[] {
     if (Boolean(pa) !== Boolean(pb)) return pa ? 1 : -1;
     return rcompare(va, vb);
   });
-}
-
-/** Format a human-readable `/agy-doctor` diagnostic summary. */
-export function formatAgyDoctorReport(input: {
-  binary?: string;
-  version?: string;
-  binaryError?: string;
-  toolMode: string;
-  executionMode: string;
-  conversationId?: string;
-  bridgeStatus: string;
-  acpConnected: boolean;
-  mcpServerCount: number;
-  quotaError?: string;
-}): string {
-  const lines = ["Antigravity ACP Diagnostics (/agy-doctor)"];
-  if (input.binaryError) {
-    lines.push(`- Binary: ERROR — ${input.binaryError}`);
-  } else {
-    lines.push(`- Binary: ${input.binary ?? "unknown"} (v${input.version ?? "?"})`);
-  }
-  lines.push(`- Transport: agy acp (${input.acpConnected ? "connected" : "idle"})`);
-  lines.push(`- Tool mode: ${input.toolMode}`);
-  lines.push(`- Execution mode: ${input.executionMode}`);
-  lines.push(`- Conversation: ${input.conversationId ?? "(new on next turn)"}`);
-  lines.push(`- Pi tool bridge: ${input.bridgeStatus}`);
-  lines.push(`- Active workspace/global MCP bridges: ${input.mcpServerCount}`);
-  if (input.quotaError) {
-    lines.push(`- Quota warning: ${input.quotaError}`);
-  }
-  return lines.join("\n");
 }

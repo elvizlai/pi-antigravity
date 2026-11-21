@@ -217,3 +217,50 @@ export function summarizeAgyResult(tool: string, output: string | undefined): Ag
   }
   return {};
 }
+
+/**
+ * Compute the next active-tool list after a model switch, or `undefined` when
+ * the wrapper's activation already matches the selected provider.
+ */
+export function wrapperToolActiveAfterModelSwitch(
+  activeTools: readonly string[],
+  wrapperTool: string,
+  provider: string | undefined,
+  wrapperProvider: string,
+): readonly string[] | undefined {
+  const want = provider === wrapperProvider;
+  const has = activeTools.includes(wrapperTool);
+  if (want === has) return undefined;
+  return want ? [...activeTools, wrapperTool] : activeTools.filter((name) => name !== wrapperTool);
+}
+
+/** Format a human-readable `/agy-doctor` diagnostic summary. */
+export function formatAgyDoctorReport(input: {
+  binary?: string;
+  version?: string;
+  binaryError?: string;
+  toolMode: string;
+  executionMode: string;
+  conversationId?: string;
+  bridgeStatus: string;
+  acpConnected: boolean;
+  mcpServerCount: number;
+  quotaError?: string;
+}): string {
+  const lines = ["Antigravity ACP Diagnostics (/agy-doctor)"];
+  if (input.binaryError) {
+    lines.push(`- Binary: ERROR — ${input.binaryError}`);
+  } else {
+    lines.push(`- Binary: ${input.binary ?? "unknown"} (v${input.version ?? "?"})`);
+  }
+  lines.push(`- Transport: agy acp (${input.acpConnected ? "connected" : "idle"})`);
+  lines.push(`- Tool mode: ${input.toolMode}`);
+  lines.push(`- Execution mode: ${input.executionMode}`);
+  lines.push(`- Conversation: ${input.conversationId ?? "(new on next turn)"}`);
+  lines.push(`- Pi tool bridge: ${input.bridgeStatus}`);
+  lines.push(`- Active bridged Pi tools: ${input.mcpServerCount}`);
+  if (input.quotaError) {
+    lines.push(`- Quota warning: ${input.quotaError}`);
+  }
+  return lines.join("\n");
+}

@@ -1,13 +1,14 @@
 import { spawn } from "node:child_process";
 import type { Model } from "@earendil-works/pi-ai";
+import { getAgyBinary, withAgyAutoUpdateDisabled } from "./binary.ts";
 import {
-  installAgyDeathHooks,
-  killAgyTree,
-  trackAgyChild,
-  untrackAgyChild,
-} from "./agy-children.ts";
-import { getAgyBinary, withAgyAutoUpdateDisabled } from "./diagnostics.ts";
-import type { AgyExecutionMode } from "./profile.ts";
+  killProcessTree,
+  registerProcessGroupDeathHooks,
+  trackProcessGroup,
+  untrackProcessGroup,
+} from "./process-tree.ts";
+
+export type AgyExecutionMode = "agent" | "plan";
 
 export type AgyEffort = "low" | "medium" | "high" | "xhigh";
 
@@ -272,8 +273,8 @@ export async function probeAgyModels(options?: {
       detached: process.platform !== "win32",
       env: withAgyAutoUpdateDisabled(),
     });
-    installAgyDeathHooks();
-    trackAgyChild(child);
+    registerProcessGroupDeathHooks();
+    trackProcessGroup(child.pid);
 
     let stdout = "";
     let stderr = "";
@@ -284,13 +285,13 @@ export async function probeAgyModels(options?: {
       settled = true;
       clearTimeout(timer);
       options?.signal?.removeEventListener("abort", onAbort);
-      untrackAgyChild(child);
+      untrackProcessGroup(child.pid);
       if (err) reject(err);
       else resolve(models ?? []);
     };
 
     const onAbort = () => {
-      killAgyTree(child);
+      killProcessTree(child.pid);
       const err = new Error("Model probe aborted.");
       err.name = "AbortError";
       finish(err);
@@ -302,7 +303,7 @@ export async function probeAgyModels(options?: {
     options?.signal?.addEventListener("abort", onAbort, { once: true });
 
     const timer = setTimeout(() => {
-      killAgyTree(child);
+      killProcessTree(child.pid);
       finish(new Error(`Timed out waiting for \`agy models\` after ${timeoutMs}ms.`));
     }, timeoutMs);
     timer.unref?.();

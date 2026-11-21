@@ -429,54 +429,42 @@ export function isBridgedMcpTool(
   return false;
 }
 
-export interface AgyTranscriptRetryError {
-  stepIndex: number;
-  attempt: number;
-  message: string;
+/** Missing call IDs fall back to the tool name key. */
+export function agyToolStepKey(activity: {
+  callId?: string;
+  stepId?: string | number;
+  name: string;
+}): string {
+  if (activity.callId) return `call:${activity.callId}`;
+  if (activity.stepId !== undefined) return `step:${activity.stepId}`;
+  return `name:${activity.name}`;
 }
 
-const RETRY_ATTEMPT_RE = /\battempt\s+(\d+)\b/i;
+/** True only when the step explicitly started an agy daemon (`IsDaemon: true`). */
+export function isDaemonToolStep(activity: {
+  name: string;
+  args?: Record<string, unknown>;
+}): boolean {
+  const flag = activity.args?.IsDaemon ?? activity.args?.isDaemon;
+  return (
+    (activity.name === "run_command" || activity.name === "execute_command") &&
+    (flag === true || flag === "true")
+  );
+}
 
-/**
- * Extract the trailing retry error and attempt count from a slice of `agy`'s
- * `transcript.jsonl`, ignoring partial leading lines and clearing once a
- * non-error step (such as a model response or new user input) follows it.
- */
-export function extractLatestTranscriptRetryError(
-  jsonlTail: string,
-): AgyTranscriptRetryError | undefined {
-  let latest: AgyTranscriptRetryError | undefined;
-  let consecutiveErrors = 0;
-  const lines = jsonlTail.split("\n");
-  for (let i = 0; i < lines.length; i += 1) {
-    const raw = lines[i]?.trim();
-    if (!raw?.startsWith("{")) continue;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      continue;
-    }
-    const rec = asRecord(parsed);
-    if (!rec) continue;
-    if (rec.type !== "ERROR_MESSAGE") {
-      latest = undefined;
-      consecutiveErrors = 0;
-      continue;
-    }
-    if (typeof rec.error === "string" && rec.error.trim()) {
-      consecutiveErrors += 1;
-      const message = rec.error.trim();
-      const attemptMatch = RETRY_ATTEMPT_RE.exec(message);
-      const parsedAttempt = attemptMatch ? Number.parseInt(attemptMatch[1], 10) : undefined;
-      const attempt = Math.max(
-        Number.isFinite(parsedAttempt) ? (parsedAttempt as number) : 0,
-        consecutiveErrors,
-      );
-      const stepIndex =
-        typeof rec.step_index === "number" && Number.isFinite(rec.step_index) ? rec.step_index : i;
-      latest = { stepIndex, attempt, message };
-    }
+/** Track active tool calls in the current turn; completions clear siblings by key only. */
+export function trackActiveToolStep(
+  active: Set<string>,
+  activity: AgyActivity,
+  daemons?: Set<string>,
+): void {
+  if (activity.type === "tool_start") {
+    const key = agyToolStepKey(activity);
+    active.add(key);
+    if (daemons && isDaemonToolStep(activity)) daemons.add(key);
+  } else if (activity.type === "tool_done" || activity.type === "tool_error") {
+    const key = agyToolStepKey(activity);
+    active.delete(key);
+    daemons?.delete(key);
   }
-  return latest;
 }

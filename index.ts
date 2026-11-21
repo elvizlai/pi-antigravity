@@ -1,48 +1,22 @@
 import { randomUUID } from "node:crypto";
-import type { Model } from "@earendil-works/pi-ai";
-import {
-  type ExtensionAPI,
-  type ExtensionCommandContext,
-  type ExtensionContext,
-  getDocsPath,
-  getExamplesPath,
-  getReadmePath,
-  type SessionEntry,
+import path from "node:path";
+import type { Api, Model } from "@earendil-works/pi-ai";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+  ProviderModelConfig,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import type { AgyUsage } from "./lib/acp-updates.ts";
-import { listAgyArtifacts } from "./lib/artifacts.ts";
-import { AgyPiBridge, selectBridgedTools } from "./lib/bridge.ts";
-import { createBridgeLifecycleManager } from "./lib/bridge-lifecycle.ts";
+import { checkAgyBinary } from "./src/acp/binary.ts";
+import type { AgyContextUsage } from "./src/acp/events.ts";
+import { getFallbackModels, mergeModelLists, probeAgyModels } from "./src/acp/models.ts";
 import {
-  AGY_COMPACTION_ENTRY,
-  type AgyCompactionMarker,
-  agyContextTokens,
-  detectAgyCompaction,
-  formatAgyContextTokens,
-} from "./lib/compaction.ts";
-import {
-  AGY_CONVERSATION_STATE_ENTRY,
-  agyConversationExists,
-  type PersistedAgyConversation,
-  type PersistedAgyReset,
-  parsePersistedAgyState,
-  restorableAgyConversation,
-} from "./lib/conversation-state.ts";
-import { checkAgyBinary, formatAgyDoctorReport } from "./lib/diagnostics.ts";
-import { removeMcpCacheEntry } from "./lib/mcp-cache.ts";
-import { createPrivateMcpConfig, sweepDeadBridgeArtifacts } from "./lib/mcp-config.ts";
-import { getFallbackModels, mergeModelLists, probeAgyModels } from "./lib/models.ts";
-import { createPiToolsAgent } from "./lib/pi-tools-agent.ts";
-import {
-  type AgyExecutionMode,
-  DEFAULT_AGY_EXECUTION_MODE,
-  toggleAgyPlanMode,
-} from "./lib/profile.ts";
-import { type PiDocsPaths, WRAPPER_TOOL_DESCRIPTION, WRAPPER_TOOL_NAME } from "./lib/prompt.ts";
-import { formatAgyCall, summarizeAgyResult } from "./lib/render.ts";
-import { AgyReplayStore } from "./lib/replay.ts";
+  createBridgeLifecycleManager,
+  createPrivateMcpConfig,
+  sweepDeadBridgeArtifacts,
+} from "./src/bridge/agent-files.ts";
+import { AgyPiBridge, selectBridgedTools } from "./src/bridge/server.ts";
 import {
   ACTIVATE_SKILL_TOOL_NAME,
   activateSkillDescription,
@@ -50,139 +24,163 @@ import {
   handleActivateSkill,
   piPrivateSkills,
   type SkillLite,
-} from "./lib/skills.ts";
-import { type AgySubagentEntry, formatAgySubagents, trackAgySubagent } from "./lib/subagents.ts";
-import { listAgyTasks } from "./lib/tasks.ts";
+} from "./src/bridge/skills.ts";
 import {
+  BRIDGE_PENDING_TOOL_MESSAGE,
+  WRAPPER_TOOL_DESCRIPTION,
+  WRAPPER_TOOL_NAME,
+} from "./src/provider/prompt.ts";
+import {
+  formatAgyCall,
+  formatAgyDoctorReport,
+  summarizeAgyResult,
+  wrapperToolActiveAfterModelSwitch,
+} from "./src/provider/render.ts";
+import { AgyRuntime } from "./src/provider/runtime.ts";
+import {
+  type AgyExecutionMode,
   type AgyToolMode,
   formatAgyToolModeStatus,
+  isAgyToolMode,
+  loadAgySettings,
+  parseAgyPlanArg,
   parseAgyToolModeArg,
+  resolveAgyExecutionMode,
   resolveAgyToolMode,
-} from "./lib/tool-mode.ts";
-import { loadSavedAgyToolMode, saveAgyToolMode } from "./lib/tool-mode-settings.ts";
-import { type AgyUsageReport, fetchAgyUsage, formatAgyUsageShort } from "./lib/usage.ts";
-import { wrapperToolActiveAfterModelSwitch } from "./lib/wrapper-activation.ts";
-import { openAgyArtifactsPicker } from "./src/artifacts-ui.ts";
-import { createAntigravityStreamSimple } from "./src/provider.ts";
-import { AgyAcpRuntime } from "./src/runtime.ts";
-import { openAgyTasksPicker } from "./src/tasks-ui.ts";
-import { openAgyUsagePicker } from "./src/usage-ui.ts";
+  saveAgySettings,
+} from "./src/provider/settings.ts";
+import {
+  AGY_STATE_ENTRY_TYPE,
+  type AgyConversationState,
+  type AgyPersistedState,
+  parseAgyStateEntry,
+} from "./src/provider/state.ts";
+import { createAntigravityStreamSimple } from "./src/provider/stream.ts";
+import { AgyReplayStore } from "./src/provider/turn.ts";
 
 const PROVIDER_ID = "antigravity";
-const USAGE_CACHE_TTL_MS = 5 * 60 * 1000;
-const QUOTA_COOLDOWN_MS = 60 * 1000;
 
-const WRAPPER_PARAMS = Type.Object({
-  tool: Type.String(),
-  input: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
-});
-
-interface WrapperReplayDetails {
-  agyTool: string;
-  output?: string;
-  error?: string;
-  durationSeconds?: number;
+function toProviderModelConfigs(models: readonly Model<string>[]): ProviderModelConfig[] {
+  return models.map((m) => ({
+    id: m.id,
+    name: m.name,
+    api: m.api as Api,
+    baseUrl: m.baseUrl,
+    reasoning: m.reasoning,
+    input: [...m.input],
+    cost: m.cost,
+    contextWindow: m.contextWindow,
+    maxTokens: m.maxTokens,
+  }));
 }
 
-function resolvePiDocsPaths(): PiDocsPaths {
-  return {
-    readme: getReadmePath(),
-    docs: getDocsPath(),
-    examples: getExamplesPath(),
-  };
-}
-
-function parseExtraDirsFlag(raw: string | boolean | undefined): string[] {
-  if (typeof raw !== "string" || !raw.trim()) return [];
+function parseExtraDirs(raw: unknown): string[] {
+  if (typeof raw !== "string") return [];
   return raw
     .split(",")
-    .map((part) => part.trim())
+    .map((entry) => entry.trim())
     .filter(Boolean);
 }
 
-function addUsage(acc: AgyUsage, delta: AgyUsage): AgyUsage {
-  const sumOpt = (a?: number, b?: number) =>
-    a === undefined && b === undefined ? undefined : (a ?? 0) + (b ?? 0);
-  return {
-    input_tokens: sumOpt(acc.input_tokens, delta.input_tokens),
-    output_tokens: sumOpt(acc.output_tokens, delta.output_tokens),
-    cache_read_tokens: sumOpt(acc.cache_read_tokens, delta.cache_read_tokens),
-    cache_creation_tokens: sumOpt(acc.cache_creation_tokens, delta.cache_creation_tokens),
-    reasoning_tokens: sumOpt(acc.reasoning_tokens, delta.reasoning_tokens),
-    thinking_tokens: sumOpt(acc.thinking_tokens, delta.thinking_tokens),
-    total_tokens: sumOpt(acc.total_tokens, delta.total_tokens),
-  };
-}
-
-export default function antigravityExtension(pi: ExtensionAPI) {
+export default async function antigravityExtension(pi: ExtensionAPI): Promise<void> {
   pi.registerFlag("agy-tools", {
-    description: "Tool routing mode for Antigravity ACP: pi (default) or native",
     type: "string",
+    description: "Antigravity tool routing mode (pi | native)",
   });
   pi.registerFlag("agy-plan", {
-    description: "Start Antigravity ACP in read-only plan mode",
     type: "boolean",
+    description: "Run Antigravity ACP sessions in plan execution mode",
     default: false,
   });
   pi.registerFlag("agy-sandbox", {
-    description: "Pass --sandbox to `agy acp`",
     type: "boolean",
+    description: "Run agy acp with --sandbox",
     default: false,
   });
   pi.registerFlag("agy-add-dir", {
-    description: "Comma-separated extra directories to pass via --add-dir to `agy acp`",
     type: "string",
+    description: "Comma-separated extra directories passed via agy --add-dir",
   });
 
-  const runtime = new AgyAcpRuntime();
-  const replayStore = new AgyReplayStore();
-  const mcpConfig = createPrivateMcpConfig();
-  const piToolsAgent = createPiToolsAgent();
-  const bridge = new AgyPiBridge(mcpConfig.serverName);
+  const savedSettings = loadAgySettings();
+  const flagToolRaw = pi.getFlag("agy-tools");
+  let toolMode: AgyToolMode = isAgyToolMode(flagToolRaw)
+    ? flagToolRaw
+    : resolveAgyToolMode(savedSettings.toolMode);
+  let executionMode: AgyExecutionMode = resolveAgyExecutionMode(Boolean(pi.getFlag("agy-plan")));
+  const sandbox = Boolean(pi.getFlag("agy-sandbox"));
+  const extraDirs = parseExtraDirs(pi.getFlag("agy-add-dir"));
+
   const bridgeToken = randomUUID();
+  const mcpConfig = createPrivateMcpConfig();
+  const bridge = new AgyPiBridge(mcpConfig.serverName);
   bridge.requireToken(bridgeToken);
+  bridge.setToolSource(() => selectBridgedTools(pi.getAllTools(), pi.getActiveTools(), toolMode));
 
-  let lastCtx: ExtensionContext | undefined;
-  let models: Model<string>[] = getFallbackModels();
-  let toolMode: AgyToolMode = resolveAgyToolMode(loadSavedAgyToolMode());
-  let executionMode: AgyExecutionMode = DEFAULT_AGY_EXECUTION_MODE;
-  let conversationId: string | undefined;
-  let turnCount = 0;
-  let accumulatedUsage: AgyUsage = {};
-  let lastContextTokens: number | undefined;
-  let missingConversationNotice: string | undefined;
+  const replayStore = new AgyReplayStore();
+  let activeCtx: ExtensionContext | undefined;
+  let pendingState: AgyConversationState | undefined;
+  let runtime: AgyRuntime | undefined;
+  let lastUsage: AgyContextUsage | undefined;
   let privateSkills: SkillLite[] = [];
-  let mcpWrittenForNative = false;
-  let quotaExhaustedUntilMs = 0;
-  let lastUsageReport: AgyUsageReport | undefined;
-  let nextUsageFetchAt = 0;
-  let activeModelId = models[0]?.id ?? "gemini-4-neon";
-  const subagentsRoster = new Map<string, AgySubagentEntry>();
 
-  bridge.setOnCall((call) => runtime.notifyBridgeCall(call));
+  const notify = (
+    ctx: ExtensionContext | undefined,
+    message: string,
+    level: "info" | "warning" | "error" = "info",
+  ) => {
+    if (ctx?.hasUI) ctx.ui.notify(message, level);
+  };
 
-  const getAllToolsSnapshot = () => {
-    try {
-      return pi.getAllTools();
-    } catch {
-      return [];
+  const bridgeLifecycle = createBridgeLifecycleManager({
+    bridge,
+    bridgeToken,
+    writeMcpConfig: async (_serverName, url, token) => {
+      await mcpConfig.write(url, token);
+    },
+    removeMcpConfig: async () => {
+      await mcpConfig.remove();
+    },
+    notifyWarning: (message) => notify(activeCtx, message, "warning"),
+  });
+
+  const updateStatus = (ctx: ExtensionContext | undefined) => {
+    if (!ctx?.hasUI) return;
+    if (ctx.model?.provider !== PROVIDER_ID) {
+      ctx.ui.setStatus(PROVIDER_ID, undefined);
+      return;
+    }
+    const modeLabel = formatAgyToolModeStatus(toolMode);
+    const planLabel = executionMode === "plan" ? " plan" : "";
+    const usageLabel = lastUsage
+      ? ` ${Math.round((lastUsage.usedTokens / lastUsage.sizeTokens) * 100)}%`
+      : "";
+    ctx.ui.setStatus(PROVIDER_ID, `agy ${modeLabel}${planLabel}${usageLabel}`);
+  };
+
+  const syncWrapperTool = (ctx: ExtensionContext) => {
+    const next = wrapperToolActiveAfterModelSwitch(
+      pi.getActiveTools(),
+      WRAPPER_TOOL_NAME,
+      ctx.model?.provider,
+      PROVIDER_ID,
+    );
+    if (next) {
+      pi.setActiveTools([...next]);
     }
   };
 
-  const getActiveToolsSnapshot = () => {
-    try {
-      return pi.getActiveTools();
-    } catch {
-      return [];
-    }
-  };
-
-  bridge.setToolSource(() =>
-    selectBridgedTools(getAllToolsSnapshot(), getActiveToolsSnapshot(), toolMode),
-  );
-
-  const syncBridgeDynamicSkills = (skills: SkillLite[], cwd: string | undefined) => {
-    privateSkills = piPrivateSkills(skills, cwd);
+  const syncSkills = (ctx: ExtensionContext) => {
+    const skillCommands = pi
+      .getCommands()
+      .filter((cmd) => cmd.source === "skill" && Boolean(cmd.sourceInfo.path));
+    const allSkills: SkillLite[] = skillCommands.map((cmd) => ({
+      name: cmd.name.replace(/^skill:/, ""),
+      description: cmd.description ?? "",
+      filePath: cmd.sourceInfo.path,
+      baseDir: path.dirname(cmd.sourceInfo.path),
+    }));
+    privateSkills = piPrivateSkills(allSkills, ctx.cwd);
     if (privateSkills.length === 0) {
       bridge.setDynamicTools([]);
       return;
@@ -197,438 +195,197 @@ export default function antigravityExtension(pi: ExtensionAPI) {
     ]);
   };
 
-  const bridgeManager = createBridgeLifecycleManager({
-    bridge,
-    bridgeToken,
-    writeMcpConfig: async (_serverName, url, token) => {
-      if (toolMode === "pi") {
-        mcpWrittenForNative = false;
-        await mcpConfig.remove().catch(() => {});
-        await piToolsAgent.prepare({ serverName: bridge.serverName, url, token });
-      } else {
-        await piToolsAgent.remove().catch(() => {});
-        await mcpConfig.write(url, token);
-        mcpWrittenForNative = true;
-      }
-    },
-    removeMcpConfig: async () => {
-      mcpWrittenForNative = false;
-      await Promise.allSettled([mcpConfig.remove(), piToolsAgent.remove()]);
-    },
-    evictMcpCache: (serverName) => removeMcpCacheEntry(serverName),
-    notifyWarning: (message) => {
-      lastCtx?.ui.notify(message, "warning");
-    },
-  });
-
-  const updateFooterStatus = (ctx: ExtensionContext | undefined) => {
-    if (!ctx) return;
-    if (ctx.model?.provider !== PROVIDER_ID) {
-      ctx.ui.setStatus(PROVIDER_ID, undefined);
-      return;
-    }
-    const modeLabel = formatAgyToolModeStatus(toolMode);
-    const planSuffix = executionMode === "plan" ? " · plan" : "";
-    const usageSuffix =
-      lastUsageReport && Date.now() < nextUsageFetchAt
-        ? ` · ${formatAgyUsageShort(lastUsageReport, ctx.model?.id)}`
-        : "";
-    ctx.ui.setStatus(PROVIDER_ID, `${modeLabel}${planSuffix}${usageSuffix}`);
-  };
-
-  const syncWrapperTool = (ctx: ExtensionContext | undefined) => {
-    if (!ctx) return;
-    const nextTools = wrapperToolActiveAfterModelSwitch(
-      getActiveToolsSnapshot(),
-      WRAPPER_TOOL_NAME,
-      ctx.model?.provider,
-      PROVIDER_ID,
-    );
-    if (nextTools) {
-      pi.setActiveTools([...nextTools]);
-    }
-  };
-
-  const ensureNativeBridgePrepared = async (notify?: (message: string) => void) => {
-    const hasNativeBridgedItems =
-      selectBridgedTools(getAllToolsSnapshot(), getActiveToolsSnapshot(), "native").length > 0 ||
-      privateSkills.length > 0;
-    if (hasNativeBridgedItems) {
-      await bridgeManager.ensureRegistered(notify);
-    }
-  };
-
-  const registerProvider = () => {
-    pi.registerProvider(PROVIDER_ID, {
-      name: "Antigravity",
-      baseUrl: "acp://agy",
-      apiKey: "antigravity-acp",
-      api: "antigravity-acp",
-      models: models.map((m) => ({
-        id: m.id,
-        name: m.name,
-        api: m.api,
-        baseUrl: m.baseUrl,
-        reasoning: m.reasoning,
-        input: [...m.input],
-        cost: m.cost,
-        contextWindow: m.contextWindow,
-        maxTokens: m.maxTokens,
-      })),
-      streamSimple: createAntigravityStreamSimple({
-        runtime,
-        replayStore,
-        bridge,
-        bridgeManager,
-        piDocs: resolvePiDocsPaths(),
-        getToolMode: () => toolMode,
-        getExecutionMode: () => executionMode,
-        getCwd: () => lastCtx?.cwd ?? process.cwd(),
-        getBridgeRevision: () =>
-          `${toolMode}:${bridgeManager.processRevision()}:${piToolsAgent.isPrepared()}`,
-        getConversationId: () => conversationId,
-        consumeMissingConversationNotice: () => {
-          const msg = missingConversationNotice;
-          missingConversationNotice = undefined;
-          return msg;
-        },
-        ensurePiToolsAgent: async (modelId) => {
-          const ok = await bridgeManager.ensureRegistered();
-          if (!ok || !bridge.url) return undefined;
-          await piToolsAgent.prepare({
-            serverName: bridge.serverName,
-            url: bridge.url,
-            token: bridgeToken,
-          });
-          return piToolsAgent.nameForModel(modelId);
-        },
-        prepareNativeBridge: () =>
-          ensureNativeBridgePrepared((msg) => lastCtx?.ui.notify(msg, "warning")),
-        getExtraDirs: (mode) => {
-          const userDirs = parseExtraDirsFlag(pi.getFlag("agy-add-dir"));
-          if (mode === "pi") {
-            // Never pass `--add-dir <mcpDirectory>` or `--add-dir <cwd>` in pi mode.
-            return userDirs;
-          }
-          return mcpWrittenForNative ? [mcpConfig.directory, ...userDirs] : userDirs;
-        },
-        isSandbox: () => pi.getFlag("agy-sandbox") === true,
-        onMissingConversation: (missingId) => {
-          conversationId = undefined;
-          lastContextTokens = undefined;
-          missingConversationNotice =
-            `[Notice] Previous Antigravity conversation "${missingId}" could not be resumed. ` +
-            "Continue from the restored Pi transcript below.";
-        },
-        onConversationResolved: ({ sessionId, resumed }) => {
-          const changed = sessionId !== conversationId;
-          conversationId = sessionId;
-          if (!resumed || changed) {
-            if (!resumed) {
-              turnCount = 0;
-              accumulatedUsage = {};
-            }
-          }
-          if (lastCtx) {
-            const payload: PersistedAgyConversation = {
-              version: 1,
-              kind: "conversation",
-              sessionId: lastCtx.sessionManager.getSessionId(),
-              conversationId: sessionId,
-              cwd: lastCtx.cwd,
-              modelId: lastCtx.model?.id ?? activeModelId,
-              toolMode,
-              bridgeServer: bridge.serverName,
-              turns: turnCount,
-              usage: accumulatedUsage,
-              contextTokens: lastContextTokens,
-            };
-            pi.appendEntry(AGY_CONVERSATION_STATE_ENTRY, payload);
-          }
-        },
-        onQuotaExhausted: () => {
-          quotaExhaustedUntilMs = Date.now() + QUOTA_COOLDOWN_MS;
-          nextUsageFetchAt = 0;
-        },
-        onUsage: (usage) => {
-          turnCount += 1;
-          accumulatedUsage = addUsage(accumulatedUsage, usage);
-          const nextContextTokens = agyContextTokens(usage);
-          const compaction = detectAgyCompaction(lastContextTokens, nextContextTokens);
-          if (compaction && nextContextTokens !== undefined) {
-            const marker: AgyCompactionMarker = {
-              version: 1,
-              beforeTokens: compaction.beforeTokens,
-              afterTokens: compaction.afterTokens,
-              detectedAt: new Date().toISOString(),
-            };
-            pi.appendEntry(AGY_COMPACTION_ENTRY, marker);
-          }
-          if (nextContextTokens !== undefined) {
-            lastContextTokens = nextContextTokens;
-          }
-        },
-        onActivity: (activity) => {
-          if (activity.type === "status_hint") {
-            lastCtx?.ui.setWorkingMessage(
-              activity.text ? `antigravity: ${activity.text}` : undefined,
-            );
-            return;
-          }
-          trackAgySubagent(subagentsRoster, activity);
-        },
-      }),
+  const createRuntimeForCwd = (cwd: string): AgyRuntime =>
+    new AgyRuntime({
+      cwd,
+      bridge,
+      bridgeToken,
+      getToolMode: () => toolMode,
+      getExecutionMode: () => executionMode,
+      sandbox,
+      extraDirs,
+      firstResponseTimeoutMs: savedSettings.firstResponseTimeoutMs,
+      ensureBridge: () =>
+        bridgeLifecycle.ensureRegistered((msg) => notify(activeCtx, msg, "warning")),
+      onPersistedState: (state) => {
+        pendingState = state;
+      },
+      onContextUsage: (usage) => {
+        lastUsage = usage;
+        updateStatus(activeCtx);
+      },
+      onWarning: (msg) => notify(activeCtx, msg, "warning"),
     });
+
+  const getRuntime = (): AgyRuntime => {
+    const cwd = activeCtx?.cwd ?? process.cwd();
+    if (!runtime) {
+      runtime = createRuntimeForCwd(cwd);
+    }
+    return runtime;
   };
 
-  registerProvider();
+  let currentModels = getFallbackModels();
+  try {
+    const probed = await probeAgyModels({ timeoutMs: 2_500 });
+    if (probed.length > 0) {
+      currentModels = mergeModelLists(probed, currentModels);
+    }
+  } catch {
+    // Offline or binary not ready at startup; fallback catalog stays usable.
+  }
+
+  pi.registerProvider(PROVIDER_ID, {
+    name: "Antigravity (ACP)",
+    api: "antigravity-acp",
+    baseUrl: "acp://agy",
+    apiKey: "antigravity-acp-local",
+    models: toProviderModelConfigs(currentModels),
+    refreshModels: async (context) => {
+      if (context.signal.aborted) return toProviderModelConfigs(currentModels);
+      const probed = await probeAgyModels({ signal: context.signal, timeoutMs: 5_000 }).catch(
+        () => [],
+      );
+      if (probed.length > 0) {
+        currentModels = mergeModelLists(probed, getFallbackModels());
+      }
+      return toProviderModelConfigs(currentModels);
+    },
+    streamSimple: createAntigravityStreamSimple({
+      getRuntime,
+      getSessionId: () => activeCtx?.sessionManager.getSessionId() ?? "default",
+      getBranchEntries: () => activeCtx?.sessionManager.getBranch() ?? [],
+      getExecutionMode: () => executionMode,
+      replayStore,
+    }),
+  });
 
   pi.registerTool({
     name: WRAPPER_TOOL_NAME,
     label: WRAPPER_TOOL_NAME,
     description: WRAPPER_TOOL_DESCRIPTION,
-    parameters: WRAPPER_PARAMS,
+    parameters: Type.Object({
+      tool: Type.String(),
+      input: Type.Record(Type.String(), Type.Unknown()),
+    }),
     async execute(toolCallId, params) {
       const recorded = replayStore.take(toolCallId);
-      const agyTool = recorded?.agyTool ?? params.tool;
-      const details: WrapperReplayDetails = {
-        agyTool,
-        output: recorded?.output,
-        error: recorded?.error,
-        durationSeconds: recorded?.durationSeconds,
-      };
-      const text = recorded?.error ?? recorded?.output ?? "(completed)";
+      if (!recorded) {
+        return {
+          content: [{ type: "text", text: BRIDGE_PENDING_TOOL_MESSAGE }],
+          details: { agyTool: params.tool },
+          terminate: true,
+        };
+      }
+      const text = recorded.error ?? recorded.output ?? "";
       return {
         content: [{ type: "text", text }],
-        isError: Boolean(recorded?.error),
-        details,
-        // Display-only replay cards must not trigger a follow-up ACP turn.
+        details: {
+          agyTool: recorded.agyTool,
+          ...(recorded.durationSeconds !== undefined
+            ? { durationSeconds: recorded.durationSeconds }
+            : {}),
+        },
+        ...(recorded.error ? { isError: true } : {}),
         terminate: true,
       };
     },
     renderCall(args, theme) {
       return new Text(formatAgyCall(args.tool, args.input, theme), 0, 0);
     },
-    renderResult(result, _options, theme) {
-      const details = result.details as WrapperReplayDetails | undefined;
+    renderResult(result, options, theme) {
+      const details = result.details as { agyTool?: string; durationSeconds?: number } | undefined;
       const agyTool = details?.agyTool ?? WRAPPER_TOOL_NAME;
-      const summary = summarizeAgyResult(agyTool, details?.output);
-      if (details?.error) {
-        return new Text(theme.fg("error", details.error), 0, 0);
+      const rawText = result.content
+        .filter((item): item is { type: "text"; text: string } => item.type === "text")
+        .map((item) => item.text)
+        .join("\n")
+        .trim();
+
+      if (result.isError) {
+        const line = rawText.split("\n", 1)[0] ?? "tool error";
+        return new Text(theme.fg("error", line), 0, 0);
       }
-      if (summary.counts) {
-        return new Text(theme.fg("muted", summary.counts), 0, 0);
+
+      const summary = summarizeAgyResult(agyTool, rawText);
+      const meta: string[] = [];
+      if (summary.counts) meta.push(summary.counts);
+      if (details?.durationSeconds !== undefined) {
+        meta.push(`${details.durationSeconds.toFixed(1)}s`);
       }
-      const firstText = result.content.find((c) => c.type === "text")?.text;
-      if (firstText && firstText !== "(completed)") {
-        const preview = firstText.split("\n")[0] ?? "";
-        const clipped = preview.length > 100 ? `${preview.slice(0, 99)}…` : preview;
-        return new Text(theme.fg("toolOutput", clipped), 0, 0);
+
+      if (!options.expanded) {
+        const preview = meta.length > 0 ? meta.join(" · ") : (rawText.split("\n", 1)[0] ?? "");
+        return new Text(preview ? theme.fg("toolOutput", preview) : "", 0, 0);
       }
-      return new Text("", 0, 0);
+      const header = meta.length > 0 ? `${theme.fg("muted", meta.join(" · "))}\n` : "";
+      return new Text(`${header}${theme.fg("toolOutput", rawText)}`, 0, 0);
     },
   });
 
-  pi.registerEntryRenderer<AgyCompactionMarker>(AGY_COMPACTION_ENTRY, (entry, _options, theme) => {
-    const data = entry.data;
-    if (!data) return undefined;
-    const text = `antigravity compacted context: ${formatAgyContextTokens(data.beforeTokens)} -> ${formatAgyContextTokens(data.afterTokens)}`;
-    return new Text(theme.fg("muted", text), 0, 0);
-  });
-
-  pi.registerEntryRenderer<PersistedAgyConversation | PersistedAgyReset>(
-    AGY_CONVERSATION_STATE_ENTRY,
-    (entry, _options, theme) => {
-      const parsed = parsePersistedAgyState(entry.data);
-      if (parsed?.kind !== "reset") return undefined;
-      return new Text(theme.fg("dim", "antigravity conversation reset"), 0, 0);
-    },
-  );
-
-  const restoreSessionState = async (ctx: ExtensionContext) => {
-    lastCtx = ctx;
-    if (ctx.model?.id) activeModelId = ctx.model.id;
-    subagentsRoster.clear();
-
-    const flagMode = pi.getFlag("agy-tools");
-    if (typeof flagMode === "string") {
-      const parsed = parseAgyToolModeArg(flagMode);
-      if (parsed.kind === "set") {
-        toolMode = parsed.mode;
-      }
-    }
-    if (pi.getFlag("agy-plan") === true) {
-      executionMode = "plan";
-    }
-
-    const entries: readonly SessionEntry[] = ctx.sessionManager.getEntries();
-    const restored = restorableAgyConversation(
-      entries,
-      ctx.sessionManager.getSessionId(),
-      ctx.cwd,
-      toolMode,
-      bridge.serverName,
-    );
-    if (restored && (await agyConversationExists(restored.conversationId))) {
-      conversationId = restored.conversationId;
-      turnCount = restored.turns;
-      accumulatedUsage = restored.usage;
-      lastContextTokens = restored.contextTokens;
-    } else {
-      conversationId = undefined;
-      turnCount = 0;
-      accumulatedUsage = {};
-      lastContextTokens = undefined;
-    }
-
-    syncWrapperTool(ctx);
-    updateFooterStatus(ctx);
-  };
-
-  pi.on("session_start", async (_event, ctx) => {
-    void sweepDeadBridgeArtifacts();
-    await restoreSessionState(ctx);
-    void probeAgyModels()
-      .then((probed) => {
-        if (probed.length > 0) {
-          models = mergeModelLists(probed, getFallbackModels());
-          registerProvider();
-        }
-      })
-      .catch(() => {});
-  });
-
-  pi.on("model_select", (event, ctx) => {
-    lastCtx = ctx;
-    activeModelId = event.model.id;
-    syncWrapperTool(ctx);
-    updateFooterStatus(ctx);
-  });
-
-  pi.on("session_tree", async (_event, ctx) => {
-    await runtime.resetConversation("Session tree branch switched");
-    await restoreSessionState(ctx);
-  });
-
-  pi.on("session_compact", async (_event, ctx) => {
-    lastCtx = ctx;
-    updateFooterStatus(ctx);
-  });
-
-  pi.on("before_agent_start", async (event, ctx) => {
-    lastCtx = ctx;
-    if (ctx.model?.provider !== PROVIDER_ID) return;
-
-    const skills = (event.systemPromptOptions?.skills ?? []) as SkillLite[];
-    syncBridgeDynamicSkills(skills, ctx.cwd);
-    bridge.refreshTools();
-    bridgeManager.warnMcpAdapterUnsupported(getAllToolsSnapshot(), (msg) =>
-      ctx.ui.notify(msg, "warning"),
-    );
-
-    if (toolMode === "pi") {
-      await bridgeManager.ensureRegistered((msg) => ctx.ui.notify(msg, "warning"));
-      bridgeManager.warnSkillsUnavailable(privateSkills);
-    } else {
-      await ensureNativeBridgePrepared((msg) => ctx.ui.notify(msg, "warning"));
-      bridgeManager.warnSkillsUnavailable(privateSkills);
-    }
-
-    if (Date.now() >= nextUsageFetchAt && Date.now() >= quotaExhaustedUntilMs) {
-      void fetchAgyUsage()
-        .then((report) => {
-          lastUsageReport = report;
-          nextUsageFetchAt = Date.now() + USAGE_CACHE_TTL_MS;
-          updateFooterStatus(lastCtx);
-        })
-        .catch(() => {
-          nextUsageFetchAt = Date.now() + 60_000;
-        });
-    }
-  });
-
-  pi.on("agent_end", (_event, ctx) => {
-    lastCtx = ctx;
-    ctx.ui.setWorkingMessage(undefined);
-  });
-
-  pi.on("session_shutdown", async () => {
-    await runtime.stop("Session shutdown");
-    await bridgeManager.teardown();
+  pi.registerEntryRenderer<AgyPersistedState>(AGY_STATE_ENTRY_TYPE, (entry, _options, theme) => {
+    const parsed = parseAgyStateEntry(entry.data);
+    if (parsed?.kind !== "reset") return undefined;
+    return new Text(theme.fg("muted", "antigravity conversation reset"), 0, 0);
   });
 
   pi.registerCommand("agy-tools", {
-    description:
-      "Switch Antigravity tool routing between `pi` (MCP bridge) and `native` (built-in tools)",
-    handler: async (args, ctx: ExtensionCommandContext) => {
-      lastCtx = ctx;
+    description: "Switch Antigravity tool routing mode (pi | native | status)",
+    async handler(args, ctx) {
       const action = parseAgyToolModeArg(args);
       if (action.kind === "status") {
-        ctx.ui.notify(
-          `Antigravity tools mode: ${formatAgyToolModeStatus(toolMode)} (default: pi)`,
-          "info",
-        );
+        notify(ctx, `Antigravity tool mode: ${toolMode} (${formatAgyToolModeStatus(toolMode)})`);
         return;
       }
       if (action.kind === "invalid") {
-        ctx.ui.notify(
-          `Invalid /agy-tools argument "${action.raw}". Use: pi | native | on | off | status`,
-          "warning",
-        );
-        return;
-      }
-      if (action.mode === toolMode) {
-        ctx.ui.notify(
-          `Antigravity tools already set to ${formatAgyToolModeStatus(toolMode)}.`,
-          "info",
-        );
+        notify(ctx, `Invalid tool mode "${action.raw}". Use: pi | native | status`, "warning");
         return;
       }
       toolMode = action.mode;
-      await saveAgyToolMode(toolMode);
+      saveAgySettings({ toolMode });
       bridge.refreshTools();
-      await runtime.stop("Tool mode changed");
-      await bridgeManager.teardown();
-      updateFooterStatus(ctx);
-      ctx.ui.notify(`Switched Antigravity tools to ${formatAgyToolModeStatus(toolMode)}.`, "info");
+      updateStatus(ctx);
+      notify(ctx, `Antigravity tool mode set to ${toolMode} (saved to antigravity.json)`);
     },
   });
 
   pi.registerCommand("agy-plan", {
-    description: "Toggle Antigravity ACP read-only plan mode",
-    handler: async (_args, ctx: ExtensionCommandContext) => {
-      lastCtx = ctx;
-      executionMode = toggleAgyPlanMode(executionMode);
-      updateFooterStatus(ctx);
-      ctx.ui.notify(`Antigravity ACP execution mode: ${executionMode}`, "info");
+    description: "Toggle Antigravity plan execution mode (on | off | status)",
+    async handler(args, ctx) {
+      const action = parseAgyPlanArg(args);
+      if (action.kind === "status") {
+        executionMode = executionMode === "plan" ? "agent" : "plan";
+      } else if (action.kind === "set") {
+        executionMode = resolveAgyExecutionMode(action.enabled);
+      } else {
+        notify(ctx, `Invalid argument "${action.raw}". Use: on | off | status`, "warning");
+        return;
+      }
+      updateStatus(ctx);
+      notify(ctx, `Antigravity execution mode: ${executionMode}`);
     },
   });
 
   pi.registerCommand("agy-reset", {
-    description: "Reset the bound Antigravity ACP conversation and start fresh on next turn",
-    handler: async (_args, ctx: ExtensionCommandContext) => {
-      lastCtx = ctx;
-      await runtime.resetConversation("User ran /agy-reset");
-      conversationId = undefined;
-      turnCount = 0;
-      accumulatedUsage = {};
-      lastContextTokens = undefined;
-      subagentsRoster.clear();
-      const resetEntry: PersistedAgyReset = {
+    description: "Reset the active Antigravity ACP conversation",
+    async handler(_args, ctx) {
+      await runtime?.resetConversation();
+      pendingState = undefined;
+      lastUsage = undefined;
+      pi.appendEntry(AGY_STATE_ENTRY_TYPE, {
         version: 1,
         kind: "reset",
         sessionId: ctx.sessionManager.getSessionId(),
         cwd: ctx.cwd,
-      };
-      pi.appendEntry(AGY_CONVERSATION_STATE_ENTRY, resetEntry);
-      ctx.ui.notify("Antigravity ACP conversation reset.", "info");
+      });
+      updateStatus(ctx);
+      notify(ctx, "Antigravity conversation reset; a new ACP session starts on the next prompt.");
     },
   });
 
   pi.registerCommand("agy-doctor", {
-    description: "Check `agy acp` binary, bridge health, execution mode, and quota status",
-    handler: async (_args, ctx: ExtensionCommandContext) => {
-      lastCtx = ctx;
+    description: "Verify agy CLI version, ACP transport, bridge state, and quota status",
+    async handler(_args, ctx) {
       let binary: string | undefined;
       let version: string | undefined;
       let binaryError: string | undefined;
@@ -639,112 +396,107 @@ export default function antigravityExtension(pi: ExtensionAPI) {
       } catch (err) {
         binaryError = err instanceof Error ? err.message : String(err);
       }
+
+      const bridgedCount = selectBridgedTools(
+        pi.getAllTools(),
+        pi.getActiveTools(),
+        toolMode,
+      ).length;
       const report = formatAgyDoctorReport({
         binary,
         version,
         binaryError,
-        toolMode: formatAgyToolModeStatus(toolMode),
+        toolMode,
         executionMode,
-        conversationId,
-        bridgeStatus: bridge.running
-          ? `listening (${bridge.url ?? "loopback"}, ${bridge.pendingCount} pending)`
-          : "stopped",
-        acpConnected: runtime.isConnected,
-        mcpServerCount: getAllToolsSnapshot().filter((t) => t.sourceInfo?.path === "builtin:mcp")
-          .length,
-        quotaError:
-          Date.now() < quotaExhaustedUntilMs ? "Quota exhausted recently; cooling down" : undefined,
+        conversationId: runtime?.conversationId,
+        bridgeStatus: bridgeLifecycle.isRunning() ? `running (${bridge.serverName})` : "idle",
+        acpConnected: runtime?.isConnected ?? false,
+        mcpServerCount: bridgedCount,
+        quotaError: runtime?.lastQuotaError,
       });
-      ctx.ui.notify(report, binaryError ? "error" : "info");
-    },
-  });
-
-  pi.registerCommand("agy-tasks", {
-    description: "Inspect background tasks spawned by Antigravity for the current conversation",
-    handler: async (_args, ctx: ExtensionCommandContext) => {
-      lastCtx = ctx;
-      if (!conversationId) {
-        ctx.ui.notify("No active Antigravity conversation yet.", "info");
-        return;
-      }
-      if (!ctx.hasUI) {
-        const tasks = await listAgyTasks(conversationId);
-        ctx.ui.notify(
-          tasks.length > 0
-            ? tasks
-                .map((t) => `• ${t.id} (${t.pids.length > 0 ? t.pids.join(",") : "done"})`)
-                .join("\n")
-            : "No agy background tasks.",
-          "info",
-        );
-        return;
-      }
-      await openAgyTasksPicker(ctx, () => listAgyTasks(conversationId ?? ""));
-    },
-  });
-
-  pi.registerCommand("agy-artifacts", {
-    description: "Browse generated artifacts in the current Antigravity conversation",
-    handler: async (_args, ctx: ExtensionCommandContext) => {
-      lastCtx = ctx;
-      if (!conversationId) {
-        ctx.ui.notify("No active Antigravity conversation yet.", "info");
-        return;
-      }
-      if (!ctx.hasUI) {
-        const artifacts = await listAgyArtifacts(conversationId);
-        ctx.ui.notify(
-          artifacts.length > 0
-            ? artifacts.map((a) => `• ${a.name} (${a.absolutePath})`).join("\n")
-            : "No agy artifacts.",
-          "info",
-        );
-        return;
-      }
-      await openAgyArtifactsPicker(ctx, () => listAgyArtifacts(conversationId ?? ""));
-    },
-  });
-
-  pi.registerCommand("agy-subagents", {
-    description: "Show tracked Antigravity subagent calls from this session",
-    handler: async (_args, ctx: ExtensionCommandContext) => {
-      lastCtx = ctx;
-      ctx.ui.notify(
-        formatAgySubagents(subagentsRoster) ?? "No Antigravity subagents recorded yet.",
-        "info",
-      );
-    },
-  });
-
-  pi.registerCommand("agy-usage", {
-    description: "Check Antigravity quota buckets",
-    handler: async (_args, ctx: ExtensionCommandContext) => {
-      lastCtx = ctx;
-      await openAgyUsagePicker(ctx, async (signal) => {
-        const report = await fetchAgyUsage({ signal });
-        lastUsageReport = report;
-        nextUsageFetchAt = Date.now() + USAGE_CACHE_TTL_MS;
-        updateFooterStatus(ctx);
-        return report;
-      });
+      notify(ctx, report, binaryError ? "error" : "info");
     },
   });
 
   pi.registerCommand("agy-models", {
-    description: "Refresh available Antigravity models via `agy models`",
-    handler: async (_args, ctx: ExtensionCommandContext) => {
-      lastCtx = ctx;
-      try {
-        const probed = await probeAgyModels();
-        models = mergeModelLists(probed, getFallbackModels());
-        registerProvider();
-        ctx.ui.notify(`Loaded ${models.length} Antigravity ACP models.`, "info");
-      } catch (err) {
-        ctx.ui.notify(
-          `Failed to refresh Antigravity models: ${err instanceof Error ? err.message : String(err)}`,
-          "error",
-        );
+    description: "Refresh available Antigravity ACP models from agy CLI",
+    async handler(_args, ctx) {
+      const result = await ctx.modelRegistry.refresh({ providers: [PROVIDER_ID], force: true });
+      const err = result.errors.get(PROVIDER_ID);
+      if (err) {
+        notify(ctx, `Failed to refresh Antigravity models: ${err.message}`, "error");
+        return;
       }
+      const ids = currentModels.map((m) => m.id).join(", ");
+      notify(ctx, `Antigravity models (${currentModels.length}): ${ids}`);
     },
+  });
+
+  pi.on("session_start", async (_event, ctx) => {
+    activeCtx = ctx;
+    pendingState = undefined;
+    lastUsage = undefined;
+    void sweepDeadBridgeArtifacts();
+    if (runtime) {
+      await runtime.dispose();
+      runtime = undefined;
+    }
+    syncWrapperTool(ctx);
+    syncSkills(ctx);
+    bridge.refreshTools();
+    updateStatus(ctx);
+  });
+
+  pi.on("model_select", (_event, ctx) => {
+    activeCtx = ctx;
+    syncWrapperTool(ctx);
+    updateStatus(ctx);
+  });
+
+  pi.on("session_tree", async (_event, ctx) => {
+    activeCtx = ctx;
+    pendingState = undefined;
+    lastUsage = undefined;
+    if (runtime) {
+      await runtime.dispose();
+      runtime = undefined;
+    }
+    updateStatus(ctx);
+  });
+
+  pi.on("before_agent_start", async (_event, ctx) => {
+    activeCtx = ctx;
+    if (ctx.model?.provider !== PROVIDER_ID) {
+      pendingState = undefined;
+      if (runtime) {
+        await runtime.dispose();
+        runtime = undefined;
+      }
+      return;
+    }
+    syncSkills(ctx);
+    bridge.refreshTools();
+    if (toolMode === "pi") {
+      bridgeLifecycle.warnMcpAdapterUnsupported(pi.getAllTools(), (msg) =>
+        notify(ctx, msg, "warning"),
+      );
+      await bridgeLifecycle.ensureRegistered((msg) => notify(ctx, msg, "warning"));
+      bridgeLifecycle.warnSkillsUnavailable(privateSkills);
+    }
+  });
+
+  pi.on("agent_end", () => {
+    if (pendingState) {
+      pi.appendEntry(AGY_STATE_ENTRY_TYPE, pendingState);
+      pendingState = undefined;
+    }
+    replayStore.clear();
+  });
+
+  pi.on("session_shutdown", async () => {
+    await runtime?.dispose();
+    runtime = undefined;
+    await bridgeLifecycle.teardown();
+    await mcpConfig.remove().catch(() => {});
   });
 }
