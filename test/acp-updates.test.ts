@@ -4,6 +4,7 @@ import {
   type AgyToolView,
   acpUpdateToActivity,
   extractAcpToolOutput,
+  extractLatestTranscriptRetryError,
   isBridgedMcpTool,
   normalizeAcpPromptUsage,
 } from "../lib/acp-updates.ts";
@@ -167,4 +168,41 @@ test("isBridgedMcpTool isolates Pi MCP bridge tools from external user MCP serve
     false,
   );
   assert.equal(isBridgedMcpTool({ name: "search_web" }, "pi-1234"), false);
+});
+
+test("extractLatestTranscriptRetryError surfaces trailing 429 retries and clears after model responds", () => {
+  const retryingTail = [
+    '...truncated leading partial line"}',
+    JSON.stringify({
+      step_index: 1,
+      source: "SYSTEM",
+      type: "ERROR_MESSAGE",
+      status: "DONE",
+      error: "API error (attempt 1): RESOURCE_EXHAUSTED (code 429): Resource has been exhausted.",
+    }),
+    JSON.stringify({
+      step_index: 2,
+      source: "SYSTEM",
+      type: "ERROR_MESSAGE",
+      status: "DONE",
+      error: "API error (attempt 2): RESOURCE_EXHAUSTED (code 429): Resource has been exhausted.",
+    }),
+  ].join("\n");
+
+  assert.deepEqual(extractLatestTranscriptRetryError(retryingTail), {
+    stepIndex: 2,
+    message: "API error (attempt 2): RESOURCE_EXHAUSTED (code 429): Resource has been exhausted.",
+  });
+
+  const recoveredTail = [
+    retryingTail,
+    JSON.stringify({
+      step_index: 3,
+      source: "MODEL",
+      type: "PLANNER_RESPONSE",
+      status: "DONE",
+    }),
+  ].join("\n");
+
+  assert.equal(extractLatestTranscriptRetryError(recoveredTail), undefined);
 });

@@ -1,3 +1,5 @@
+import { promises as fs } from "node:fs";
+import path from "node:path";
 import {
   type AcpContentBlock,
   AgyAcpClient,
@@ -9,8 +11,10 @@ import {
   type AgyContextUsage,
   type AgyToolView,
   acpUpdateToActivity,
+  extractLatestTranscriptRetryError,
   normalizeAcpPromptUsage,
 } from "../lib/acp-updates.ts";
+import { agyBrainDir } from "../lib/agy-paths.ts";
 import type { BridgeCall } from "../lib/bridge.ts";
 import { type AgyBinaryInfo, checkAgyBinary } from "../lib/diagnostics.ts";
 import {
@@ -365,6 +369,61 @@ export class AgyAcpRuntime {
     };
 
     // Start the background ACP prompt loop; each Pi wave awaits `waitNextWave`.
+    const transcriptPath = path.join(
+      agyBrainDir(),
+      sessionId,
+      ".system_generated",
+      "logs",
+      "transcript.jsonl",
+    );
+    let lastRetryStep: number | undefined;
+    let retryHintActive = false;
+    let polling = false;
+    let stopped = false;
+
+    const pollTranscriptRetry = async () => {
+      if (polling || stopped) return;
+      polling = true;
+      let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+      try {
+        handle = await fs.open(transcriptPath, "r");
+        const stat = await handle.stat();
+        const readLen = Math.min(8_192, stat.size);
+        if (readLen <= 0) return;
+        const offset = Math.max(0, stat.size - readLen);
+        const buf = Buffer.alloc(readLen);
+        const { bytesRead } = await handle.read(buf, 0, readLen, offset);
+        if (bytesRead <= 0 || stopped) return;
+        const latest = extractLatestTranscriptRetryError(
+          buf.subarray(0, bytesRead).toString("utf8"),
+        );
+        if (latest && latest.stepIndex !== lastRetryStep) {
+          lastRetryStep = latest.stepIndex;
+          retryHintActive = true;
+          controller.onActivity({ type: "status_hint", text: latest.message });
+        }
+      } catch {
+        // Missing or unreadable brain transcript while initializing is non-fatal.
+      } finally {
+        await handle?.close().catch(() => {});
+        polling = false;
+      }
+    };
+
+    const retryPollTimer = setInterval(() => {
+      void pollTranscriptRetry();
+    }, 2_000);
+    retryPollTimer.unref?.();
+
+    const clearRetryWatcher = () => {
+      stopped = true;
+      clearInterval(retryPollTimer);
+      if (retryHintActive) {
+        retryHintActive = false;
+        controller.onActivity({ type: "status_hint", text: "" });
+      }
+    };
+
     void client
       .prompt(sessionId, blocks, {
         signal: turnAbortController.signal,
@@ -372,6 +431,15 @@ export class AgyAcpRuntime {
         onUpdate: (update) => {
           const activity = acpUpdateToActivity(update, toolsByCallId);
           if (!activity) return;
+          if (
+            retryHintActive &&
+            (activity.type === "thinking_delta" ||
+              activity.type === "text_delta" ||
+              activity.type === "tool_start")
+          ) {
+            retryHintActive = false;
+            controller.onActivity({ type: "status_hint", text: "" });
+          }
           switch (activity.type) {
             case "text_delta":
               quotaTracker.noteText(activity.text);
@@ -397,6 +465,7 @@ export class AgyAcpRuntime {
         },
       })
       .then((result) => {
+        clearRetryWatcher();
         const usage = normalizeAcpPromptUsage(result.usage);
         const quotaNotice = quotaTracker.detectTurnQuotaExhaustion(result.usage);
         if (quotaNotice) {
@@ -410,6 +479,7 @@ export class AgyAcpRuntime {
         });
       })
       .catch((error) => {
+        clearRetryWatcher();
         const err = error instanceof Error ? error : new Error(String(error));
         if (isAgyQuotaError(err.message)) {
           request.onQuotaExhausted?.();

@@ -369,6 +369,12 @@ export default function antigravityExtension(pi: ExtensionAPI) {
           }
         },
         onActivity: (activity) => {
+          if (activity.type === "status_hint") {
+            lastCtx?.ui.setWorkingMessage(
+              activity.text ? `antigravity: ${activity.text}` : undefined,
+            );
+            return;
+          }
           trackAgySubagent(subagentsRoster, activity);
         },
       }),
@@ -434,12 +440,8 @@ export default function antigravityExtension(pi: ExtensionAPI) {
     AGY_CONVERSATION_STATE_ENTRY,
     (entry, _options, theme) => {
       const parsed = parsePersistedAgyState(entry.data);
-      if (!parsed) return undefined;
-      const text =
-        parsed.kind === "reset"
-          ? "antigravity conversation reset"
-          : `antigravity conversation ${parsed.conversationId.slice(0, 8)} (${parsed.turns} turns)`;
-      return new Text(theme.fg("dim", text), 0, 0);
+      if (!parsed || parsed.kind !== "reset") return undefined;
+      return new Text(theme.fg("dim", "antigravity conversation reset"), 0, 0);
     },
   );
 
@@ -543,6 +545,11 @@ export default function antigravityExtension(pi: ExtensionAPI) {
           nextUsageFetchAt = Date.now() + 60_000;
         });
     }
+  });
+
+  pi.on("agent_end", (_event, ctx) => {
+    lastCtx = ctx;
+    ctx.ui.setWorkingMessage(undefined);
   });
 
   pi.on("session_shutdown", async () => {

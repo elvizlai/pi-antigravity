@@ -117,21 +117,49 @@ export function extractTrailingUserPrompt(messages: readonly Message[]): {
   text: string;
   images: ImageContent[];
 } {
-  for (let i = messages.length - 1; i >= 0; i--) {
+  let lastUserIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const msg = messages[i];
+    if (msg.role === "system") continue;
+    if (msg.role === "user") {
+      lastUserIdx = i;
+    }
+    break;
+  }
+
+  if (lastUserIdx < 0) {
+    return {
+      userIndex: -1,
+      text: stallContinuationPrompt(),
+      images: [],
+    };
+  }
+
+  let firstUserIdx = lastUserIdx;
+  for (let i = lastUserIdx - 1; i >= 0; i -= 1) {
     const msg = messages[i];
     if (msg.role === "user") {
-      const { text, images } = extractTextFromBlocks(msg.content);
-      return {
-        userIndex: i,
-        text: text || "(see attached image)",
-        images,
-      };
+      firstUserIdx = i;
+      continue;
     }
+    if (msg.role === "system") continue;
+    break;
   }
+
+  const textParts: string[] = [];
+  const images: ImageContent[] = [];
+  for (let i = firstUserIdx; i <= lastUserIdx; i += 1) {
+    const msg = messages[i];
+    if (msg.role !== "user") continue;
+    const extracted = extractTextFromBlocks(msg.content);
+    if (extracted.text.trim()) textParts.push(extracted.text);
+    images.push(...extracted.images);
+  }
+
   return {
-    userIndex: -1,
-    text: stallContinuationPrompt(),
-    images: [],
+    userIndex: firstUserIdx,
+    text: textParts.join("\n\n") || "(see attached image)",
+    images,
   };
 }
 
@@ -403,6 +431,7 @@ export function createAntigravityStreamSimple(deps: AntigravityProviderDeps) {
           }
           case "tool_start":
           case "tool_update":
+          case "status_hint":
             break;
         }
       };

@@ -35,6 +35,7 @@ export type AgyActivity =
   | { type: "thinking_delta"; text: string }
   | { type: "text_delta"; text: string }
   | { type: "context_usage"; usedTokens: number; sizeTokens: number }
+  | { type: "status_hint"; text: string }
   | {
       type: "tool_start";
       callId: string;
@@ -426,4 +427,37 @@ export function isBridgedMcpTool(
   }
 
   return false;
+}
+
+/**
+ * Extract the trailing retry error from a slice of `agy`'s `transcript.jsonl`,
+ * ignoring partial leading lines and clearing once a model step begins after it.
+ */
+export function extractLatestTranscriptRetryError(
+  jsonlTail: string,
+): { stepIndex: number; message: string } | undefined {
+  let latest: { stepIndex: number; message: string } | undefined;
+  const lines = jsonlTail.split("\n");
+  for (let i = 0; i < lines.length; i += 1) {
+    const raw = lines[i]?.trim();
+    if (!raw || !raw.startsWith("{")) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      continue;
+    }
+    const rec = asRecord(parsed);
+    if (!rec) continue;
+    if (rec.type === "PLANNER_RESPONSE" || rec.source === "MODEL") {
+      latest = undefined;
+      continue;
+    }
+    if (rec.type === "ERROR_MESSAGE" && typeof rec.error === "string" && rec.error.trim()) {
+      const stepIndex =
+        typeof rec.step_index === "number" && Number.isFinite(rec.step_index) ? rec.step_index : i;
+      latest = { stepIndex, message: rec.error.trim() };
+    }
+  }
+  return latest;
 }

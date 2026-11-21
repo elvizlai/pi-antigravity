@@ -7,7 +7,12 @@ import type { AssistantMessageEvent, Model, TranscriptContext } from "@earendil-
 import { AgyAcpClient } from "../lib/acp-client.ts";
 import { AgyPiBridge, BRIDGE_CALL_TIMEOUT_MS } from "../lib/bridge.ts";
 import { AgyReplayStore } from "../lib/replay.ts";
-import { buildAgySystemPromptAppend, createAntigravityStreamSimple } from "../src/provider.ts";
+import {
+  buildAgySystemPromptAppend,
+  buildRestoredPiTranscript,
+  createAntigravityStreamSimple,
+  extractTrailingUserPrompt,
+} from "../src/provider.ts";
 import { AgyAcpRuntime } from "../src/runtime.ts";
 import { assertDeltasMatchPartial } from "./delta-replay.ts";
 
@@ -309,4 +314,28 @@ test("createAntigravityStreamSimple continues parked turn across toolResult wave
   assert.equal(m2.stopReason, "stop");
   assert.equal((m2.content[0] as any).text, "You are in /repo");
   await runtime.stop();
+});
+
+test("extractTrailingUserPrompt preserves user text followed by hindsight/custom user messages across turns", () => {
+  const turn1Messages = [
+    { role: "system", content: "system", timestamp: 0 },
+    { role: "user", content: [{ type: "text", text: "hi" }], timestamp: 1 },
+    { role: "user", content: "<hindsight_pages>memory</hindsight_pages>", timestamp: 2 },
+  ] as any[];
+
+  const t1 = extractTrailingUserPrompt(turn1Messages);
+  assert.equal(t1.userIndex, 1);
+  assert.equal(t1.text, "hi\n\n<hindsight_pages>memory</hindsight_pages>");
+  assert.equal(buildRestoredPiTranscript(turn1Messages, t1.userIndex), undefined);
+
+  const turn2Messages = [
+    ...turn1Messages,
+    { role: "assistant", content: [{ type: "text", text: "Hello!" }], timestamp: 3 },
+    { role: "user", content: [{ type: "text", text: "turn2" }], timestamp: 4 },
+    { role: "user", content: "<hindsight_pages>memory2</hindsight_pages>", timestamp: 5 },
+  ] as any[];
+
+  const t2 = extractTrailingUserPrompt(turn2Messages);
+  assert.equal(t2.userIndex, 4);
+  assert.equal(t2.text, "turn2\n\n<hindsight_pages>memory2</hindsight_pages>");
 });
