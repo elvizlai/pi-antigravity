@@ -30,10 +30,6 @@ export class AgyReplayStore {
   clear(): void {
     this.#results.clear();
   }
-
-  get size(): number {
-    return this.#results.size;
-  }
 }
 
 export interface AgyTurnResult {

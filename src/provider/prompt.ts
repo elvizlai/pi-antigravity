@@ -112,68 +112,6 @@ function truncateUtf8Tail(text: string, maxBytes: number): string {
   return `${TRUNCATION_NOTICE.trimStart()}\n${slice.slice(0, end)}`;
 }
 
-function truncateUtf8Head(text: string, maxBytes: number): string {
-  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
-  const noticeBytes = Buffer.byteLength(TRUNCATION_NOTICE, "utf8");
-  if (maxBytes <= noticeBytes) {
-    return Buffer.from(text, "utf8").subarray(0, maxBytes).toString("utf8");
-  }
-  const budget = maxBytes - noticeBytes;
-  let end = Math.min(text.length, budget);
-  while (end > 0 && Buffer.byteLength(text.slice(0, end), "utf8") > budget) {
-    end -= Math.max(1, Math.floor((Buffer.byteLength(text.slice(0, end), "utf8") - budget) / 3));
-  }
-  return `${text.slice(0, end)}${TRUNCATION_NOTICE}`;
-}
-
-function clampPromptTextBlocks(
-  blocks: readonly AcpContentBlock[],
-  maxBytes: number,
-): AcpContentBlock[] {
-  const textIndexes: number[] = [];
-  let totalBytes = 0;
-  for (let i = 0; i < blocks.length; i += 1) {
-    const block = blocks[i];
-    if (block.type === "text") {
-      textIndexes.push(i);
-      totalBytes += Buffer.byteLength(block.text, "utf8");
-    }
-  }
-  if (totalBytes <= maxBytes || textIndexes.length === 0) return [...blocks];
-
-  // Keep the most recent user text intact first, capping older injected context.
-  const kept = [...blocks];
-  let remaining = maxBytes;
-  const reverseResult: (AcpContentBlock | undefined)[] = new Array(blocks.length);
-
-  for (let i = blocks.length - 1; i >= 0; i -= 1) {
-    const block = kept[i];
-    if (block.type === "image") {
-      reverseResult[i] = block;
-      continue;
-    }
-    const bytes = Buffer.byteLength(block.text, "utf8");
-    if (remaining <= 0) {
-      continue;
-    }
-    if (bytes <= remaining) {
-      reverseResult[i] = block;
-      remaining -= bytes;
-      continue;
-    }
-    const truncated =
-      i === textIndexes[textIndexes.length - 1]
-        ? truncateUtf8Head(block.text, remaining)
-        : truncateUtf8Tail(block.text, remaining);
-    if (truncated.trim()) {
-      reverseResult[i] = { type: "text", text: truncated };
-    }
-    remaining = 0;
-  }
-
-  return reverseResult.filter((b): b is AcpContentBlock => b !== undefined);
-}
-
 /**
  * Collect contiguous trailing `user` messages (skipping `system` entries) in
  * chronological order and merge all text parts into a single `text` block
@@ -238,9 +176,6 @@ export function extractTrailingUserPrompt(
   result.push(...imageBlocks);
   return result;
 }
-
-void truncateUtf8Head;
-void clampPromptTextBlocks;
 
 export interface CollectedToolResult {
   callId: string;

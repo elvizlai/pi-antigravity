@@ -10,11 +10,6 @@ export interface AgyUsage {
   total_tokens?: number;
 }
 
-export interface AgyContextUsage {
-  usedTokens: number;
-  sizeTokens: number;
-}
-
 export type AgyToolStatus = "pending" | "in_progress" | "completed" | "failed" | "cancelled";
 
 export interface AgyToolView {
@@ -28,14 +23,12 @@ export interface AgyToolView {
   startedAtMs: number;
   startedEmitted: boolean;
   finishedEmitted: boolean;
-  meta?: Record<string, unknown>;
 }
 
 export type AgyActivity =
   | { type: "thinking_delta"; text: string }
   | { type: "text_delta"; text: string }
   | { type: "context_usage"; usedTokens: number; sizeTokens: number }
-  | { type: "status_hint"; text: string }
   | {
       type: "tool_start";
       callId: string;
@@ -43,7 +36,6 @@ export type AgyActivity =
       title?: string;
       kind?: string;
       args: JsonObject;
-      meta?: Record<string, unknown>;
     }
   | {
       type: "tool_update";
@@ -52,7 +44,6 @@ export type AgyActivity =
       title?: string;
       kind?: string;
       args: JsonObject;
-      meta?: Record<string, unknown>;
     }
   | {
       type: "tool_done";
@@ -63,7 +54,6 @@ export type AgyActivity =
       args: JsonObject;
       output?: string;
       durationSeconds?: number;
-      meta?: Record<string, unknown>;
     }
   | {
       type: "tool_error";
@@ -74,7 +64,6 @@ export type AgyActivity =
       args: JsonObject;
       message: string;
       durationSeconds?: number;
-      meta?: Record<string, unknown>;
     };
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -92,21 +81,8 @@ function asJsonObject(value: unknown): JsonObject | undefined {
   return rec ? (rec as JsonObject) : undefined;
 }
 
-function readMetaToolName(meta: Record<string, unknown> | undefined): string | undefined {
-  if (!meta) return undefined;
-  const agy = asRecord(meta.antigravity);
-  return (
-    nonEmptyString(agy?.toolName) ??
-    nonEmptyString(agy?.tool) ??
-    nonEmptyString(meta.toolName) ??
-    nonEmptyString(meta.name)
-  );
-}
-
 function inferToolName(update: Record<string, unknown>, existing: AgyToolView | undefined): string {
-  const meta = asRecord(update._meta) ?? existing?.meta;
-  const explicit =
-    readMetaToolName(meta) ?? nonEmptyString(update.toolName) ?? nonEmptyString(update.name);
+  const explicit = nonEmptyString(update.toolName) ?? nonEmptyString(update.name);
   if (explicit) return explicit;
   if (existing && existing.name !== "unknown") return existing.name;
 
@@ -192,20 +168,7 @@ function normalizeStatus(raw: unknown, fallback: AgyToolStatus): AgyToolStatus {
   return fallback;
 }
 
-function readDurationSeconds(
-  meta: Record<string, unknown> | undefined,
-  startedAtMs: number,
-  now: number,
-): number | undefined {
-  const agy = asRecord(meta?.antigravity);
-  const rawMs = agy?.durationMs ?? meta?.durationMs;
-  if (typeof rawMs === "number" && Number.isFinite(rawMs) && rawMs >= 0) {
-    return rawMs / 1000;
-  }
-  const rawSec = agy?.durationSeconds ?? meta?.durationSeconds;
-  if (typeof rawSec === "number" && Number.isFinite(rawSec) && rawSec >= 0) {
-    return rawSec;
-  }
+function readDurationSeconds(startedAtMs: number, now: number): number | undefined {
   const elapsed = (now - startedAtMs) / 1000;
   return Number.isFinite(elapsed) && elapsed >= 0 ? elapsed : undefined;
 }
@@ -220,7 +183,6 @@ export function mergeAgyAcpTool(
   if (!toolCallId) return undefined;
 
   const existing = tools.get(toolCallId);
-  const meta = asRecord(update._meta) ?? existing?.meta;
   const name = inferToolName(update, existing);
   const title = nonEmptyString(update.title) ?? existing?.title;
   const kind = nonEmptyString(update.kind) ?? existing?.kind;
@@ -254,7 +216,6 @@ export function mergeAgyAcpTool(
     startedAtMs: existing?.startedAtMs ?? now,
     startedEmitted: existing?.startedEmitted ?? false,
     finishedEmitted: existing?.finishedEmitted ?? false,
-    meta,
   };
   tools.set(toolCallId, view);
 
@@ -270,8 +231,7 @@ export function mergeAgyAcpTool(
       kind: view.kind,
       args: view.args,
       output: view.output,
-      durationSeconds: readDurationSeconds(meta, view.startedAtMs, now),
-      meta: view.meta,
+      durationSeconds: readDurationSeconds(view.startedAtMs, now),
     };
   }
 
@@ -288,8 +248,7 @@ export function mergeAgyAcpTool(
       args: view.args,
       message:
         view.output || (status === "cancelled" ? "Tool call cancelled." : "Tool call failed."),
-      durationSeconds: readDurationSeconds(meta, view.startedAtMs, now),
-      meta: view.meta,
+      durationSeconds: readDurationSeconds(view.startedAtMs, now),
     };
   }
 
@@ -302,7 +261,6 @@ export function mergeAgyAcpTool(
       title: view.title,
       kind: view.kind,
       args: view.args,
-      meta: view.meta,
     };
   }
 
@@ -313,7 +271,6 @@ export function mergeAgyAcpTool(
     title: view.title,
     kind: view.kind,
     args: view.args,
-    meta: view.meta,
   };
 }
 
@@ -403,11 +360,10 @@ export function isBridgedMcpTool(
   activity: {
     name: string;
     args?: Record<string, unknown>;
-    meta?: Record<string, unknown>;
   },
   bridgeServerName?: string,
 ): boolean {
-  const { name, args, meta } = activity;
+  const { name, args } = activity;
   if (name.startsWith("pi__")) return true;
 
   if (bridgeServerName) {
@@ -415,8 +371,6 @@ export function isBridgedMcpTool(
     if (name.startsWith(`mcp_${sanitized}_`) || name.startsWith(`mcp_${bridgeServerName}_`)) {
       return true;
     }
-    const agyMeta = asRecord(meta?.antigravity);
-    if (agyMeta?.mcpServerName === bridgeServerName) return true;
   }
 
   if (name === "call_mcp_tool") {

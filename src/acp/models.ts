@@ -418,36 +418,6 @@ export function resolveAcpExecutionMode(
   return undefined;
 }
 
-/**
- * Compute desired config writes after setting `model` first (because `agy` changes
- * which `thought_level` values exist per model).
- */
-export function planAgyAcpSecondaryConfigWrites(
-  configOptions: readonly AgyAcpConfigOption[] | undefined,
-  desired: {
-    requestedEffort?: string;
-    executionMode?: AgyExecutionMode;
-  },
-): Array<{ configId: string; value: string }> {
-  const writes: Array<{ configId: string; value: string }> = [];
-
-  const thoughtOption = extractAcpConfigOption(configOptions, "thought_level");
-  const resolvedThought = resolveAcpThoughtLevel(desired.requestedEffort, thoughtOption);
-  if (thoughtOption && resolvedThought && thoughtOption.currentValue !== resolvedThought) {
-    writes.push({ configId: thoughtOption.id, value: resolvedThought });
-  }
-
-  const modeOption = extractAcpConfigOption(configOptions, "mode");
-  if (desired.executionMode && modeOption) {
-    const resolvedMode = resolveAcpExecutionMode(desired.executionMode, modeOption);
-    if (resolvedMode && modeOption.currentValue !== resolvedMode) {
-      writes.push({ configId: modeOption.id, value: resolvedMode });
-    }
-  }
-
-  return writes;
-}
-
 const LIVE_CACHE_TTL_MS = 60 * 60 * 1000;
 const FALLBACK_CACHE_TTL_MS = 5 * 60 * 1000;
 

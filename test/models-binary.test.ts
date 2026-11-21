@@ -15,7 +15,7 @@ import {
   modelCacheIsFresh,
   modelsFromCachedEntries,
   parseAgyModelsOutput,
-  planAgyAcpSecondaryConfigWrites,
+  resolveAcpExecutionMode,
   resolveAcpModelCandidate,
   resolveAcpThoughtLevel,
 } from "../src/acp/models.ts";
@@ -88,35 +88,29 @@ test("model parsing, fallback merge, effort stripping, and config planning", () 
   });
   assert.equal(resolvedEffort, "high");
 
-  const writes = planAgyAcpSecondaryConfigWrites(
-    [
-      {
-        id: "thought_level",
-        category: "thought_level",
-        type: "select",
-        currentValue: "low",
-        options: [
-          { value: "low", name: "Low" },
-          { value: "high", name: "High" },
-        ],
-      },
-      {
-        id: "mode",
-        category: "mode",
-        type: "select",
-        currentValue: "default",
-        options: [
-          { value: "default", name: "Default" },
-          { value: "plan", name: "Plan" },
-        ],
-      },
+  const modeOption = {
+    id: "mode",
+    category: "mode",
+    type: "select",
+    currentValue: "default",
+    options: [
+      { value: "default", name: "Default" },
+      { value: "plan", name: "Plan" },
     ],
-    { requestedEffort: "high", executionMode: "plan" },
+  };
+  assert.equal(resolveAcpExecutionMode("plan", modeOption), "plan");
+  assert.equal(resolveAcpExecutionMode("default", modeOption), "default");
+  assert.equal(
+    resolveAcpExecutionMode("default", {
+      id: "mode",
+      type: "select",
+      options: [
+        { value: "agent", name: "Agent" },
+        { value: "plan", name: "Plan" },
+      ],
+    }),
+    "agent",
   );
-  assert.deepEqual(writes, [
-    { configId: "thought_level", value: "high" },
-    { configId: "mode", value: "plan" },
-  ]);
 
   assert.equal(modelCacheIsFresh({ fetchedAt: Date.now(), source: "live" }), true);
   assert.equal(modelCacheIsFresh({ fetchedAt: 0, source: "live" }), false);

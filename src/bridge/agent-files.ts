@@ -2,13 +2,17 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { isAgyOrchestratorModel } from "../acp/models.ts";
-import { type AgyPiBridge, BRIDGE_MCP_TIMEOUT_SECONDS, type PiToolInfo } from "./server.ts";
-import type { SkillLite } from "./skills.ts";
+import { BRIDGE_MCP_TIMEOUT_SECONDS, type PiToolInfo } from "./server.ts";
 
 export const PI_TOOLS_AGENT_DESCRIPTION =
   "Complete Pi requests using the current Pi session tools through its MCP bridge.";
+
+export const MCP_ADAPTER_UNSUPPORTED_WARNING =
+  "antigravity: pi-mcp-adapter is installed, but its MCP tools are not bridged to agy. " +
+  "It also replaces Pi's built-in MCP support. Remove or disable pi-mcp-adapter, " +
+  'move your servers to ~/.pi/agent/mcp.json (or .pi/mcp.json) with "exposure": "direct", ' +
+  "then run /reload.";
 
 export function piToolsAgentPrompt(serverName: string): string {
   return [
@@ -22,11 +26,10 @@ export function piToolsAgentPrompt(serverName: string): string {
 }
 
 /**
- * Built-in phase-handoff tools required by agy's Orchestrator models
- * (`planexecute.checkPreconditions` disables the two-phase Planner -> Worker
- * pipeline unless both are allowed). Non-orchestrator models have no
- * `execution_model` configured and fail executor construction if either is
- * declared, so standard and Orchestrator models use separate static agents.
+ * Built-in phase-handoff tools needed by agy's Orchestrator models so the
+ * Planner -> Worker pipeline stays intact. Non-orchestrator models fail executor
+ * construction if either is declared, so standard and Orchestrator models use
+ * separate static agent definitions.
  */
 export const PI_TOOLS_ORCHESTRATOR_TOOLS = ["enter_plan_mode", "exit_plan_mode"] as const;
 
@@ -55,13 +58,8 @@ export interface PiToolsAgentHandle {
   remove(): Promise<void>;
 }
 
-const BRIDGE_DIR_PATTERN =
-  /^(\d+)-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
 const PI_TOOLS_AGENT_PATTERN = /^pi-tools-(\d+)-[0-9a-f-]+(?:-orchestrator)?(?:\.md)?$/i;
-
-function defaultBridgesRoot(): string {
-  return path.join(getAgentDir(), "antigravity", "bridges");
-}
+const MCP_ADAPTER_SOURCE = /(?:^|[:/\\])pi-mcp-adapter(?=$|[@/\\.])/;
 
 function defaultIsPidDead(pid: number): boolean {
   if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return false;
@@ -73,6 +71,13 @@ function defaultIsPidDead(pid: number): boolean {
   }
 }
 
+/**
+ * Format an `agy --agent` definition (`~/.gemini/config/agents/<name>/agent.md`).
+ *
+ * Uses documented agent schema fields (`name`, `description`, `mainAgent`, `subagent`,
+ * `tools`, `mcpServers`) plus minimal CLI scoping flags (`hidden`,
+ * `inheritCustomizations: false`) safely ignored if absent in newer CLI versions.
+ */
 function formatPiToolsAgentFile(
   agentName: string,
   bridge: PiToolsAgentBridge,
@@ -131,67 +136,16 @@ export function createPiToolsAgent(
   };
 }
 
-/** One process's workspace MCP discovery directory, passed only via `cwd` / `--add-dir` if used. */
-export function createPrivateMcpConfig(root = defaultBridgesRoot()) {
-  const id = randomUUID();
-  const serverName = `pi-${id.replaceAll("-", "").slice(0, 12)}`;
-  const directory = path.join(root, `${process.pid}-${id}`);
-  const agentsDirectory = path.join(directory, ".agents");
-
-  return {
-    serverName,
-    directory,
-    async write(url: string, token: string): Promise<void> {
-      await mkdir(agentsDirectory, { recursive: true, mode: 0o700 });
-      await writeFile(
-        path.join(agentsDirectory, "mcp_config.json"),
-        `${JSON.stringify(
-          {
-            mcpServers: {
-              [serverName]: {
-                serverUrl: url,
-                headers: { "x-pi-bridge-token": token },
-                timeoutSeconds: BRIDGE_MCP_TIMEOUT_SECONDS,
-              },
-            },
-          },
-          null,
-          2,
-        )}\n`,
-        { mode: 0o600 },
-      );
-    },
-    async remove(): Promise<void> {
-      await rm(directory, { recursive: true, force: true });
-    },
-  };
-}
-
 /**
- * Best-effort cleanup of bridge workspaces and `pi-tools-*` agent files
- * left behind by terminated Pi processes. Uses public Pi and agent config dirs only.
+ * Best-effort cleanup of stale `pi-tools-<pid>-*` custom agent directories left
+ * behind by terminated Pi processes under `~/.gemini/config/agents`.
  */
-export async function sweepDeadBridgeArtifacts(options?: {
-  bridgesRoot?: string;
+export async function sweepDeadPiToolsAgents(options?: {
   agentsRoot?: string;
   isPidDead?: (pid: number) => boolean;
 }): Promise<void> {
-  const bridgesRoot = options?.bridgesRoot ?? defaultBridgesRoot();
   const agentsRoot = options?.agentsRoot ?? path.join(homedir(), ".gemini", "config", "agents");
   const isPidDead = options?.isPidDead ?? defaultIsPidDead;
-
-  try {
-    const entries = await readdir(bridgesRoot);
-    await Promise.all(
-      entries.map(async (entry) => {
-        const match = BRIDGE_DIR_PATTERN.exec(entry);
-        if (!match || !isPidDead(Number(match[1]))) return;
-        await rm(path.join(bridgesRoot, entry), { recursive: true, force: true }).catch(() => {});
-      }),
-    );
-  } catch {
-    // Missing or unreadable bridges directory is non-fatal.
-  }
 
   try {
     const entries = await readdir(agentsRoot);
@@ -207,133 +161,11 @@ export async function sweepDeadBridgeArtifacts(options?: {
   }
 }
 
-export interface BridgeLifecycleDeps {
-  bridge: AgyPiBridge;
-  bridgeToken: string;
-  writeMcpConfig: (serverName: string, url: string, token: string) => Promise<void>;
-  removeMcpConfig: (serverName: string) => Promise<void>;
-  enabled?: boolean;
-  notifyWarning?: (message: string) => void;
-}
-
-export interface BridgeLifecycleManager {
-  readonly isRegistered: () => boolean;
-  readonly isRunning: () => boolean;
-  readonly ensureRegistered: (notify?: (message: string) => void) => Promise<boolean>;
-  readonly teardown: () => Promise<void>;
-  readonly registrationGeneration: () => number;
-  readonly processRevision: () => string;
-  readonly warnMcpAdapterUnsupported: (
-    resources: readonly Pick<PiToolInfo, "sourceInfo">[],
-    notify?: (message: string) => void,
-  ) => void;
-  readonly warnSkillsUnavailable: (skills: SkillLite[]) => void;
-}
-
-export function createBridgeLifecycleManager(deps: BridgeLifecycleDeps): BridgeLifecycleManager {
-  const enabled = deps.enabled ?? true;
-  let registered = false;
-  let ownsConfig = false;
-  let generation = 0;
-  let preparing: Promise<boolean> | undefined;
-  let tearingDown: Promise<void> | undefined;
-  let warnedSkillsUnavailable = false;
-  let warnedMcpAdapterUnsupported = false;
-
-  const cleanup = async () => {
-    if (!registered && !ownsConfig && !deps.bridge.running) return;
-    registered = false;
-    let removalError: unknown;
-    try {
-      await deps.removeMcpConfig(deps.bridge.serverName);
-      ownsConfig = false;
-    } catch (error) {
-      removalError = error;
-    }
-    try {
-      await deps.bridge.close();
-    } finally {
-      generation += 1;
-    }
-    if (removalError) throw removalError;
-  };
-
-  const prepare = async (notify?: (message: string) => void) => {
-    try {
-      await deps.bridge.start();
-      const url = deps.bridge.url;
-      if (!url) throw new Error("pi-tool bridge did not expose a URL after start.");
-      ownsConfig = true;
-      await deps.writeMcpConfig(deps.bridge.serverName, url, deps.bridgeToken);
-      deps.bridge.refreshTools();
-      registered = true;
-      generation += 1;
-      return true;
-    } catch (error) {
-      let message = error instanceof Error ? error.message : String(error);
-      try {
-        await cleanup();
-      } catch (cleanupError) {
-        message += `; cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`;
-      }
-      const warning = `antigravity: pi-tool bridge unavailable (${message}).`;
-      (notify ?? deps.notifyWarning)?.(warning);
-      return false;
-    }
-  };
-
-  return {
-    isRegistered: () => registered,
-    isRunning: () => deps.bridge.running,
-    registrationGeneration: () => generation,
-    processRevision: () => `${generation}:${deps.bridge.catalogRevision}`,
-
-    ensureRegistered: async (notify) => {
-      if (!enabled) return false;
-      if (tearingDown) await tearingDown;
-      if (registered) return true;
-      preparing ??= prepare(notify).finally(() => {
-        preparing = undefined;
-      });
-      return preparing;
-    },
-
-    teardown: async () => {
-      tearingDown ??= (async () => {
-        await preparing;
-        await cleanup();
-      })().finally(() => {
-        tearingDown = undefined;
-      });
-      await tearingDown;
-    },
-
-    warnMcpAdapterUnsupported: (resources, notify) => {
-      if (!enabled || warnedMcpAdapterUnsupported) return;
-      const adapterSource = /(?:^|[:/\\])pi-mcp-adapter(?=$|[@/\\.])/;
-      const installed = resources.some(({ sourceInfo }) =>
-        [sourceInfo?.source, sourceInfo?.path].some((value) => adapterSource.test(value ?? "")),
-      );
-      const warn = notify ?? deps.notifyWarning;
-      if (!installed || !warn) return;
-      warnedMcpAdapterUnsupported = true;
-      warn(
-        "antigravity: pi-mcp-adapter is installed, but its MCP tools are not bridged to agy. " +
-          "It also replaces Pi's built-in MCP support. Remove or disable pi-mcp-adapter, " +
-          'move your servers to ~/.pi/agent/mcp.json (or .pi/mcp.json) with "exposure": "direct", ' +
-          "then run /reload.",
-      );
-    },
-
-    warnSkillsUnavailable: (skills) => {
-      if (warnedSkillsUnavailable || skills.length === 0) return;
-      if (enabled && registered) return;
-      warnedSkillsUnavailable = true;
-      deps.notifyWarning?.(
-        enabled
-          ? "antigravity: pi-tool bridge failed to prepare — pi-private skills are unavailable to agy this session."
-          : "antigravity: pi-tool bridge is disabled — pi-private skills are unavailable to agy this session.",
-      );
-    },
-  };
+/** True when any registered Pi tool originates from `pi-mcp-adapter`. */
+export function hasUnsupportedMcpAdapter(
+  resources: readonly Pick<PiToolInfo, "sourceInfo">[],
+): boolean {
+  return resources.some(({ sourceInfo }) =>
+    [sourceInfo?.source, sourceInfo?.path].some((value) => MCP_ADAPTER_SOURCE.test(value ?? "")),
+  );
 }

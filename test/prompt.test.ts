@@ -141,14 +141,30 @@ test("findActiveAgyConversation enforces session ownership and invalidation mark
       sessionId: "pi-1",
       conversationId: "acp-1",
       cwd: "/work",
-      modelId: "gemini-4-hydrogen",
       turns: 2,
+    },
+  };
+  const legacyMarker = {
+    type: "custom",
+    customType: AGY_STATE_ENTRY_TYPE,
+    data: {
+      version: 1,
+      kind: "conversation",
+      sessionId: "pi-1",
+      conversationId: "acp-legacy",
+      cwd: "/work",
+      modelId: "gemini-4-hydrogen",
+      turns: 3,
       usage: { input_tokens: 10 },
     },
   };
 
   assert.equal(parseAgyStateEntry({ version: 2 }), undefined);
   assert.equal(findActiveAgyConversation("pi-1", "/work", [validMarker])?.conversationId, "acp-1");
+  assert.equal(
+    findActiveAgyConversation("pi-1", "/work", [legacyMarker])?.conversationId,
+    "acp-legacy",
+  );
   assert.equal(
     findActiveAgyConversation("pi-1", "/work", [validMarker, { type: "model_change" }])
       ?.conversationId,

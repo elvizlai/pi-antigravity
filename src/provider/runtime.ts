@@ -8,9 +8,7 @@ import {
   type AgyAcpClientOptions,
 } from "../acp/client.ts";
 import {
-  type AgyContextUsage,
   type AgyToolView,
-  type AgyUsage,
   acpUpdateToActivity,
   isBridgedMcpTool,
   normalizeAcpPromptUsage,
@@ -55,11 +53,6 @@ export class AgyQuotaError extends Error {
     this.resetsIn = options?.resetsIn ?? options?.notice?.resetsIn;
     this.notice = options?.notice;
   }
-}
-
-export function toAgyQuotaError(raw: unknown, resetsIn?: string): AgyQuotaError {
-  const text = raw instanceof Error ? raw.message : String(raw ?? "");
-  return new AgyQuotaError(text, { resetsIn });
 }
 
 /**
@@ -126,7 +119,6 @@ export interface AgyRuntimeDeps {
   ) => Promise<{ binary: string; version: string }>;
   createClient?: (options: AgyAcpClientOptions) => AgyAcpClientLike;
   onPersistedState?: (state: AgyConversationState) => void;
-  onContextUsage?: (usage: AgyContextUsage) => void;
   onWarning?: (message: string) => void;
 }
 
@@ -169,23 +161,6 @@ function stableEnvFingerprint(env: Record<string, string> | undefined): string {
   return JSON.stringify(entries);
 }
 
-function sumUsage(prev: AgyUsage, next: AgyUsage | undefined): AgyUsage {
-  if (!next) return { ...prev };
-  const add = (a: number | undefined, b: number | undefined): number | undefined => {
-    if (a === undefined && b === undefined) return undefined;
-    return (a ?? 0) + (b ?? 0);
-  };
-  return {
-    input_tokens: add(prev.input_tokens, next.input_tokens),
-    output_tokens: add(prev.output_tokens, next.output_tokens),
-    cache_read_tokens: add(prev.cache_read_tokens, next.cache_read_tokens),
-    cache_creation_tokens: add(prev.cache_creation_tokens, next.cache_creation_tokens),
-    reasoning_tokens: add(prev.reasoning_tokens, next.reasoning_tokens),
-    thinking_tokens: add(prev.thinking_tokens, next.thinking_tokens),
-    total_tokens: add(prev.total_tokens, next.total_tokens),
-  };
-}
-
 /**
  * Owns the persistent `agy acp` child process, session/resume lifecycle, config
  * synchronization (`mode -> model -> thought_level`), bridged MCP wave loop,
@@ -208,8 +183,6 @@ export class AgyRuntime {
   #openedOnClient: string | undefined;
   #configOptions: AgyAcpConfigOption[] | undefined;
   #turns = 0;
-  #usage: AgyUsage = {};
-  #contextTokens: number | undefined;
   #lastQuotaError: string | undefined;
   #activeTurn: ActiveTurn | undefined;
 
@@ -239,8 +212,6 @@ export class AgyRuntime {
     this.#openedOnClient = undefined;
     this.#configOptions = undefined;
     this.#turns = 0;
-    this.#usage = {};
-    this.#contextTokens = undefined;
     this.#lastQuotaError = undefined;
     await this.dispose();
   }
@@ -478,7 +449,6 @@ export class AgyRuntime {
     params: {
       piSessionId: string;
       branchEntries: readonly SessionEntryLike[];
-      systemPromptAppend?: string;
     },
   ): Promise<{ sessionId: string; configOptions?: AgyAcpConfigOption[] }> {
     if (
@@ -502,8 +472,6 @@ export class AgyRuntime {
       this.#conversationId = fromState.conversationId;
       this.#piSessionId = params.piSessionId;
       this.#turns = fromState.turns;
-      this.#usage = { ...fromState.usage };
-      this.#contextTokens = fromState.contextTokens;
     }
 
     if (candidateId && this.#openedOnClient === candidateId && this.#client === client) {
@@ -525,8 +493,6 @@ export class AgyRuntime {
         // Fallback to a fresh session when the stored ACP conversation cannot resume.
         this.#conversationId = undefined;
         this.#turns = 0;
-        this.#usage = {};
-        this.#contextTokens = undefined;
       }
     }
 
@@ -538,8 +504,6 @@ export class AgyRuntime {
     this.#openedOnClient = created.sessionId;
     this.#configOptions = created.configOptions;
     this.#turns = 0;
-    this.#usage = {};
-    this.#contextTokens = undefined;
     return { sessionId: created.sessionId, configOptions: created.configOptions };
   }
 
@@ -761,19 +725,14 @@ export class AgyRuntime {
         onUpdate: (update) => {
           if (timedOut || controller.isSettled) return;
           const activity = acpUpdateToActivity(update, acpTools);
-          if (!activity || activity.type === "status_hint") return;
+          if (!activity) return;
 
           if (activity.type === "context_usage") {
-            this.#contextTokens = activity.usedTokens;
             // Pre-turn `usage_update` (usedTokens === 0) must not disarm the watchdog or quota guard.
             if (activity.usedTokens > 0) {
               noteFirstResponse();
               quotaTracker.noteUsageUpdate();
             }
-            this.#deps.onContextUsage?.({
-              usedTokens: activity.usedTokens,
-              sizeTokens: activity.sizeTokens,
-            });
             controller.pushActivity(activity);
             return;
           }
@@ -814,7 +773,9 @@ export class AgyRuntime {
         });
         if (quotaNotice) {
           this.#lastQuotaError = quotaNotice.message;
-          controller.fail(toAgyQuotaError(quotaNotice.message, quotaNotice.resetsIn));
+          controller.fail(
+            new AgyQuotaError(quotaNotice.message, { resetsIn: quotaNotice.resetsIn }),
+          );
           return;
         }
 
@@ -839,12 +800,10 @@ export class AgyRuntime {
             kind: tool.kind,
             args: tool.args,
             message: isDaemon ? AGY_PARKED_TURN_ERROR : agyIncompleteToolError(tool.name),
-            meta: tool.meta,
           });
         }
 
         this.#turns += 1;
-        this.#usage = sumUsage(this.#usage, normalizedUsage);
         this.#lastQuotaError = undefined;
         this.#deps.onPersistedState?.({
           version: 1,
@@ -852,12 +811,7 @@ export class AgyRuntime {
           sessionId: params.sessionId,
           conversationId: sessionId,
           cwd: this.#deps.cwd,
-          modelId: params.modelId,
-          toolMode,
-          ...(bridgeServerName ? { bridgeServer: bridgeServerName } : {}),
           turns: this.#turns,
-          usage: this.#usage,
-          ...(this.#contextTokens !== undefined ? { contextTokens: this.#contextTokens } : {}),
         });
 
         controller.finish({
@@ -879,7 +833,7 @@ export class AgyRuntime {
         const error = err instanceof Error ? err : new Error(String(err));
         if (isAgyQuotaError(error.message)) {
           this.#lastQuotaError = error.message;
-          controller.fail(toAgyQuotaError(error.message));
+          controller.fail(new AgyQuotaError(error.message));
           return;
         }
 

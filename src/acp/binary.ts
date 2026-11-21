@@ -1,9 +1,8 @@
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
 import { promises as fs, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { gte, prerelease, rcompare, valid } from "semver";
+import { gte, valid } from "semver";
 import which from "which";
 import {
   killProcessTree,
@@ -31,15 +30,6 @@ export function withAgyAutoUpdateDisabled(env: NodeJS.ProcessEnv = process.env):
 export function isRegularFileSync(filePath: string): boolean {
   try {
     return statSync(filePath).isFile();
-  } catch {
-    return false;
-  }
-}
-
-export async function isRegularFile(filePath: string): Promise<boolean> {
-  try {
-    const stat = await fs.stat(filePath);
-    return stat.isFile();
   } catch {
     return false;
   }
@@ -214,22 +204,4 @@ export async function checkAgyBinary(options?: {
   const info: AgyBinaryInfo = { binary, version };
   verifiedCache.set(binary, { fingerprint, info });
   return info;
-}
-
-/** Build a short deterministic cache hash for arbitrary text. */
-export function hashText(text: string): string {
-  return createHash("sha256").update(text).digest("hex").slice(0, 12);
-}
-
-/** Sort semver strings descending, stable pre-release ordering. */
-export function sortVersionsDesc(versions: readonly string[]): string[] {
-  return [...versions].sort((a, b) => {
-    const va = valid(a);
-    const vb = valid(b);
-    if (!va || !vb) return b.localeCompare(a);
-    const pa = prerelease(va);
-    const pb = prerelease(vb);
-    if (Boolean(pa) !== Boolean(pb)) return pa ? 1 : -1;
-    return rcompare(va, vb);
-  });
 }

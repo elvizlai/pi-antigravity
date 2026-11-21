@@ -18,9 +18,9 @@ import {
 } from "./src/acp/models.ts";
 import { type AgyUsageReport, fetchAgyUsage, formatAgyUsageShort } from "./src/acp/usage.ts";
 import {
-  createBridgeLifecycleManager,
-  createPrivateMcpConfig,
-  sweepDeadBridgeArtifacts,
+  hasUnsupportedMcpAdapter,
+  MCP_ADAPTER_UNSUPPORTED_WARNING,
+  sweepDeadPiToolsAgents,
 } from "./src/bridge/agent-files.ts";
 import { AgyPiBridge, selectBridgedTools } from "./src/bridge/server.ts";
 import {
@@ -119,8 +119,8 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   const extraDirs = parseExtraDirs(pi.getFlag("agy-add-dir"));
 
   const bridgeToken = randomUUID();
-  const mcpConfig = createPrivateMcpConfig();
-  const bridge = new AgyPiBridge(mcpConfig.serverName);
+  const bridgeServerName = `pi-${randomUUID().replaceAll("-", "").slice(0, 12)}`;
+  const bridge = new AgyPiBridge(bridgeServerName);
   bridge.requireToken(bridgeToken);
   bridge.setToolSource(() => selectBridgedTools(pi.getAllTools(), pi.getActiveTools(), toolMode));
 
@@ -135,6 +135,9 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   let usageFetchInFlight = false;
   let nextUsageFetchAt = 0;
   let privateSkills: SkillLite[] = [];
+  let bridgeStartPromise: Promise<boolean> | undefined;
+  let warnedMcpAdapter = false;
+  let warnedSkills = false;
 
   const notify = (
     ctx: ExtensionContext | undefined,
@@ -144,17 +147,29 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     if (ctx?.hasUI) ctx.ui.notify(message, level);
   };
 
-  const bridgeLifecycle = createBridgeLifecycleManager({
-    bridge,
-    bridgeToken,
-    writeMcpConfig: async (_serverName, url, token) => {
-      await mcpConfig.write(url, token);
-    },
-    removeMcpConfig: async () => {
-      await mcpConfig.remove();
-    },
-    notifyWarning: (message) => notify(activeCtx, message, "warning"),
-  });
+  const ensureBridgeStarted = async (warn?: (message: string) => void): Promise<boolean> => {
+    if (bridge.running) return true;
+    bridgeStartPromise ??= bridge
+      .start()
+      .then(() => {
+        bridge.refreshTools();
+        return true;
+      })
+      .catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        warn?.(`antigravity: pi-tool bridge unavailable (${message}).`);
+        return false;
+      })
+      .finally(() => {
+        bridgeStartPromise = undefined;
+      });
+    return bridgeStartPromise;
+  };
+
+  const stopBridge = async () => {
+    await bridgeStartPromise?.catch(() => {});
+    await bridge.close();
+  };
 
   const updateStatus = (ctx: ExtensionContext | undefined) => {
     if (!ctx?.hasUI) return;
@@ -197,17 +212,8 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     }
   };
 
-  const syncSkills = (ctx: ExtensionContext) => {
-    const skillCommands = pi
-      .getCommands()
-      .filter((cmd) => cmd.source === "skill" && Boolean(cmd.sourceInfo.path));
-    const allSkills: SkillLite[] = skillCommands.map((cmd) => ({
-      name: cmd.name.replace(/^skill:/, ""),
-      description: cmd.description ?? "",
-      filePath: cmd.sourceInfo.path,
-      baseDir: path.dirname(cmd.sourceInfo.path),
-    }));
-    privateSkills = piPrivateSkills(allSkills, ctx.cwd);
+  const applyPrivateSkills = (skills: readonly SkillLite[], cwd: string) => {
+    privateSkills = piPrivateSkills([...skills], cwd);
     if (privateSkills.length === 0) {
       bridge.setDynamicTools([]);
       return;
@@ -222,6 +228,21 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     ]);
   };
 
+  const seedSkillsFromCommands = (ctx: ExtensionContext) => {
+    const skillCommands = pi
+      .getCommands()
+      .filter((cmd) => cmd.source === "skill" && Boolean(cmd.sourceInfo.path));
+    applyPrivateSkills(
+      skillCommands.map((cmd) => ({
+        name: cmd.name.replace(/^skill:/, ""),
+        description: cmd.description ?? "",
+        filePath: cmd.sourceInfo.path,
+        baseDir: path.dirname(cmd.sourceInfo.path),
+      })),
+      ctx.cwd,
+    );
+  };
+
   const createRuntimeForCwd = (cwd: string): AgyRuntime =>
     new AgyRuntime({
       cwd,
@@ -232,8 +253,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       sandbox,
       extraDirs,
       firstResponseTimeoutMs: savedSettings.firstResponseTimeoutMs,
-      ensureBridge: () =>
-        bridgeLifecycle.ensureRegistered((msg) => notify(activeCtx, msg, "warning")),
+      ensureBridge: () => ensureBridgeStarted((msg) => notify(activeCtx, msg, "warning")),
       onPersistedState: (state) => {
         pendingState = state;
       },
@@ -385,7 +405,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       saveAgySettings({ toolMode });
       bridge.refreshTools();
       if (toolMode !== "pi") {
-        await bridgeLifecycle.teardown();
+        await stopBridge();
       }
       updateStatus(ctx);
       notify(
@@ -462,7 +482,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         toolMode,
         executionMode,
         conversationId: runtime?.conversationId,
-        bridgeStatus: bridgeLifecycle.isRunning() ? `running (${bridge.serverName})` : "idle",
+        bridgeStatus: bridge.running ? `running (${bridge.serverName})` : "idle",
         acpConnected: runtime?.isConnected ?? false,
         mcpServerCount: bridgedCount,
         quotaError: runtime?.lastQuotaError,
@@ -507,7 +527,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     const modelId = ctx.model.id;
     void (async () => {
       if (toolMode === "pi") {
-        await bridgeLifecycle.ensureRegistered();
+        await ensureBridgeStarted();
       }
       await getRuntime().warmupClient({ modelId });
     })().catch(() => {});
@@ -516,13 +536,13 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     activeCtx = ctx;
     pendingState = undefined;
-    void sweepDeadBridgeArtifacts();
+    void sweepDeadPiToolsAgents();
     if (runtime) {
       await runtime.dispose();
       runtime = undefined;
     }
     syncWrapperTool(ctx);
-    syncSkills(ctx);
+    seedSkillsFromCommands(ctx);
     bridge.refreshTools();
     updateStatus(ctx);
     if (ctx.model?.provider === PROVIDER_ID) {
@@ -555,7 +575,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     updateStatus(ctx);
   });
 
-  pi.on("before_agent_start", async (_event, ctx) => {
+  pi.on("before_agent_start", async (event, ctx) => {
     activeCtx = ctx;
     if (ctx.model?.provider !== PROVIDER_ID) {
       pendingState = undefined;
@@ -565,14 +585,29 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       }
       return;
     }
-    syncSkills(ctx);
+    const promptSkills = event.systemPromptOptions?.skills?.filter(
+      (skill) => !skill.disableModelInvocation,
+    );
+    if (promptSkills) {
+      applyPrivateSkills(promptSkills, ctx.cwd);
+    } else {
+      seedSkillsFromCommands(ctx);
+    }
     bridge.refreshTools();
     if (toolMode === "pi") {
-      bridgeLifecycle.warnMcpAdapterUnsupported(pi.getAllTools(), (msg) =>
-        notify(ctx, msg, "warning"),
-      );
-      await bridgeLifecycle.ensureRegistered((msg) => notify(ctx, msg, "warning"));
-      bridgeLifecycle.warnSkillsUnavailable(privateSkills);
+      if (!warnedMcpAdapter && hasUnsupportedMcpAdapter(pi.getAllTools())) {
+        warnedMcpAdapter = true;
+        notify(ctx, MCP_ADAPTER_UNSUPPORTED_WARNING, "warning");
+      }
+      const ready = await ensureBridgeStarted((msg) => notify(ctx, msg, "warning"));
+      if (!ready && !warnedSkills && privateSkills.length > 0) {
+        warnedSkills = true;
+        notify(
+          ctx,
+          "antigravity: pi-tool bridge unavailable — pi-private skills are unavailable to agy this session.",
+          "warning",
+        );
+      }
     }
     const effort = ctx.thinkingLevel === "off" ? undefined : ctx.thinkingLevel;
     await getRuntime()
@@ -603,7 +638,6 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   pi.on("session_shutdown", async () => {
     await runtime?.dispose();
     runtime = undefined;
-    await bridgeLifecycle.teardown();
-    await mcpConfig.remove().catch(() => {});
+    await stopBridge();
   });
 }

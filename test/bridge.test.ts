@@ -5,8 +5,8 @@ import path from "node:path";
 import test from "node:test";
 import {
   createPiToolsAgent,
-  createPrivateMcpConfig,
-  sweepDeadBridgeArtifacts,
+  hasUnsupportedMcpAdapter,
+  sweepDeadPiToolsAgents,
 } from "../src/bridge/agent-files.ts";
 import { AgyPiBridge, selectBridgedTools } from "../src/bridge/server.ts";
 import {
@@ -143,9 +143,8 @@ test("AgyPiBridge enforces token header, exposes tools/list + activate_skill, an
   }
 });
 
-test("pi-tools agent files and dead bridge sweeping avoid private agy caches", async () => {
+test("pi-tools agent files, adapter guard, and dead agent sweeping stay clean", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-files-"));
-  const bridgesRoot = path.join(tmpDir, "bridges");
   const agentsDir = path.join(tmpDir, "agents");
 
   try {
@@ -168,23 +167,22 @@ test("pi-tools agent files and dead bridge sweeping avoid private agy caches", a
     await orchAgent.write();
     assert.match(fs.readFileSync(orchAgent.agentFile, "utf-8"), /"enter_plan_mode"/);
 
-    const mcp = createPrivateMcpConfig(bridgesRoot);
-    await mcp.write("http://127.0.0.1:9999/mcp", "tok");
-    assert.equal(fs.existsSync(path.join(mcp.directory, ".agents", "mcp_config.json")), true);
+    const deadAgent = path.join(agentsDir, "pi-tools-999999-11111111");
+    fs.mkdirSync(deadAgent, { recursive: true });
+    fs.writeFileSync(path.join(deadAgent, "agent.md"), "stale");
 
-    const deadBridge = path.join(bridgesRoot, "999999-11111111-1111-1111-1111-111111111111");
-    fs.mkdirSync(deadBridge, { recursive: true });
-    const deadAgent = path.join(agentsDir, "pi-tools-999999-11111111.md");
-    fs.writeFileSync(deadAgent, "stale");
-
-    await sweepDeadBridgeArtifacts({
-      bridgesRoot,
+    await sweepDeadPiToolsAgents({
       agentsRoot: agentsDir,
       isPidDead: (pid) => pid === 999999,
     });
-    assert.equal(fs.existsSync(deadBridge), false);
     assert.equal(fs.existsSync(deadAgent), false);
-    assert.equal(fs.existsSync(mcp.directory), true);
+    assert.equal(fs.existsSync(orchAgent.agentDir), true);
+
+    assert.equal(
+      hasUnsupportedMcpAdapter([{ sourceInfo: { source: "npm:pi-mcp-adapter" } }]),
+      true,
+    );
+    assert.equal(hasUnsupportedMcpAdapter([{ sourceInfo: { path: "builtin:mcp" } }]), false);
 
     const skills = piPrivateSkills(
       [
