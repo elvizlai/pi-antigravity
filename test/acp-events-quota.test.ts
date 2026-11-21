@@ -10,7 +10,12 @@ import {
   normalizeAcpPromptUsage,
   trackActiveToolStep,
 } from "../src/acp/events.ts";
-import { AgyQuotaTurnTracker, isAgyQuotaError, parseAgyQuotaNotice } from "../src/acp/quota.ts";
+import {
+  AgyQuotaTurnTracker,
+  isAgyQuotaError,
+  parseAgyErrorBanner,
+  parseAgyQuotaNotice,
+} from "../src/acp/quota.ts";
 
 test("acpUpdateToActivity normalizes thought, text, context usage, locations, and content-first tool updates", () => {
   const tools = new Map<string, AgyToolView>();
@@ -163,4 +168,45 @@ test("quota detection catches fake end_turn quota banners while avoiding prose f
   realTurn.noteThought();
   realTurn.noteText("⚠ Individual quota reached is what agy prints.");
   assert.equal(realTurn.detectTurnQuotaExhaustion({ totalTokens: 0, outputTokens: 0 }), undefined);
+
+  assert.equal(
+    parseAgyErrorBanner("⚠ FAILED_PRECONDITION (code 400): User location is not supported.")?.kind,
+    "api_error",
+  );
+
+  // Cumulative promptUsage from earlier tool waves must not suppress final-step error banners.
+  const failedAfterTools = new AgyQuotaTurnTracker();
+  failedAfterTools.noteToolActivity();
+  failedAfterTools.noteText(
+    "\n⚠ FAILED_PRECONDITION (code 400): User location is not supported for the API use.\n",
+  );
+  assert.deepEqual(
+    failedAfterTools.detectTurnErrorBanner({ totalTokens: 1_400_423, outputTokens: 25_705 }),
+    {
+      kind: "api_error",
+      message: "FAILED_PRECONDITION (code 400): User location is not supported for the API use.",
+    },
+  );
+
+  const quotaAfterTools = new AgyQuotaTurnTracker();
+  quotaAfterTools.noteToolActivity();
+  quotaAfterTools.noteText("⚠ Individual quota reached. Resets in 2h.");
+  assert.deepEqual(
+    quotaAfterTools.detectTurnErrorBanner({ totalTokens: 50_000, outputTokens: 500 }),
+    {
+      kind: "quota",
+      message: "Individual quota reached. Resets in 2h.",
+      resetsIn: "2h",
+    },
+  );
+
+  // Final step with its own thought/usage update is legitimate prose, not an error banner.
+  const validWithQuote = new AgyQuotaTurnTracker();
+  validWithQuote.noteToolActivity();
+  validWithQuote.noteUsageUpdate();
+  validWithQuote.noteText("⚠ FAILED_PRECONDITION (code 400): User location is not supported.");
+  assert.equal(
+    validWithQuote.detectTurnErrorBanner({ totalTokens: 50_000, outputTokens: 500 }),
+    undefined,
+  );
 });

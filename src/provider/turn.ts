@@ -37,11 +37,13 @@ export interface AgyTurnResult {
   status: "completed" | "aborted" | "error";
   stopReason: string;
   usage?: AgyUsage;
+  contextTokens?: number;
+  llmDurationMs?: number;
   error?: Error;
 }
 
 export type AgyTurnWaveResult =
-  | { wave: "bridge_wave" }
+  | { wave: "bridge_wave"; contextTokens?: number }
   | { wave: "settled"; result: AgyTurnResult }
   | { wave: "aborted" };
 
@@ -60,6 +62,9 @@ export class AgyTurnController {
   #settled = false;
   #error?: Error;
   #settledResult?: AgyTurnResult;
+  #latestContextTokens: number | undefined;
+  #accumulatedWaveMs = 0;
+  #waveCount = 0;
 
   get isSettled(): boolean {
     return this.#settled;
@@ -67,6 +72,9 @@ export class AgyTurnController {
 
   pushActivity(activity: AgyTurnActivity): void {
     if (this.#settled) return;
+    if (activity.type === "context_usage" && activity.usedTokens > 0) {
+      this.#latestContextTokens = activity.usedTokens;
+    }
     this.#queue.push({ kind: "activity", activity });
     this.#wake();
   }
@@ -98,50 +106,81 @@ export class AgyTurnController {
     options?: { signal?: AbortSignal },
   ): Promise<AgyTurnWaveResult> {
     const signal = options?.signal;
+    this.#waveCount += 1;
+    const waveStartedAt = performance.now();
+    let waveCommitted = false;
+    const commitWaveDuration = () => {
+      if (waveCommitted) return;
+      waveCommitted = true;
+      this.#accumulatedWaveMs += Math.max(0, performance.now() - waveStartedAt);
+    };
+    const bridgeWave = (): AgyTurnWaveResult => ({
+      wave: "bridge_wave",
+      ...(this.#latestContextTokens !== undefined
+        ? { contextTokens: this.#latestContextTokens }
+        : {}),
+    });
 
-    while (true) {
-      if (signal?.aborted) {
-        return { wave: "aborted" };
-      }
-
-      if (this.#queue.length > 0) {
-        let sawBridgeCall = false;
-        while (this.#queue.length > 0) {
-          const next = this.#queue[0];
-          if (
-            sawBridgeCall &&
-            !(next.kind === "activity" && next.activity.type === "bridge_call")
-          ) {
-            return { wave: "bridge_wave" };
-          }
-          this.#queue.shift();
-          if (next.kind === "error") {
-            throw next.error;
-          }
-          if (next.kind === "settled") {
-            if (sawBridgeCall) return { wave: "bridge_wave" };
-            return { wave: "settled", result: next.result };
-          }
-          await onActivity(next.activity);
-          if (next.activity.type === "bridge_call") {
-            sawBridgeCall = true;
-          }
+    try {
+      while (true) {
+        if (signal?.aborted) {
+          return { wave: "aborted" };
         }
-        if (sawBridgeCall) {
-          return { wave: "bridge_wave" };
+
+        if (this.#queue.length > 0) {
+          let sawBridgeCall = false;
+          while (this.#queue.length > 0) {
+            const next = this.#queue[0];
+            if (
+              sawBridgeCall &&
+              !(next.kind === "activity" && next.activity.type === "bridge_call")
+            ) {
+              return bridgeWave();
+            }
+            this.#queue.shift();
+            if (next.kind === "error") {
+              throw next.error;
+            }
+            if (next.kind === "settled") {
+              if (sawBridgeCall) return bridgeWave();
+              commitWaveDuration();
+              return { wave: "settled", result: this.#enrichSettled(next.result) };
+            }
+            await onActivity(next.activity);
+            if (next.activity.type === "bridge_call") {
+              sawBridgeCall = true;
+            }
+          }
+          if (sawBridgeCall) {
+            return bridgeWave();
+          }
+          continue;
         }
-        continue;
-      }
 
-      if (this.#error) {
-        throw this.#error;
-      }
-      if (this.#settledResult) {
-        return { wave: "settled", result: this.#settledResult };
-      }
+        if (this.#error) {
+          throw this.#error;
+        }
+        if (this.#settledResult) {
+          commitWaveDuration();
+          return { wave: "settled", result: this.#enrichSettled(this.#settledResult) };
+        }
 
-      await this.#waitForEvent(signal);
+        await this.#waitForEvent(signal);
+      }
+    } finally {
+      commitWaveDuration();
     }
+  }
+
+  #enrichSettled(result: AgyTurnResult): AgyTurnResult {
+    const contextTokens = result.contextTokens ?? this.#latestContextTokens;
+    const llmDurationMs =
+      this.#waveCount > 1 ? Math.max(1, Math.round(this.#accumulatedWaveMs)) : undefined;
+    return {
+      ...result,
+      ...(contextTokens !== undefined ? { contextTokens } : {}),
+      ...(llmDurationMs !== undefined ? { llmDurationMs } : {}),
+    };
   }
 
   #wake(): void {

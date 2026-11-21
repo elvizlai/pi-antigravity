@@ -50,14 +50,17 @@ function zeroUsage(): Usage {
   };
 }
 
-function toPiUsage(usage: AgyUsage | undefined, model: Model<Api>): Usage {
-  if (!usage) return zeroUsage();
-  const input = usage.input_tokens ?? 0;
-  const output = usage.output_tokens ?? 0;
-  const cacheRead = usage.cache_read_tokens ?? 0;
-  const cacheWrite = usage.cache_creation_tokens ?? 0;
-  const reasoning = usage.thinking_tokens ?? usage.reasoning_tokens;
-  const totalTokens = usage.total_tokens ?? input + output + cacheRead + cacheWrite;
+function toPiUsage(usage: AgyUsage | undefined, model: Model<Api>, contextTokens?: number): Usage {
+  if (!usage && !contextTokens) return zeroUsage();
+  const input = usage?.input_tokens ?? 0;
+  const output = usage?.output_tokens ?? 0;
+  const cacheRead = usage?.cache_read_tokens ?? 0;
+  const cacheWrite = usage?.cache_creation_tokens ?? 0;
+  const reasoning = usage?.thinking_tokens ?? usage?.reasoning_tokens;
+  const totalTokens =
+    contextTokens !== undefined && contextTokens > 0
+      ? contextTokens
+      : (usage?.total_tokens ?? input + output + cacheRead + cacheWrite);
   const costInput = (input / 1_000_000) * (model.cost?.input ?? 0);
   const costOutput = (output / 1_000_000) * (model.cost?.output ?? 0);
   const costCacheRead = (cacheRead / 1_000_000) * (model.cost?.cacheRead ?? 0);
@@ -315,6 +318,9 @@ export function createAntigravityStreamSimple(
         }
 
         if (waveResult.wave === "bridge_wave") {
+          if (waveResult.contextTokens && waveResult.contextTokens > 0) {
+            partial.usage = { ...zeroUsage(), totalTokens: waveResult.contextTokens };
+          }
           partial.stopReason = "toolUse";
           stream.push({ type: "done", reason: "toolUse", message: partial });
           stream.end(partial);
@@ -322,14 +328,17 @@ export function createAntigravityStreamSimple(
         }
 
         const settled = waveResult.result;
-        partial.usage = toPiUsage(settled.usage, model);
-
         if (settled.status === "aborted") {
           partial.stopReason = "aborted";
           partial.errorMessage = "Antigravity turn aborted.";
           stream.push({ type: "error", reason: "aborted", error: partial });
           stream.end(partial);
           return;
+        }
+
+        partial.usage = toPiUsage(settled.usage, model, settled.contextTokens);
+        if (settled.llmDurationMs !== undefined) {
+          partial.durationMs = settled.llmDurationMs;
         }
 
         if (hasAnyToolCall) {

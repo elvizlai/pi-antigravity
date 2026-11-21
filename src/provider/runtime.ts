@@ -157,6 +157,7 @@ interface ActiveTurn {
   toolMode: AgyToolMode;
   bridgeServerName?: string;
   noteFirstResponse: () => void;
+  noteBridgeCall: () => void;
   requestAbort: () => void;
 }
 
@@ -319,6 +320,7 @@ export class AgyRuntime {
     const active = this.#activeTurn;
     if (!active || active.controller.isSettled) return false;
     active.noteFirstResponse();
+    active.noteBridgeCall();
     active.controller.pushActivity({
       type: "bridge_call",
       callId: call.id,
@@ -694,6 +696,7 @@ export class AgyRuntime {
       toolMode,
       bridgeServerName,
       noteFirstResponse,
+      noteBridgeCall: () => quotaTracker.noteToolActivity(),
       requestAbort: () => {
         clearTimeoutTimer();
         promptAbort.abort();
@@ -802,15 +805,19 @@ export class AgyRuntime {
         cleanupActive();
 
         const normalizedUsage = normalizeAcpPromptUsage(promptResult.usage);
-        const quotaNotice = quotaTracker.detectTurnQuotaExhaustion({
+        const errorBanner = quotaTracker.detectTurnErrorBanner({
           totalTokens: normalizedUsage?.total_tokens,
           outputTokens: normalizedUsage?.output_tokens,
         });
-        if (quotaNotice) {
-          this.#lastQuotaError = quotaNotice.message;
+        if (errorBanner?.kind === "quota") {
+          this.#lastQuotaError = errorBanner.message;
           controller.fail(
-            new AgyQuotaError(quotaNotice.message, { resetsIn: quotaNotice.resetsIn }),
+            new AgyQuotaError(errorBanner.message, { resetsIn: errorBanner.resetsIn }),
           );
+          return;
+        }
+        if (errorBanner?.kind === "api_error") {
+          controller.fail(new Error(errorBanner.message));
           return;
         }
 

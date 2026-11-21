@@ -449,6 +449,11 @@ test("bridged MCP tool call suspends wave and resumes seamlessly when Pi toolRes
       },
       cancelSession() {},
       async prompt(_sid, _blocks, opts) {
+        opts?.onUpdate?.({
+          sessionUpdate: "usage_update",
+          used: 2771,
+          size: 1_048_576,
+        });
         // Call the real loopback HTTP bridge like agy does!
         const res = await fetch(bridge.url!, {
           method: "POST",
@@ -464,10 +469,23 @@ test("bridged MCP tool call suspends wave and resumes seamlessly when Pi toolRes
           result: { content: Array<{ text: string }> };
         };
         opts?.onUpdate?.({
+          sessionUpdate: "usage_update",
+          used: 3016,
+          size: 1_048_576,
+        });
+        opts?.onUpdate?.({
           sessionUpdate: "agent_message_chunk",
           content: { type: "text", text: `read:${json.result.content[0]?.text}` },
         });
-        return { stopReason: "end_turn" };
+        return {
+          stopReason: "end_turn",
+          usage: {
+            inputTokens: 7030,
+            outputTokens: 250,
+            cachedReadTokens: 1424,
+            totalTokens: 8704,
+          },
+        };
       },
       async dispose() {},
     }),
@@ -489,9 +507,14 @@ test("bridged MCP tool call suspends wave and resumes seamlessly when Pi toolRes
     assertDeltasMatchPartial(events1);
     const msg1 = await wave1.result();
     assert.equal(msg1.stopReason, "toolUse");
+    assert.equal(msg1.usage.totalTokens, 2771);
+    assert.equal(msg1.usage.output, 0);
     const toolCall = msg1.content.find((b) => b.type === "toolCall");
     assert.ok(toolCall && toolCall.type === "toolCall");
     assert.equal(toolCall.name, "read");
+
+    // Simulate local Pi tool execution pause between waves (excluded from multi-wave LLM durationMs).
+    await new Promise((r) => setTimeout(r, 80));
 
     messages = [
       ...messages,
@@ -513,6 +536,12 @@ test("bridged MCP tool call suspends wave and resumes seamlessly when Pi toolRes
     const msg2 = await wave2.result();
     assert.equal(msg2.stopReason, "stop");
     assert.equal(msg2.content[0]?.type === "text" ? msg2.content[0].text : "", "read:contents");
+    assert.equal(msg2.usage.totalTokens, 3016);
+    assert.equal(msg2.usage.input, 7030);
+    assert.equal(msg2.usage.output, 250);
+    assert.equal(msg2.usage.cacheRead, 1424);
+    assert.equal(typeof msg2.durationMs, "number");
+    assert.ok((msg2.durationMs ?? Number.POSITIVE_INFINITY) < 70);
     assert.deepEqual(seenNewMcp, [
       {
         type: "http",
@@ -525,6 +554,118 @@ test("bridged MCP tool call suspends wave and resumes seamlessly when Pi toolRes
     await runtime.dispose();
     await bridge.close();
     fs.rmSync(agentsDir, { recursive: true, force: true });
+  }
+});
+
+test("upstream ⚠ error banners after tool waves fail with stopReason error (400 non-retryable, 503 retryable) and zero usage", async () => {
+  const banners = [
+    "\n⚠ FAILED_PRECONDITION (code 400): User location is not supported for the API use.\n",
+    "\n⚠ UNAVAILABLE (code 503): Service temporarily unavailable.\n",
+  ];
+
+  for (const [idx, banner] of banners.entries()) {
+    const agentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-banner-agents-"));
+    const bridge = new AgyPiBridge(`pi-banner-${idx}`);
+    bridge.setToolSource(() => [{ name: "read", description: "read", parameters: {} }]);
+    bridge.refreshTools();
+    await bridge.start();
+
+    const runtime = new AgyRuntime({
+      cwd: "/work",
+      agentsDir,
+      bridge,
+      getToolMode: () => "pi",
+      ensureBridge: async () => true,
+      checkBinary: async () => ({ binary: "agy", version: "1.5.14" }),
+      createClient: () => ({
+        isAlive: true,
+        async initialize() {
+          return { protocolVersion: 1 };
+        },
+        async newSession() {
+          return { sessionId: `banner-sess-${idx}` };
+        },
+        async resumeSession() {
+          return { sessionId: `banner-sess-${idx}` };
+        },
+        async setConfigOption() {
+          return {};
+        },
+        cancelSession() {},
+        async prompt(_sid, _blocks, opts) {
+          opts?.onUpdate?.({ sessionUpdate: "usage_update", used: 25_000, size: 1_048_576 });
+          await fetch(bridge.url!, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              method: "tools/call",
+              params: { name: "pi__read", arguments: { path: "note.txt" } },
+            }),
+          });
+          // Final step fails without agent_thought_chunk or usage_update.
+          opts?.onUpdate?.({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: banner },
+          });
+          return {
+            stopReason: "end_turn",
+            usage: {
+              inputTokens: 125_102,
+              outputTokens: 25_705,
+              cachedReadTokens: 1_249_616,
+              totalTokens: 1_400_423,
+            },
+          };
+        },
+        async dispose() {},
+      }),
+    });
+
+    const streamSimple = createAntigravityStreamSimple({
+      getRuntime: () => runtime,
+      getSessionId: () => `pi-banner-${idx}`,
+      getBranchEntries: () => [],
+      replayStore: new AgyReplayStore(),
+    });
+
+    try {
+      let messages: unknown[] = [{ role: "user", content: "check", timestamp: 1 }];
+      const wave1 = streamSimple(testModel(), makeTranscript(messages));
+      const msg1 = await wave1.result();
+      assert.equal(msg1.stopReason, "toolUse");
+      const toolCall = msg1.content.find((b) => b.type === "toolCall");
+      assert.ok(toolCall && toolCall.type === "toolCall");
+
+      messages = [
+        ...messages,
+        msg1,
+        {
+          role: "toolResult",
+          toolCallId: toolCall.id,
+          toolName: "read",
+          content: [{ type: "text", text: "ok" }],
+          isError: false,
+          timestamp: 2,
+        },
+      ];
+
+      const wave2 = streamSimple(testModel(), makeTranscript(messages));
+      const msg2 = await wave2.result();
+      assert.equal(msg2.stopReason, "error");
+      assert.equal(msg2.usage.totalTokens, 0);
+      assert.equal(isRetryableAssistantError(msg2), idx === 1);
+      if (idx === 0) {
+        assert.match(msg2.errorMessage ?? "", /FAILED_PRECONDITION \(code 400\)/);
+      } else {
+        assert.match(msg2.errorMessage ?? "", /UNAVAILABLE \(code 503\)/);
+      }
+    } finally {
+      await runtime.dispose();
+      await bridge.close();
+      fs.rmSync(agentsDir, { recursive: true, force: true });
+    }
   }
 });
 
