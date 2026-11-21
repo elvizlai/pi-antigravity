@@ -50,17 +50,64 @@ function zeroUsage(): Usage {
   };
 }
 
-function toPiUsage(usage: AgyUsage | undefined, model: Model<Api>, contextTokens?: number): Usage {
-  if (!usage && !contextTokens) return zeroUsage();
-  const input = usage?.input_tokens ?? 0;
-  const output = usage?.output_tokens ?? 0;
-  const cacheRead = usage?.cache_read_tokens ?? 0;
-  const cacheWrite = usage?.cache_creation_tokens ?? 0;
-  const reasoning = usage?.thinking_tokens ?? usage?.reasoning_tokens;
-  const totalTokens =
-    contextTokens !== undefined && contextTokens > 0
-      ? contextTokens
-      : (usage?.total_tokens ?? input + output + cacheRead + cacheWrite);
+export function toPiUsage(
+  usage: AgyUsage | undefined,
+  model: Model<Api>,
+  contextTokens?: number,
+): Usage {
+  const hasContextTokens =
+    typeof contextTokens === "number" && Number.isFinite(contextTokens) && contextTokens > 0;
+  if (!usage && !hasContextTokens) return zeroUsage();
+
+  const rawInput = Math.max(0, usage?.input_tokens ?? 0);
+  const rawOutput = Math.max(0, usage?.output_tokens ?? 0);
+  const rawCacheRead = Math.max(0, usage?.cache_read_tokens ?? 0);
+  const rawCacheWrite = Math.max(0, usage?.cache_creation_tokens ?? 0);
+  const rawReasoning =
+    usage?.thinking_tokens !== undefined
+      ? Math.max(0, usage.thinking_tokens)
+      : usage?.reasoning_tokens !== undefined
+        ? Math.max(0, usage.reasoning_tokens)
+        : undefined;
+  const rawPrompt = rawInput + rawCacheRead + rawCacheWrite;
+  const rawComponentSum = rawPrompt + rawOutput;
+  const rawTotal = Math.max(usage?.total_tokens ?? 0, rawComponentSum);
+
+  let input = rawInput;
+  let output = rawOutput;
+  let cacheRead = rawCacheRead;
+  let cacheWrite = rawCacheWrite;
+  let reasoning = rawReasoning;
+  const totalTokens = hasContextTokens ? Math.round(contextTokens) : rawTotal;
+
+  // ACP `PromptResponse.usage` accumulates across every internal LLM call in the turn,
+  // whereas Pi expects `AssistantMessage.usage` to describe a single step (`isContextOverflow`
+  // checks `input + cacheRead > contextWindow` when `stopReason === "stop"`). When the final
+  // step's `usage_update.used` (`totalTokens`) is smaller than `rawTotal`, scale the cumulative
+  // breakdown proportionally into `totalTokens`.
+  if (hasContextTokens && rawTotal > totalTokens) {
+    const scale = totalTokens / rawTotal;
+    output = rawOutput > 0 ? Math.min(totalTokens, Math.max(1, Math.round(rawOutput * scale))) : 0;
+    const promptBudget = Math.min(
+      Math.max(0, totalTokens - output),
+      rawPrompt > 0 ? Math.round(rawPrompt * scale) : 0,
+    );
+    if (rawPrompt > 0 && promptBudget > 0) {
+      const promptScale = promptBudget / rawPrompt;
+      cacheRead = Math.min(promptBudget, Math.round(rawCacheRead * promptScale));
+      cacheWrite = Math.min(promptBudget - cacheRead, Math.round(rawCacheWrite * promptScale));
+      input = Math.max(0, promptBudget - cacheRead - cacheWrite);
+    } else {
+      input = 0;
+      cacheRead = 0;
+      cacheWrite = 0;
+    }
+    if (rawReasoning !== undefined) {
+      const scaledReasoning = rawReasoning > 0 ? Math.max(1, Math.round(rawReasoning * scale)) : 0;
+      reasoning = rawReasoning <= rawOutput ? Math.min(output, scaledReasoning) : scaledReasoning;
+    }
+  }
+
   const costInput = (input / 1_000_000) * (model.cost?.input ?? 0);
   const costOutput = (output / 1_000_000) * (model.cost?.output ?? 0);
   const costCacheRead = (cacheRead / 1_000_000) * (model.cost?.cacheRead ?? 0);
@@ -337,9 +384,6 @@ export function createAntigravityStreamSimple(
         }
 
         partial.usage = toPiUsage(settled.usage, model, settled.contextTokens);
-        if (settled.llmDurationMs !== undefined) {
-          partial.durationMs = settled.llmDurationMs;
-        }
 
         if (hasAnyToolCall) {
           partial.stopReason = "toolUse";

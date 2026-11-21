@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import {
   type Api,
+  isContextOverflow,
   isRetryableAssistantError,
   type Model,
   type TranscriptContext,
@@ -21,7 +22,7 @@ import {
   DEFAULT_FIRST_RESPONSE_TIMEOUT_MS,
 } from "../src/provider/runtime.ts";
 import { AGY_STATE_ENTRY_TYPE, type AgyConversationState } from "../src/provider/state.ts";
-import { createAntigravityStreamSimple } from "../src/provider/stream.ts";
+import { createAntigravityStreamSimple, toPiUsage } from "../src/provider/stream.ts";
 import { AgyReplayStore } from "../src/provider/turn.ts";
 import { assertDeltasMatchPartial } from "./delta-replay.ts";
 
@@ -537,9 +538,10 @@ test("bridged MCP tool call suspends wave and resumes seamlessly when Pi toolRes
     assert.equal(msg2.stopReason, "stop");
     assert.equal(msg2.content[0]?.type === "text" ? msg2.content[0].text : "", "read:contents");
     assert.equal(msg2.usage.totalTokens, 3016);
-    assert.equal(msg2.usage.input, 7030);
-    assert.equal(msg2.usage.output, 250);
-    assert.equal(msg2.usage.cacheRead, 1424);
+    assert.equal(msg2.usage.input, 2436);
+    assert.equal(msg2.usage.output, 87);
+    assert.equal(msg2.usage.cacheRead, 493);
+    assert.equal(msg2.usage.input + msg2.usage.cacheRead + msg2.usage.output, 3016);
     assert.equal(typeof msg2.durationMs, "number");
     assert.ok((msg2.durationMs ?? Number.POSITIVE_INFINITY) < 70);
     assert.deepEqual(seenNewMcp, [
@@ -554,6 +556,103 @@ test("bridged MCP tool call suspends wave and resumes seamlessly when Pi toolRes
     await runtime.dispose();
     await bridge.close();
     fs.rmSync(agentsDir, { recursive: true, force: true });
+  }
+});
+
+test("multi-step cumulative PromptResponse.usage scales to usage_update.used without triggering false silent overflow", async () => {
+  const runtime = new AgyRuntime({
+    cwd: "/work",
+    getToolMode: () => "native",
+    checkBinary: async () => ({ binary: "agy", version: "1.5.14" }),
+    createClient: () => ({
+      isAlive: true,
+      async initialize() {
+        return { protocolVersion: 1 };
+      },
+      async newSession() {
+        return { sessionId: "scaled-usage-sess" };
+      },
+      async resumeSession() {
+        return { sessionId: "scaled-usage-sess" };
+      },
+      async setConfigOption() {
+        return {};
+      },
+      cancelSession() {},
+      async prompt(_sid, _blocks, opts) {
+        opts?.onUpdate?.({ sessionUpdate: "usage_update", used: 69_916, size: 1_048_576 });
+        opts?.onUpdate?.({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "done" },
+        });
+        return {
+          stopReason: "end_turn",
+          usage: {
+            inputTokens: 101_108,
+            outputTokens: 22_608,
+            cachedReadTokens: 1_063_287,
+            thoughtTokens: 6_619,
+            totalTokens: 1_187_003,
+          },
+        };
+      },
+      async dispose() {},
+    }),
+  });
+
+  const streamSimple = createAntigravityStreamSimple({
+    getRuntime: () => runtime,
+    getSessionId: () => "pi-scaled-usage",
+    getBranchEntries: () => [],
+    replayStore: new AgyReplayStore(),
+  });
+
+  try {
+    const model = testModel();
+    const s = streamSimple(
+      model,
+      makeTranscript([{ role: "user", content: "status", timestamp: 1 }]),
+    );
+    const msg = await s.result();
+    assert.equal(msg.stopReason, "stop");
+    assert.equal(msg.usage.totalTokens, 69_916);
+    assert.equal(msg.usage.output, 1_332);
+    assert.equal(msg.usage.reasoning, 390);
+    assert.equal(msg.usage.cacheRead, 62_629);
+    assert.equal(msg.usage.input, 5_955);
+    assert.equal(msg.usage.input + msg.usage.cacheRead + msg.usage.output, 69_916);
+    assert.equal(isContextOverflow(msg, 1_000_000), false);
+
+    const singleStep = toPiUsage(
+      {
+        input_tokens: 3_113,
+        cache_read_tokens: 4_662,
+        output_tokens: 27,
+        thinking_tokens: 10,
+        total_tokens: 7_802,
+      },
+      model,
+      7_802,
+    );
+    assert.equal(singleStep.input, 3_113);
+    assert.equal(singleStep.cacheRead, 4_662);
+    assert.equal(singleStep.output, 27);
+    assert.equal(singleStep.reasoning, 10);
+    assert.equal(singleStep.totalTokens, 7_802);
+
+    const realOverflow = toPiUsage(
+      {
+        input_tokens: 150_000,
+        cache_read_tokens: 1_900_000,
+        output_tokens: 4_000,
+        total_tokens: 2_054_000,
+      },
+      model,
+      1_050_000,
+    );
+    assert.equal(isContextOverflow({ ...msg, usage: realOverflow }, 1_000_000), true);
+  } finally {
+    await runtime.dispose();
   }
 });
 
