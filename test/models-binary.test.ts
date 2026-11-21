@@ -104,9 +104,9 @@ test("model parsing, fallback merge, effort stripping, and config planning", () 
         id: "mode",
         category: "mode",
         type: "select",
-        currentValue: "agent",
+        currentValue: "default",
         options: [
-          { value: "agent", name: "Agent" },
+          { value: "default", name: "Default" },
           { value: "plan", name: "Plan" },
         ],
       },

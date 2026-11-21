@@ -45,7 +45,7 @@ export function formatAgyToolModeStatus(mode: AgyToolMode): string {
 
 export function formatAgyFooterStatus(
   mode: AgyToolMode,
-  executionMode: AgyExecutionMode = "agent",
+  executionMode: AgyExecutionMode = "default",
   quotaSummary?: string,
 ): string {
   const modeLabel = formatAgyToolModeStatus(mode);
@@ -73,7 +73,7 @@ export function parseAgyToolModeArg(raw: string | undefined): AgyToolModeCommand
 }
 
 export function resolveAgyExecutionMode(planEnabled: boolean): AgyExecutionMode {
-  return planEnabled ? "plan" : "agent";
+  return planEnabled ? "plan" : "default";
 }
 
 export function parseAgyPlanArg(raw: string | undefined): AgyPlanCommandAction {

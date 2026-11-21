@@ -52,7 +52,7 @@ Extension settings are stored independently in `~/.pi/agent/antigravity.json` (n
 ## Commands & Flags
 
 - `/agy-tools [pi|agy]` — Switch or inspect tool routing (persists to `~/.pi/agent/antigravity.json`)
-- `/agy-plan [on|off]` — Toggle ACP `plan` execution mode vs `agent`
+- `/agy-plan [on|off]` — Toggle ACP `plan` execution mode vs `default`
 - `/agy-reset` — Reset the bound ACP conversation and start fresh on the next turn
 - `/agy-doctor` — Verify `agy >= 1.5.0`, bridge server state, ACP connection, and quota status
 - `/agy-models` — Refresh available models from `agy models`

@@ -41,12 +41,22 @@ function makeTranscript(messages: unknown[]): TranscriptContext {
 test("AgyRuntime reuses session, falls back from missing resume to newSession, and orders mode -> model -> thought_level", async () => {
   const calls: string[] = [];
   let resumeAttempts = 0;
-  let currentMode = "agent";
+  let currentMode = "default";
+  let desiredExecutionMode: "default" | "plan" = "plan";
   let currentModel = "other";
   let currentThought = "low";
 
   const snapshotConfig = () => [
-    { id: "mode", category: "mode", type: "select", currentValue: currentMode },
+    {
+      id: "mode",
+      category: "mode",
+      type: "select",
+      currentValue: currentMode,
+      options: [
+        { value: "default", name: "Default" },
+        { value: "plan", name: "Plan" },
+      ],
+    },
     { id: "model", category: "model", type: "select", currentValue: currentModel },
     {
       id: "thought_level",
@@ -129,7 +139,7 @@ test("AgyRuntime reuses session, falls back from missing resume to newSession, a
         },
       },
     ],
-    getExecutionMode: () => "plan",
+    getExecutionMode: () => desiredExecutionMode,
     replayStore,
   });
 
@@ -152,7 +162,8 @@ test("AgyRuntime reuses session, falls back from missing resume to newSession, a
   ]);
   assert.equal(persisted[0]?.conversationId, "acp-fresh");
 
-  // Second turn reuses opened ACP session without spawning or resuming again.
+  // Second turn switches back to default (`/agy-plan off`) on the existing ACP session.
+  desiredExecutionMode = "default";
   const s2 = streamSimple(
     testModel(),
     makeTranscript([{ role: "user", content: "next", timestamp: 2 }]),
@@ -161,6 +172,8 @@ test("AgyRuntime reuses session, falls back from missing resume to newSession, a
   const res2 = await s2.result();
   assert.equal(res2.stopReason, "stop");
   assert.equal(calls.filter((c) => c === "newSession").length, 1);
+  assert.equal(currentMode, "default");
+  assert.ok(calls.includes("set:mode=default"));
   await runtime.dispose();
 });
 
@@ -588,7 +601,16 @@ test("warmupSession completes setup before streamSimple and reloads client when 
             return {
               sessionId: `sess-${clientId}`,
               configOptions: [
-                { id: "mode", category: "mode", type: "select", currentValue: "agent" },
+                {
+                  id: "mode",
+                  category: "mode",
+                  type: "select",
+                  currentValue: "default",
+                  options: [
+                    { value: "default", name: "Default" },
+                    { value: "plan", name: "Plan" },
+                  ],
+                },
                 {
                   id: "model",
                   category: "model",
@@ -603,7 +625,16 @@ test("warmupSession completes setup before streamSimple and reloads client when 
             return {
               sessionId,
               configOptions: [
-                { id: "mode", category: "mode", type: "select", currentValue: "agent" },
+                {
+                  id: "mode",
+                  category: "mode",
+                  type: "select",
+                  currentValue: "default",
+                  options: [
+                    { value: "default", name: "Default" },
+                    { value: "plan", name: "Plan" },
+                  ],
+                },
                 {
                   id: "model",
                   category: "model",
@@ -645,7 +676,7 @@ test("warmupSession completes setup before streamSimple and reloads client when 
 
     await runtime.warmupSession({
       modelId: "gemini-4-hydrogen",
-      executionMode: "agent",
+      executionMode: "default",
       sessionId: "pi-warmup-1",
       branchEntries: [],
     });

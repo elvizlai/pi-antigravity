@@ -21,6 +21,7 @@ import {
   type AgyExecutionMode,
   extractAcpConfigOption,
   isAgyOrchestratorModel,
+  resolveAcpExecutionMode,
   resolveAcpModelCandidate,
   resolveAcpThoughtLevel,
 } from "../acp/models.ts";
@@ -324,7 +325,7 @@ export class AgyRuntime {
     if (params.signal?.aborted || this.#activeTurn) return;
     await this.#runWarmup(params.signal, async (signal) => {
       if (signal.aborted || this.#activeTurn) return;
-      const executionMode = params.executionMode ?? this.#deps.getExecutionMode?.() ?? "agent";
+      const executionMode = params.executionMode ?? this.#deps.getExecutionMode?.() ?? "default";
       await this.#prepareConfiguredSession({
         modelId: params.modelId,
         effort: params.effort,
@@ -555,16 +556,10 @@ export class AgyRuntime {
     let currentOptions = initialOptions;
 
     const modeOption = extractAcpConfigOption(currentOptions, "mode");
-    if (modeOption && modeOption.currentValue !== desired.executionMode) {
-      const supported = new Set((modeOption.options ?? []).map((o) => o.value));
-      if (supported.size === 0 || supported.has(desired.executionMode)) {
-        const updated = await client.setConfigOption(
-          sessionId,
-          modeOption.id,
-          desired.executionMode,
-        );
-        if (updated.configOptions) currentOptions = updated.configOptions;
-      }
+    const resolvedMode = resolveAcpExecutionMode(desired.executionMode, modeOption);
+    if (modeOption && resolvedMode && modeOption.currentValue !== resolvedMode) {
+      const updated = await client.setConfigOption(sessionId, modeOption.id, resolvedMode);
+      if (updated.configOptions) currentOptions = updated.configOptions;
     }
 
     const modelOption = extractAcpConfigOption(currentOptions, "model");
@@ -654,7 +649,7 @@ export class AgyRuntime {
     }
 
     // 2. Fresh ACP prompt turn.
-    const executionMode = params.executionMode ?? this.#deps.getExecutionMode?.() ?? "agent";
+    const executionMode = params.executionMode ?? this.#deps.getExecutionMode?.() ?? "default";
     const { client, sessionId, toolMode, bridgeServerName } = await this.#prepareConfiguredSession({
       modelId: params.modelId,
       effort: params.effort,

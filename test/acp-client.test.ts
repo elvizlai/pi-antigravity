@@ -37,7 +37,16 @@ rl.on("line", (line) => {
       result: {
         sessionId: "sess-1",
         configOptions: [
-          { id: "mode", category: "mode", type: "select", currentValue: "agent" },
+          {
+            id: "mode",
+            category: "mode",
+            type: "select",
+            currentValue: "default",
+            options: [
+              { value: "default", name: "Default" },
+              { value: "plan", name: "Plan" },
+            ],
+          },
           { id: "model", category: "model", type: "select", currentValue: "gemini-pro" }
         ]
       }

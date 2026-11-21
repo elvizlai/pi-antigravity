@@ -401,14 +401,14 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       const query = prefix.trim().toLowerCase();
       const items = [
         { value: "on", label: "on", description: "Enable ACP plan mode" },
-        { value: "off", label: "off", description: "Use ACP agent mode" },
+        { value: "off", label: "off", description: "Use default ACP execution mode" },
       ].filter((item) => item.value.startsWith(query));
       return items.length > 0 ? items : null;
     },
     async handler(args, ctx) {
       const action = parseAgyPlanArg(args);
       if (action.kind === "status") {
-        executionMode = executionMode === "plan" ? "agent" : "plan";
+        executionMode = executionMode === "plan" ? "default" : "plan";
       } else if (action.kind === "set") {
         executionMode = resolveAgyExecutionMode(action.enabled);
       } else {

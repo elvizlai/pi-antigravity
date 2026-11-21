@@ -8,7 +8,7 @@ import {
   untrackProcessGroup,
 } from "./process-tree.ts";
 
-export type AgyExecutionMode = "agent" | "plan";
+export type AgyExecutionMode = "default" | "plan";
 
 export type AgyEffort = "low" | "medium" | "high" | "xhigh";
 
@@ -406,6 +406,18 @@ export function resolveAcpThoughtLevel(
   return undefined;
 }
 
+/** Resolve `default` / `plan` execution mode against advertised ACP `mode` options. */
+export function resolveAcpExecutionMode(
+  desired: AgyExecutionMode,
+  modeOption: AgyAcpConfigOption | undefined,
+): string | undefined {
+  if (!modeOption) return undefined;
+  const supported = new Set((modeOption.options ?? []).map((o) => o.value));
+  if (supported.size === 0 || supported.has(desired)) return desired;
+  if (desired === "default" && supported.has("agent")) return "agent";
+  return undefined;
+}
+
 /**
  * Compute desired config writes after setting `model` first (because `agy` changes
  * which `thought_level` values exist per model).
@@ -427,12 +439,9 @@ export function planAgyAcpSecondaryConfigWrites(
 
   const modeOption = extractAcpConfigOption(configOptions, "mode");
   if (desired.executionMode && modeOption) {
-    const supportedModes = new Set((modeOption.options ?? []).map((o) => o.value));
-    if (
-      (supportedModes.size === 0 || supportedModes.has(desired.executionMode)) &&
-      modeOption.currentValue !== desired.executionMode
-    ) {
-      writes.push({ configId: modeOption.id, value: desired.executionMode });
+    const resolvedMode = resolveAcpExecutionMode(desired.executionMode, modeOption);
+    if (resolvedMode && modeOption.currentValue !== resolvedMode) {
+      writes.push({ configId: modeOption.id, value: resolvedMode });
     }
   }
 
