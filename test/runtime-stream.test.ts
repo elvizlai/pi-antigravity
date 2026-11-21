@@ -12,6 +12,7 @@ import {
 import antigravityExtension from "../index.ts";
 import type { AcpHttpMcpServer } from "../src/acp/client.ts";
 import { AgyPiBridge } from "../src/bridge/server.ts";
+import { INCOMPLETE_ACP_TOOL_MESSAGE } from "../src/provider/prompt.ts";
 import {
   type AgyAcpClientLike,
   AgyFirstResponseTimeoutError,
@@ -527,7 +528,7 @@ test("bridged MCP tool call suspends wave and resumes seamlessly when Pi toolRes
   }
 });
 
-test("native wrapper tool replay store preserves output and daemon parked errors accurately", async () => {
+test("native wrapper tool replay store preserves output and incomplete tool errors accurately", async () => {
   const replayStore = new AgyReplayStore();
   const workingStatuses: Array<string | undefined> = [];
   const runtime = new AgyRuntime({
@@ -554,7 +555,9 @@ test("native wrapper tool replay store preserves output and daemon parked errors
         opts?.onUpdate?.({
           sessionUpdate: "tool_call",
           toolCallId: "n1",
-          title: "view_file",
+          title: "Read a.txt",
+          kind: "read",
+          locations: [{ path: "a.txt" }],
           status: "in_progress",
           rawInput: { path: "a.txt" },
         });
@@ -567,9 +570,10 @@ test("native wrapper tool replay store preserves output and daemon parked errors
         opts?.onUpdate?.({
           sessionUpdate: "tool_call",
           toolCallId: "d1",
-          title: "run_command",
+          title: "Run sleep 10",
+          kind: "execute",
           status: "in_progress",
-          rawInput: { CommandLine: "sleep 10", IsDaemon: true },
+          rawInput: { cmd: "sleep 10" },
         });
         return { stopReason: "end_turn" };
       },
@@ -596,9 +600,9 @@ test("native wrapper tool replay store preserves output and daemon parked errors
   const calls = msg.content.filter((b) => b.type === "toolCall");
   assert.equal(calls.length, 2);
   assert.equal(replayStore.take(calls[0].id)?.output, "line1");
-  assert.match(replayStore.take(calls[1].id)?.error ?? "", /background task/);
-  assert.equal(workingStatuses[0], "Running read…");
-  assert.ok(workingStatuses.includes("Running bash: sleep 10…"));
+  assert.equal(replayStore.take(calls[1].id)?.error, INCOMPLETE_ACP_TOOL_MESSAGE);
+  assert.equal(workingStatuses[0], "Read a.txt…");
+  assert.ok(workingStatuses.includes("Run sleep 10…"));
   assert.equal(workingStatuses.at(-1), undefined);
   await runtime.dispose();
 });

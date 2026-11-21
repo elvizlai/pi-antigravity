@@ -88,6 +88,31 @@ test("model parsing, fallback merge, effort stripping, and config planning", () 
   });
   assert.equal(resolvedEffort, "high");
 
+  assert.equal(
+    resolveAcpThoughtLevel("extra", {
+      id: "thought_level",
+      type: "select",
+      options: [
+        { value: "low", name: "Low" },
+        { value: "extra", name: "Extra" },
+        { value: "max", name: "Max" },
+      ],
+    }),
+    "extra",
+  );
+  assert.equal(
+    resolveAcpThoughtLevel("max", {
+      id: "thought_level",
+      type: "select",
+      options: [
+        { value: "low", name: "Low" },
+        { value: "extra", name: "Extra" },
+        { value: "max", name: "Max" },
+      ],
+    }),
+    "max",
+  );
+
   const modeOption = {
     id: "mode",
     category: "mode",

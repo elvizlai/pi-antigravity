@@ -7,7 +7,8 @@ export type AgyTurnActivity =
 
 /** Recorded native agy tool execution replayed by the display-only `antigravity` tool. */
 export interface RecordedAgyTool {
-  agyTool: string;
+  title: string;
+  kind?: string;
   output?: string;
   error?: string;
   durationSeconds?: number;
@@ -33,7 +34,7 @@ export class AgyReplayStore {
 }
 
 export interface AgyTurnResult {
-  status: "completed" | "aborted" | "error" | "parked_daemon";
+  status: "completed" | "aborted" | "error";
   stopReason: string;
   usage?: AgyUsage;
   error?: Error;
@@ -89,7 +90,7 @@ export class AgyTurnController {
   /**
    * Consume events for the current Pi assistant wave until either:
    * - one or more `bridge_call`s suspend the turn for Pi tool execution,
-   * - the underlying ACP turn settles (completed / aborted / parked_daemon), or
+   * - the underlying ACP turn settles (completed / aborted / error), or
    * - the per-wave `signal` aborts.
    */
   async drainWave(

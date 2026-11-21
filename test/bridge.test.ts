@@ -155,8 +155,12 @@ test("pi-tools agent files, adapter guard, and dead agent sweeping stay clean", 
     await stdAgent.write();
     assert.equal(stdAgent.agentFile.endsWith(`${path.sep}agent.md`), true);
     const stdContent = fs.readFileSync(stdAgent.agentFile, "utf-8");
-    assert.match(stdContent, /"inheritCustomizations": false/);
+    assert.match(stdContent, /"mainAgent": true/);
+    assert.match(stdContent, /"subagent": false/);
+    assert.doesNotMatch(stdContent, /"hidden"/);
+    assert.doesNotMatch(stdContent, /"inheritCustomizations"/);
     assert.doesNotMatch(stdContent, /"mcpServers"/);
+    assert.doesNotMatch(stdContent, /<plan_execute_protocol>/);
     assert.match(stdContent, /"tools": \[\]/);
     await stdAgent.remove();
 

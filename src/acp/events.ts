@@ -1,5 +1,10 @@
 import type { JsonObject } from "@earendil-works/pi-ai";
 
+export type AcpToolLocation = {
+  path: string;
+  line?: number;
+};
+
 export interface AgyUsage {
   input_tokens?: number;
   output_tokens?: number;
@@ -14,11 +19,12 @@ export type AgyToolStatus = "pending" | "in_progress" | "completed" | "failed" |
 
 export interface AgyToolView {
   toolCallId: string;
-  name: string;
-  title?: string;
+  title: string;
+  name?: string;
   kind?: string;
+  locations?: AcpToolLocation[];
+  rawInput?: JsonObject;
   status: AgyToolStatus;
-  args: JsonObject;
   output?: string;
   startedAtMs: number;
   startedEmitted: boolean;
@@ -32,36 +38,40 @@ export type AgyActivity =
   | {
       type: "tool_start";
       callId: string;
-      name: string;
-      title?: string;
+      title: string;
+      name?: string;
       kind?: string;
-      args: JsonObject;
+      locations?: AcpToolLocation[];
+      rawInput?: JsonObject;
     }
   | {
       type: "tool_update";
       callId: string;
-      name: string;
-      title?: string;
+      title: string;
+      name?: string;
       kind?: string;
-      args: JsonObject;
+      locations?: AcpToolLocation[];
+      rawInput?: JsonObject;
     }
   | {
       type: "tool_done";
       callId: string;
-      name: string;
-      title?: string;
+      title: string;
+      name?: string;
       kind?: string;
-      args: JsonObject;
+      locations?: AcpToolLocation[];
+      rawInput?: JsonObject;
       output?: string;
       durationSeconds?: number;
     }
   | {
       type: "tool_error";
       callId: string;
-      name: string;
-      title?: string;
+      title: string;
+      name?: string;
       kind?: string;
-      args: JsonObject;
+      locations?: AcpToolLocation[];
+      rawInput?: JsonObject;
       message: string;
       durationSeconds?: number;
     };
@@ -81,19 +91,17 @@ function asJsonObject(value: unknown): JsonObject | undefined {
   return rec ? (rec as JsonObject) : undefined;
 }
 
-function inferToolName(update: Record<string, unknown>, existing: AgyToolView | undefined): string {
-  const explicit = nonEmptyString(update.toolName) ?? nonEmptyString(update.name);
-  if (explicit) return explicit;
-  if (existing && existing.name !== "unknown") return existing.name;
-
-  const title = nonEmptyString(update.title) ?? existing?.title;
-  if (title) {
-    // When agy emits bare tool identifiers as title (e.g. `run_command`, `mcp_...`), keep them.
-    if (/^[a-zA-Z0-9_.:-]+$/.test(title)) return title;
-    return title.split(/\s+/)[0] || title;
+function parseAcpLocations(raw: unknown): AcpToolLocation[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const locations: AcpToolLocation[] = [];
+  for (const item of raw) {
+    const rec = asRecord(item);
+    const filePath = nonEmptyString(rec?.path);
+    if (!filePath) continue;
+    const line = typeof rec?.line === "number" && Number.isFinite(rec.line) ? rec.line : undefined;
+    locations.push(line !== undefined ? { path: filePath, line } : { path: filePath });
   }
-
-  return nonEmptyString(update.kind) ?? existing?.kind ?? "unknown";
+  return locations.length > 0 ? locations : undefined;
 }
 
 function extractTextFromContentBlock(block: unknown): string | undefined {
@@ -121,33 +129,36 @@ function extractTextFromContentBlock(block: unknown): string | undefined {
   return undefined;
 }
 
+/** Extract display text preferring standard ACP `content` blocks, falling back to `rawOutput`. */
 export function extractAcpToolOutput(rawOutput: unknown, content: unknown): string | undefined {
   const sections: string[] = [];
 
-  if (typeof rawOutput === "string") {
-    if (rawOutput.trim().length > 0) sections.push(rawOutput);
-  } else {
-    const out = asRecord(rawOutput);
-    if (out) {
-      for (const key of ["output", "stdout", "text", "content", "result", "error", "message"]) {
-        const val = out[key];
-        if (typeof val === "string" && val.trim().length > 0) sections.push(val);
-      }
-      const stderr = out.stderr;
-      if (typeof stderr === "string" && stderr.trim().length > 0) {
-        sections.push(stderr);
-      }
-      if (sections.length === 0) {
-        const serialized = JSON.stringify(out);
-        if (serialized && serialized !== "{}") sections.push(serialized);
-      }
-    }
-  }
-
-  if (sections.length === 0 && Array.isArray(content)) {
+  if (Array.isArray(content)) {
     for (const block of content) {
       const text = extractTextFromContentBlock(block);
       if (text) sections.push(text);
+    }
+  }
+
+  if (sections.length === 0) {
+    if (typeof rawOutput === "string") {
+      if (rawOutput.trim().length > 0) sections.push(rawOutput);
+    } else {
+      const out = asRecord(rawOutput);
+      if (out) {
+        for (const key of ["output", "stdout", "text", "content", "result", "error", "message"]) {
+          const val = out[key];
+          if (typeof val === "string" && val.trim().length > 0) sections.push(val);
+        }
+        const stderr = out.stderr;
+        if (typeof stderr === "string" && stderr.trim().length > 0) {
+          sections.push(stderr);
+        }
+        if (sections.length === 0) {
+          const serialized = JSON.stringify(out);
+          if (serialized && serialized !== "{}") sections.push(serialized);
+        }
+      }
     }
   }
 
@@ -173,7 +184,7 @@ function readDurationSeconds(startedAtMs: number, now: number): number | undefin
   return Number.isFinite(elapsed) && elapsed >= 0 ? elapsed : undefined;
 }
 
-/** Merge a `tool_call` or `tool_call_update` payload into the tracked map and return resulting activity. */
+/** Merge a standard ACP `tool_call` or `tool_call_update` payload into the tracked map. */
 export function mergeAgyAcpTool(
   tools: Map<string, AgyToolView>,
   update: Record<string, unknown>,
@@ -183,35 +194,25 @@ export function mergeAgyAcpTool(
   if (!toolCallId) return undefined;
 
   const existing = tools.get(toolCallId);
-  const name = inferToolName(update, existing);
-  const title = nonEmptyString(update.title) ?? existing?.title;
   const kind = nonEmptyString(update.kind) ?? existing?.kind;
+  const title = nonEmptyString(update.title) ?? existing?.title ?? kind ?? "tool";
+  const name = nonEmptyString(update.name) ?? existing?.name;
   const status = normalizeStatus(update.status, existing?.status ?? "pending");
-  const incomingArgs = asJsonObject(update.rawInput);
-  const mergedArgs: JsonObject = incomingArgs
-    ? { ...(existing?.args ?? {}), ...incomingArgs }
-    : (existing?.args ?? {});
-
-  // Add first location path if args has none so renderers / mappers still have a path hint.
-  if (
-    Object.keys(mergedArgs).length === 0 &&
-    Array.isArray(update.locations) &&
-    update.locations.length > 0
-  ) {
-    const firstLoc = asRecord(update.locations[0]);
-    const locPath = nonEmptyString(firstLoc?.path);
-    if (locPath) mergedArgs.path = locPath;
-  }
-
+  const locations = parseAcpLocations(update.locations) ?? existing?.locations;
+  const incomingRaw = asJsonObject(update.rawInput);
+  const rawInput = incomingRaw
+    ? { ...(existing?.rawInput ?? {}), ...incomingRaw }
+    : existing?.rawInput;
   const output = extractAcpToolOutput(update.rawOutput, update.content) ?? existing?.output;
 
   const view: AgyToolView = {
     toolCallId,
-    name,
     title,
-    kind,
+    ...(name ? { name } : {}),
+    ...(kind ? { kind } : {}),
+    ...(locations ? { locations } : {}),
+    ...(rawInput ? { rawInput } : {}),
     status,
-    args: mergedArgs,
     output,
     startedAtMs: existing?.startedAtMs ?? now,
     startedEmitted: existing?.startedEmitted ?? false,
@@ -219,17 +220,22 @@ export function mergeAgyAcpTool(
   };
   tools.set(toolCallId, view);
 
+  const shared = {
+    callId: view.toolCallId,
+    title: view.title,
+    ...(view.name ? { name: view.name } : {}),
+    ...(view.kind ? { kind: view.kind } : {}),
+    ...(view.locations ? { locations: view.locations } : {}),
+    ...(view.rawInput ? { rawInput: view.rawInput } : {}),
+  };
+
   if (status === "completed") {
     if (view.finishedEmitted) return undefined;
     view.startedEmitted = true;
     view.finishedEmitted = true;
     return {
       type: "tool_done",
-      callId: view.toolCallId,
-      name: view.name,
-      title: view.title,
-      kind: view.kind,
-      args: view.args,
+      ...shared,
       output: view.output,
       durationSeconds: readDurationSeconds(view.startedAtMs, now),
     };
@@ -241,11 +247,7 @@ export function mergeAgyAcpTool(
     view.finishedEmitted = true;
     return {
       type: "tool_error",
-      callId: view.toolCallId,
-      name: view.name,
-      title: view.title,
-      kind: view.kind,
-      args: view.args,
+      ...shared,
       message:
         view.output || (status === "cancelled" ? "Tool call cancelled." : "Tool call failed."),
       durationSeconds: readDurationSeconds(view.startedAtMs, now),
@@ -254,24 +256,10 @@ export function mergeAgyAcpTool(
 
   if (!view.startedEmitted) {
     view.startedEmitted = true;
-    return {
-      type: "tool_start",
-      callId: view.toolCallId,
-      name: view.name,
-      title: view.title,
-      kind: view.kind,
-      args: view.args,
-    };
+    return { type: "tool_start", ...shared };
   }
 
-  return {
-    type: "tool_update",
-    callId: view.toolCallId,
-    name: view.name,
-    title: view.title,
-    kind: view.kind,
-    args: view.args,
-  };
+  return { type: "tool_update", ...shared };
 }
 
 /** Convert an ACP `session/update` object into zero or one typed turn activities. */
@@ -351,74 +339,49 @@ function sanitizeMcpIdentifier(name: string): string {
   return name.replace(/[^a-zA-Z0-9_]/g, "_");
 }
 
+const BRIDGED_TOOL_PREFIX_RE = /(?:^|[\s:_/])pi__[a-zA-Z0-9_-]+/;
+
 /**
- * True when an ACP tool call represents Pi's own MCP bridge tool (`pi__*` or
- * `call_mcp_tool` targeting the bridge server). User-configured external MCP
- * servers stay false so their calls still appear in Pi as antigravity cards.
+ * True when an ACP tool call belongs to Pi's own MCP bridge server (`pi__*` or
+ * `mcp_<bridgeServerName>_*`). External MCP servers stay false so their calls
+ * still render in Pi as wrapper cards.
  */
 export function isBridgedMcpTool(
   activity: {
-    name: string;
-    args?: Record<string, unknown>;
+    title?: string;
+    name?: string;
   },
   bridgeServerName?: string,
 ): boolean {
-  const { name, args } = activity;
-  if (name.startsWith("pi__")) return true;
-
-  if (bridgeServerName) {
-    const sanitized = sanitizeMcpIdentifier(bridgeServerName);
-    if (name.startsWith(`mcp_${sanitized}_`) || name.startsWith(`mcp_${bridgeServerName}_`)) {
+  const sanitized = bridgeServerName ? sanitizeMcpIdentifier(bridgeServerName) : undefined;
+  for (const raw of [activity.name, activity.title]) {
+    if (!raw) continue;
+    if (BRIDGED_TOOL_PREFIX_RE.test(raw)) return true;
+    if (
+      bridgeServerName &&
+      sanitized &&
+      (raw.includes(`mcp_${sanitized}_`) ||
+        raw.includes(`mcp_${bridgeServerName}_`) ||
+        raw === bridgeServerName ||
+        raw.startsWith(`${bridgeServerName}:`) ||
+        raw.startsWith(`${bridgeServerName}/`))
+    ) {
       return true;
     }
   }
-
-  if (name === "call_mcp_tool") {
-    const serverName = nonEmptyString(args?.ServerName ?? args?.serverName);
-    const toolName = nonEmptyString(args?.ToolName ?? args?.toolName);
-    if (bridgeServerName && serverName === bridgeServerName) return true;
-    if (toolName?.startsWith("pi__")) return true;
-  }
-
   return false;
 }
 
-/** Missing call IDs fall back to the tool name key. */
-export function agyToolStepKey(activity: {
-  callId?: string;
-  stepId?: string | number;
-  name: string;
-}): string {
-  if (activity.callId) return `call:${activity.callId}`;
-  if (activity.stepId !== undefined) return `step:${activity.stepId}`;
-  return `name:${activity.name}`;
+/** Key identifying an ACP tool step in a turn. */
+export function agyToolStepKey(activity: { callId: string }): string {
+  return `call:${activity.callId}`;
 }
 
-/** True only when the step explicitly started an agy daemon (`IsDaemon: true`). */
-export function isDaemonToolStep(activity: {
-  name: string;
-  args?: Record<string, unknown>;
-}): boolean {
-  const flag = activity.args?.IsDaemon ?? activity.args?.isDaemon;
-  return (
-    (activity.name === "run_command" || activity.name === "execute_command") &&
-    (flag === true || flag === "true")
-  );
-}
-
-/** Track active tool calls in the current turn; completions clear siblings by key only. */
-export function trackActiveToolStep(
-  active: Set<string>,
-  activity: AgyActivity,
-  daemons?: Set<string>,
-): void {
+/** Track active tool calls in the current turn by ACP `callId`. */
+export function trackActiveToolStep(active: Set<string>, activity: AgyActivity): void {
   if (activity.type === "tool_start") {
-    const key = agyToolStepKey(activity);
-    active.add(key);
-    if (daemons && isDaemonToolStep(activity)) daemons.add(key);
+    active.add(agyToolStepKey(activity));
   } else if (activity.type === "tool_done" || activity.type === "tool_error") {
-    const key = agyToolStepKey(activity);
-    active.delete(key);
-    daemons?.delete(key);
+    active.delete(agyToolStepKey(activity));
   }
 }

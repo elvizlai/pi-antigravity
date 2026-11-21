@@ -13,7 +13,6 @@ import {
   acpUpdateToActivity,
   isBridgedMcpTool,
   normalizeAcpPromptUsage,
-  trackActiveToolStep,
 } from "../acp/events.ts";
 import {
   type AgyAcpConfigOption,
@@ -27,7 +26,7 @@ import {
 import { type AgyQuotaNotice, AgyQuotaTurnTracker, isAgyQuotaError } from "../acp/quota.ts";
 import { createPiToolsAgent, type PiToolsAgentHandle } from "../bridge/agent-files.ts";
 import type { AgyPiBridge, BridgeCall } from "../bridge/server.ts";
-import { AGY_PARKED_TURN_ERROR, agyIncompleteToolError, collectTurnToolResults } from "./prompt.ts";
+import { collectTurnToolResults, INCOMPLETE_ACP_TOOL_MESSAGE } from "./prompt.ts";
 import { AgyWorkingStatusTracker } from "./render.ts";
 import type { AgyToolMode } from "./settings.ts";
 import {
@@ -653,8 +652,6 @@ export class AgyRuntime {
 
     const controller = new AgyTurnController();
     const acpTools = new Map<string, AgyToolView>();
-    const activeToolSteps = new Set<string>();
-    const daemonToolSteps = new Set<string>();
     const quotaTracker = new AgyQuotaTurnTracker();
     const workingTracker = new AgyWorkingStatusTracker();
     const promptAbort = new AbortController();
@@ -794,7 +791,6 @@ export class AgyRuntime {
             return;
           }
 
-          trackActiveToolStep(activeToolSteps, activity, daemonToolSteps);
           quotaTracker.noteToolActivity();
           setWorkingStatus(workingTracker.onActivity(activity));
           controller.pushActivity(activity);
@@ -818,10 +814,7 @@ export class AgyRuntime {
           return;
         }
 
-        const isParkedDaemon =
-          activeToolSteps.size > 0 && daemonToolSteps.size === activeToolSteps.size;
-
-        if (!isParkedDaemon && promptResult.stopReason === "error") {
+        if (promptResult.stopReason === "error") {
           controller.fail(new Error("Antigravity ACP turn failed with stopReason: error."));
           return;
         }
@@ -830,15 +823,15 @@ export class AgyRuntime {
         for (const [callId, tool] of acpTools.entries()) {
           if (tool.finishedEmitted || isBridgedMcpTool(tool, bridgeServerName)) continue;
           tool.finishedEmitted = true;
-          const isDaemon = daemonToolSteps.has(`call:${callId}`);
           controller.pushActivity({
             type: "tool_error",
             callId,
-            name: tool.name,
             title: tool.title,
-            kind: tool.kind,
-            args: tool.args,
-            message: isDaemon ? AGY_PARKED_TURN_ERROR : agyIncompleteToolError(tool.name),
+            ...(tool.name ? { name: tool.name } : {}),
+            ...(tool.kind ? { kind: tool.kind } : {}),
+            ...(tool.locations ? { locations: tool.locations } : {}),
+            ...(tool.rawInput ? { rawInput: tool.rawInput } : {}),
+            message: INCOMPLETE_ACP_TOOL_MESSAGE,
           });
         }
 
@@ -854,7 +847,7 @@ export class AgyRuntime {
         });
 
         controller.finish({
-          status: isParkedDaemon ? "parked_daemon" : "completed",
+          status: "completed",
           stopReason: promptResult.stopReason,
           usage: normalizedUsage,
         });
@@ -910,7 +903,4 @@ export class AgyRuntime {
     }
     return resolved;
   }
-
-  /** Expose parked-turn error marker for incomplete daemon rendering tests/stream consumers. */
-  static readonly parkedTurnError = AGY_PARKED_TURN_ERROR;
 }

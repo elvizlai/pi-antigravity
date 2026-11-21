@@ -10,9 +10,16 @@ import {
 
 export type AgyExecutionMode = "default" | "plan";
 
-export type AgyEffort = "low" | "medium" | "high" | "xhigh";
+export type AgyEffort = "low" | "medium" | "high" | "extra" | "xhigh" | "max";
 
-export const AGY_EFFORT_ORDER: readonly AgyEffort[] = ["low", "medium", "high", "xhigh"];
+export const AGY_EFFORT_ORDER: readonly AgyEffort[] = [
+  "low",
+  "medium",
+  "high",
+  "extra",
+  "xhigh",
+  "max",
+];
 
 export interface AgyAcpSelectOption {
   value: string;
@@ -381,6 +388,7 @@ export function resolveAcpThoughtLevel(
   if (!thoughtOption?.options || thoughtOption.options.length === 0) return undefined;
   const supported = new Set(thoughtOption.options.map((o) => o.value));
   if (!requested) return undefined;
+  if (supported.has(requested)) return requested as AgyEffort;
 
   const mapped: AgyEffort =
     requested === "minimal"
@@ -390,6 +398,7 @@ export function resolveAcpThoughtLevel(
         : requested === "low" ||
             requested === "medium" ||
             requested === "high" ||
+            requested === "extra" ||
             requested === "xhigh"
           ? requested
           : "medium";

@@ -5,14 +5,14 @@ import {
   type AgyToolView,
   acpUpdateToActivity,
   agyToolStepKey,
+  extractAcpToolOutput,
   isBridgedMcpTool,
-  isDaemonToolStep,
   normalizeAcpPromptUsage,
   trackActiveToolStep,
 } from "../src/acp/events.ts";
 import { AgyQuotaTurnTracker, isAgyQuotaError, parseAgyQuotaNotice } from "../src/acp/quota.ts";
 
-test("acpUpdateToActivity normalizes thought, text, context usage, and diff tool updates", () => {
+test("acpUpdateToActivity normalizes thought, text, context usage, locations, and content-first tool updates", () => {
   const tools = new Map<string, AgyToolView>();
 
   assert.deepEqual(
@@ -53,7 +53,9 @@ test("acpUpdateToActivity normalizes thought, text, context usage, and diff tool
     {
       sessionUpdate: "tool_call",
       toolCallId: "tc-1",
-      title: "edit_file",
+      title: "Edit a.ts",
+      kind: "edit",
+      locations: [{ path: "a.ts", line: 12 }],
       status: "in_progress",
       rawInput: { path: "a.ts" },
     },
@@ -61,6 +63,11 @@ test("acpUpdateToActivity normalizes thought, text, context usage, and diff tool
     1000,
   );
   assert.equal(started?.type, "tool_start");
+  if (started?.type === "tool_start") {
+    assert.equal(started.title, "Edit a.ts");
+    assert.equal(started.kind, "edit");
+    assert.deepEqual(started.locations, [{ path: "a.ts", line: 12 }]);
+  }
 
   const done = acpUpdateToActivity(
     {
@@ -77,9 +84,17 @@ test("acpUpdateToActivity normalizes thought, text, context usage, and diff tool
     assert.equal(done.durationSeconds, 1.5);
     assert.equal(done.output, "diff: a.ts -1 lines +1 lines");
   }
+
+  assert.equal(
+    extractAcpToolOutput({ output: "fallback raw" }, [
+      { type: "content", content: { type: "text", text: "standard content" } },
+    ]),
+    "standard content",
+  );
+  assert.equal(extractAcpToolOutput({ output: "fallback raw" }, undefined), "fallback raw");
 });
 
-test("normalizeAcpPromptUsage and isBridgedMcpTool work across camelCase and snake_case", () => {
+test("normalizeAcpPromptUsage and isBridgedMcpTool work across standard ACP shapes", () => {
   assert.deepEqual(
     normalizeAcpPromptUsage({
       inputTokens: 100,
@@ -101,42 +116,30 @@ test("normalizeAcpPromptUsage and isBridgedMcpTool work across camelCase and sna
   assert.equal(normalizeAcpPromptUsage({}), undefined);
 
   assert.equal(isBridgedMcpTool({ name: "pi__read" }, "pi-1234"), true);
+  assert.equal(isBridgedMcpTool({ title: "Run pi__edit" }, "pi-1234"), true);
   assert.equal(isBridgedMcpTool({ name: "mcp_pi_1234_bash" }, "pi-1234"), true);
-  assert.equal(
-    isBridgedMcpTool({ name: "call_mcp_tool", args: { ServerName: "pi-1234" } }, "pi-1234"),
-    true,
-  );
-  assert.equal(
-    isBridgedMcpTool({ name: "call_mcp_tool", args: { ServerName: "other" } }, "pi-1234"),
-    false,
-  );
-  assert.equal(isBridgedMcpTool({ name: "run_command" }, "pi-1234"), false);
+  assert.equal(isBridgedMcpTool({ title: "pi-1234/pi__read" }, "pi-1234"), true);
+  assert.equal(isBridgedMcpTool({ title: "read pi-1234.txt" }, "pi-1234"), false);
+  assert.equal(isBridgedMcpTool({ title: "Run command" }, "pi-1234"), false);
 });
 
-test("tool step tracking identifies IsDaemon run_command steps", () => {
+test("trackActiveToolStep tracks active ACP tool steps by callId", () => {
   const active = new Set<string>();
-  const daemons = new Set<string>();
 
-  const daemonStart: AgyActivity = {
+  const stepStart: AgyActivity = {
     type: "tool_start",
     callId: "c1",
-    name: "run_command",
-    args: { CommandLine: "npm run dev", IsDaemon: true },
+    title: "Run dev server",
+    kind: "execute",
+    rawInput: { command: "npm run dev" },
   };
-  assert.equal(isDaemonToolStep(daemonStart), true);
-  assert.equal(agyToolStepKey(daemonStart), "call:c1");
+  assert.equal(agyToolStepKey(stepStart), "call:c1");
 
-  trackActiveToolStep(active, daemonStart, daemons);
+  trackActiveToolStep(active, stepStart);
   assert.equal(active.has("call:c1"), true);
-  assert.equal(daemons.has("call:c1"), true);
 
-  trackActiveToolStep(
-    active,
-    { type: "tool_done", callId: "c1", name: "run_command", args: {} },
-    daemons,
-  );
+  trackActiveToolStep(active, { type: "tool_done", callId: "c1", title: "Run dev server" });
   assert.equal(active.size, 0);
-  assert.equal(daemons.size, 0);
 });
 
 test("quota detection catches fake end_turn quota banners while avoiding prose false positives", () => {

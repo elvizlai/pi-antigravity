@@ -17,7 +17,7 @@ export const MCP_ADAPTER_UNSUPPORTED_WARNING =
 export function piToolsAgentPrompt(serverName: string): string {
   return [
     "# System Prompt",
-    "You are the agent for the current Pi coding session. Complete the user request using Pi tools (when <plan_execute_protocol> is active, bridged edits and mutating commands still go through exit_plan_mode).",
+    "You are the agent for the current Pi coding session. Complete the user request using Pi tools.",
     `Your tools are provided by the MCP server ${serverName}. Use the exact MCP tool names and schemas it exposes.`,
     "Relayed Pi instructions refer to tools by their Pi names; match them to the tools exposed by this bridge.",
     "Use the Pi bridge for file access, editing, commands, web access, skills, and other work. Pi handles tool execution, permissions, and tool results.",
@@ -72,9 +72,9 @@ function defaultIsPidDead(pid: number): boolean {
 /**
  * Format an `agy --agent` definition (`~/.gemini/config/agents/<name>/agent.md`).
  *
- * Scopes `agy` built-in tools and customizations (`inheritCustomizations: false`,
- * `tools: []` or orchestrator handoff tools) while the loopback HTTP MCP server
- * is attached via ACP `session/new` and `session/resume`.
+ * Uses strictly documented agent schema fields (`name`, `description`, `mainAgent`,
+ * `subagent`, `tools`) to restrict built-in tools while the loopback HTTP MCP server
+ * is attached via standard ACP `session/new` and `session/resume`.
  */
 function formatPiToolsAgentFile(
   agentName: string,
@@ -84,10 +84,8 @@ function formatPiToolsAgentFile(
   const definition = {
     name: agentName,
     description: PI_TOOLS_AGENT_DESCRIPTION,
-    hidden: true,
     mainAgent: true,
     subagent: false,
-    inheritCustomizations: false,
     tools: orchestrator ? [...PI_TOOLS_ORCHESTRATOR_TOOLS] : [],
   };
 

@@ -335,6 +335,15 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     description: WRAPPER_TOOL_DESCRIPTION,
     parameters: Type.Object({
       tool: Type.String(),
+      kind: Type.Optional(Type.String()),
+      locations: Type.Optional(
+        Type.Array(
+          Type.Object({
+            path: Type.String(),
+            line: Type.Optional(Type.Number()),
+          }),
+        ),
+      ),
       input: Type.Record(Type.String(), Type.Unknown()),
     }),
     async execute(toolCallId, params) {
@@ -342,7 +351,10 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       if (!recorded) {
         return {
           content: [{ type: "text", text: BRIDGE_PENDING_TOOL_MESSAGE }],
-          details: { agyTool: params.tool },
+          details: {
+            title: params.tool,
+            ...(params.kind ? { kind: params.kind } : {}),
+          },
           terminate: true,
         };
       }
@@ -350,7 +362,8 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       return {
         content: [{ type: "text", text }],
         details: {
-          agyTool: recorded.agyTool,
+          title: recorded.title,
+          ...(recorded.kind ? { kind: recorded.kind } : {}),
           ...(recorded.durationSeconds !== undefined
             ? { durationSeconds: recorded.durationSeconds }
             : {}),
@@ -360,11 +373,24 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       };
     },
     renderCall(args, theme) {
-      return new Text(formatAgyCall(args.tool, args.input, theme), 0, 0);
+      return new Text(
+        formatAgyCall(
+          {
+            tool: args.tool,
+            kind: args.kind,
+            locations: args.locations,
+            input: args.input,
+          },
+          theme,
+        ),
+        0,
+        0,
+      );
     },
     renderResult(result, options, theme) {
-      const details = result.details as { agyTool?: string; durationSeconds?: number } | undefined;
-      const agyTool = details?.agyTool ?? WRAPPER_TOOL_NAME;
+      const details = result.details as
+        | { title?: string; kind?: string; durationSeconds?: number }
+        | undefined;
       const rawText = result.content
         .filter((item): item is { type: "text"; text: string } => item.type === "text")
         .map((item) => item.text)
@@ -376,7 +402,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         return new Text(theme.fg("error", line), 0, 0);
       }
 
-      const summary = summarizeAgyResult(agyTool, rawText);
+      const summary = summarizeAgyResult(details?.kind, rawText);
       const meta: string[] = [];
       if (summary.counts) meta.push(summary.counts);
       if (details?.durationSeconds !== undefined) {

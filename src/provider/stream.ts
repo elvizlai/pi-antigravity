@@ -17,11 +17,7 @@ import type { AcpContentBlock } from "../acp/client.ts";
 import { type AgyUsage, isBridgedMcpTool } from "../acp/events.ts";
 import type { AgyExecutionMode } from "../acp/models.ts";
 import { WRAPPER_TOOL_NAME } from "../bridge/server.ts";
-import {
-  AGY_PARKED_TURN_ERROR,
-  extractSystemPromptAppend,
-  extractTrailingUserPrompt,
-} from "./prompt.ts";
+import { extractSystemPromptAppend, extractTrailingUserPrompt } from "./prompt.ts";
 import type { AgyRuntime } from "./runtime.ts";
 import type { SessionEntryLike } from "./state.ts";
 import type { AgyReplayStore } from "./turn.ts";
@@ -260,14 +256,19 @@ export function createAntigravityStreamSimple(
                 }
                 const replayId = `agy_${randomUUID()}`;
                 deps.replayStore.record(replayId, {
-                  agyTool: activity.name,
+                  title: activity.title,
+                  kind: activity.kind,
                   output: activity.output,
                   durationSeconds: activity.durationSeconds,
                 });
                 hasAnyToolCall = true;
                 appendToolCall(replayId, WRAPPER_TOOL_NAME, {
-                  tool: activity.name,
-                  input: activity.args,
+                  tool: activity.title,
+                  ...(activity.kind ? { kind: activity.kind } : {}),
+                  ...(activity.locations && activity.locations.length > 0
+                    ? { locations: activity.locations }
+                    : {}),
+                  input: activity.rawInput ?? {},
                 });
                 break;
               }
@@ -278,14 +279,19 @@ export function createAntigravityStreamSimple(
                 }
                 const replayId = `agy_${randomUUID()}`;
                 deps.replayStore.record(replayId, {
-                  agyTool: activity.name,
+                  title: activity.title,
+                  kind: activity.kind,
                   error: activity.message,
                   durationSeconds: activity.durationSeconds,
                 });
                 hasAnyToolCall = true;
                 appendToolCall(replayId, WRAPPER_TOOL_NAME, {
-                  tool: activity.name,
-                  input: activity.args,
+                  tool: activity.title,
+                  ...(activity.kind ? { kind: activity.kind } : {}),
+                  ...(activity.locations && activity.locations.length > 0
+                    ? { locations: activity.locations }
+                    : {}),
+                  input: activity.rawInput ?? {},
                 });
                 break;
               }
@@ -329,14 +335,6 @@ export function createAntigravityStreamSimple(
         if (hasAnyToolCall) {
           partial.stopReason = "toolUse";
           stream.push({ type: "done", reason: "toolUse", message: partial });
-          stream.end(partial);
-          return;
-        }
-
-        if (settled.status === "parked_daemon") {
-          partial.stopReason = "error";
-          partial.errorMessage = AGY_PARKED_TURN_ERROR;
-          stream.push({ type: "error", reason: "error", error: partial });
           stream.end(partial);
           return;
         }

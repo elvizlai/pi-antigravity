@@ -20,39 +20,14 @@ export const BRIDGE_PENDING_TOOL_MESSAGE =
   "Started and still running at tool handoff. Unfinished commands may be cancelled when " +
   "the agy turn ends.";
 
-/**
- * Terminal error synthesized when the runtime closes a wave on still-running
- * `IsDaemon` work so Pi finishes the assistant turn without cutting off daemons.
- */
-export const AGY_PARKED_TURN_ERROR =
-  "timeout waiting for response — agy is still running work as a background task";
+/** Fallback error recorded when an ACP tool call has not reported completion at turn end. */
+export const INCOMPLETE_ACP_TOOL_MESSAGE =
+  "ACP tool call did not report completion before the turn ended.";
 
 /** Maximum UTF-8 byte budget allocated to text blocks in a single `session/prompt`. */
 export const MAX_AGY_PROMPT_BYTES = 185_000;
 
 const OMITTED_SYSTEM_SECTIONS = new Set(["preamble", "tools", "rules", "docs", "skills", "cwd"]);
-
-/** Replay diagnostics must not promise that an unobserved task survived or stopped. */
-export function agyIncompleteToolError(tool: string, resultError?: string): string {
-  if (tool === "schedule") {
-    return (
-      "agy stopped reporting before the scheduled wait completed. The timer's final state " +
-      "is unknown and it may still fire. Do not reschedule it blindly: confirm the work it " +
-      "was waiting on instead, using pi's own tools."
-    );
-  }
-  if (
-    tool === "run_command" &&
-    (!resultError || /timeout waiting for response/i.test(resultError))
-  ) {
-    return (
-      "agy did not report this command completing. It may have become a background task " +
-      '(headless agy can report "timeout waiting for response"). Confirm whether the command ' +
-      "is still running before retrying; use pi's own bash for long-lived commands."
-    );
-  }
-  return "agy tool call did not complete.";
-}
 
 export function omittedImagesPrompt(images: number): string {
   return `(${images} image(s) omitted — this agy request is text-only)`;

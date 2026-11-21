@@ -1,191 +1,120 @@
 import assert from "node:assert/strict";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import { AgyWorkingStatusTracker, formatAgyCall } from "../src/provider/render.ts";
+import {
+  AgyWorkingStatusTracker,
+  formatAgyCall,
+  summarizeAgyResult,
+} from "../src/provider/render.ts";
 
 const mockTheme = {
   fg: (role: string, text: string) => (role === "error" ? `ERR:${text}` : text),
   bold: (text: string) => text,
 } as unknown as Theme;
 
-test("formatAgyCall formats multi-agent orchestration and file tools cleanly without invalid-arg errors", () => {
-  const invoke = formatAgyCall(
-    "invoke_subagent",
+test("formatAgyCall renders standard ACP kind, title, locations, and opaque rawInput cleanly", () => {
+  const homeFile = path.join(os.homedir(), "work", "app.ts");
+  assert.equal(
+    formatAgyCall(
+      {
+        tool: "Read configuration",
+        kind: "read",
+        locations: [{ path: homeFile, line: 42 }],
+      },
+      mockTheme,
+    ),
+    "read Read configuration ~/work/app.ts:42",
+  );
+
+  // Skip locations already present in title and suppress redundant generic args when locations exist.
+  assert.equal(
+    formatAgyCall(
+      {
+        tool: `Edit ${homeFile}`,
+        kind: "edit",
+        locations: [{ path: homeFile }],
+        input: { path: homeFile },
+      },
+      mockTheme,
+    ),
+    `edit Edit ${homeFile}`,
+  );
+
+  // When title equals standard kind, do not repeat the label.
+  assert.equal(
+    formatAgyCall(
+      {
+        tool: "execute",
+        kind: "execute",
+        input: { cmd: "npm test", cwd: "/tmp/repo" },
+      },
+      mockTheme,
+    ),
+    'execute cmd "npm test", cwd "/tmp/repo"',
+  );
+
+  // Arbitrary unknown/opaque inputs never emit invalid-arg errors.
+  const other = formatAgyCall(
     {
-      TypeName: "research",
-      Role: "Quick Probe",
-      Model: "flash_lite",
-      Prompt: "Reply with OK",
+      tool: "Parallel\n  Review",
+      kind: "other",
+      input: {
+        role: "Auditor",
+        count: 2,
+        nested: { deep: true },
+        items: ["a", "b"],
+      },
     },
     mockTheme,
   );
-  assert.doesNotMatch(invoke, /ERR:/);
-  assert.equal(invoke, 'subagent research "Quick Probe" (flash_lite)');
+  assert.doesNotMatch(other, /ERR:/);
+  assert.equal(other, 'Parallel Review role "Auditor", count 2, nested {…} …');
 
-  const invokeInherit = formatAgyCall(
-    "invoke_subagent",
-    {
-      TypeName: "self",
-      Model: "inherit",
-      Prompt: "Inspect\nmultiple\nlines",
-    },
-    mockTheme,
-  );
-  assert.equal(invokeInherit, 'subagent self "Inspect multiple lines"');
-
-  assert.equal(
-    formatAgyCall(
-      "define_subagent",
-      { Name: "auditor", Description: "Audit security\nboundaries" },
-      mockTheme,
-    ),
-    'define_subagent auditor "Audit security boundaries"',
-  );
-
-  assert.equal(
-    formatAgyCall("manage_subagents", { Action: "kill", ConversationIds: ["c1", "c2"] }, mockTheme),
-    "manage_subagents kill (2)",
-  );
-  assert.equal(
-    formatAgyCall("manage_subagents", { Action: "list" }, mockTheme),
-    "manage_subagents list",
-  );
-
-  const msg = formatAgyCall(
-    "send_message",
-    { Recipient: "conv-123", Message: "Line 1\nLine 2" },
-    mockTheme,
-  );
-  assert.doesNotMatch(msg, /ERR:/);
-  assert.equal(msg, 'send_message conv-123 "Line 1 Line 2"');
-
-  assert.equal(formatAgyCall("swarm", { action: "status" }, mockTheme), "swarm status");
-  assert.equal(
-    formatAgyCall("swarm", { action: "title", title: "Review Changes" }, mockTheme),
-    'swarm title "Review Changes"',
-  );
-  assert.equal(
-    formatAgyCall(
-      "swarm",
-      { action: "add", name: "reviewer", n: 2, model: "gemini-3.8-flash", brief: "Check\nPR diff" },
-      mockTheme,
-    ),
-    'swarm add reviewer×2 "Check PR diff" (gemini-3.8-flash)',
-  );
-  assert.equal(
-    formatAgyCall("swarm", { action: "add", name: "shard", tasks: ["a", "b", "c"] }, mockTheme),
-    "swarm add shard×3",
-  );
-  assert.equal(
-    formatAgyCall("swarm", { action: "kill", name: "reviewer" }, mockTheme),
-    "swarm kill reviewer",
-  );
-
-  assert.equal(
-    formatAgyCall("run_workflow", { Description: "Fan out\nmodule checks" }, mockTheme),
-    'run_workflow "Fan out module checks"',
-  );
-  assert.equal(
-    formatAgyCall("run_workflow", { ScriptPath: "/tmp/scan.py" }, mockTheme),
-    "run_workflow /tmp/scan.py",
-  );
-  assert.equal(
-    formatAgyCall("run_workflow", { Script: "print(1)" }, mockTheme),
-    "run_workflow (inline script)",
-  );
-
-  assert.equal(
-    formatAgyCall("schedule", { DurationSeconds: 30, Prompt: "Check status" }, mockTheme),
-    'schedule 30s "Check status"',
-  );
-  assert.equal(
-    formatAgyCall("schedule", { CronExpression: "*/5 * * * *", Prompt: "Poll health" }, mockTheme),
-    'schedule */5 * * * * "Poll health"',
-  );
-
-  assert.equal(
-    formatAgyCall("write_file", { Path: "/tmp/out.txt" }, mockTheme),
-    "write /tmp/out.txt",
-  );
-  assert.equal(formatAgyCall("edit_file", { Path: "/tmp/in.txt" }, mockTheme), "edit /tmp/in.txt");
+  // Search results summarize line count without inspecting internal tool names.
+  assert.deepEqual(summarizeAgyResult("search", "a.ts:1:foo\nb.ts:2:bar"), { counts: "2 lines" });
+  assert.deepEqual(summarizeAgyResult("read", "a.ts\nb.ts"), {});
 });
 
-test("AgyWorkingStatusTracker tracks foreground tools and persistent subagent/swarm wait phases", () => {
+test("AgyWorkingStatusTracker tracks in-flight standard ACP titles until completion or error", () => {
   const tracker = new AgyWorkingStatusTracker();
 
   assert.equal(
     tracker.onActivity({
       type: "tool_start",
       callId: "c1",
-      name: "run_command",
-      args: { CommandLine: "npm test" },
+      title: "Run\n  npm test",
+      kind: "execute",
     }),
-    "Running bash: npm test…",
+    "Run npm test…",
   );
+
+  assert.equal(
+    tracker.onActivity({
+      type: "tool_update",
+      callId: "c2",
+      title: "Inspect src/index.ts",
+      kind: "read",
+    }),
+    "Inspect src/index.ts…",
+  );
+
+  assert.equal(
+    tracker.onActivity({
+      type: "tool_error",
+      callId: "c2",
+      title: "Inspect src/index.ts",
+      message: "failed",
+    }),
+    "Run npm test…",
+  );
+
   assert.equal(
     tracker.onActivity({
       type: "tool_done",
       callId: "c1",
-      name: "run_command",
-      args: { CommandLine: "npm test" },
-    }),
-    undefined,
-  );
-
-  assert.equal(
-    tracker.onActivity({
-      type: "tool_start",
-      callId: "c2",
-      name: "invoke_subagent",
-      args: { TypeName: "research", Role: "Quick Probe" },
-    }),
-    "Starting subagent: Quick Probe…",
-  );
-  assert.equal(
-    tracker.onActivity({
-      type: "tool_done",
-      callId: "c2",
-      name: "invoke_subagent",
-      args: { TypeName: "research", Role: "Quick Probe" },
-    }),
-    "Subagent running: Quick Probe…",
-  );
-
-  assert.equal(
-    tracker.onActivity({
-      type: "tool_start",
-      callId: "c3",
-      name: "swarm",
-      args: { action: "add", name: "reviewer", n: 2 },
-    }),
-    "Updating swarm (add)…",
-  );
-  assert.equal(
-    tracker.onActivity({
-      type: "tool_done",
-      callId: "c3",
-      name: "swarm",
-      args: { action: "add", name: "reviewer", n: 2 },
-    }),
-    "Swarm running: reviewer×2…",
-  );
-
-  assert.equal(
-    tracker.onActivity({
-      type: "tool_done",
-      callId: "c4",
-      name: "swarm",
-      args: { action: "kill", name: "reviewer" },
-    }),
-    "Subagent running: Quick Probe…",
-  );
-
-  assert.equal(
-    tracker.onActivity({
-      type: "tool_done",
-      callId: "c5",
-      name: "manage_subagents",
-      args: { Action: "kill_all" },
+      title: "Run npm test",
     }),
     undefined,
   );
