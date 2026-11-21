@@ -771,6 +771,7 @@ test("upstream ⚠ error banners after tool waves fail with stopReason error (40
 test("native wrapper tool replay store preserves output and incomplete tool errors accurately", async () => {
   const replayStore = new AgyReplayStore();
   const workingStatuses: Array<string | undefined> = [];
+  let promptCalls = 0;
   const runtime = new AgyRuntime({
     cwd: "/work",
     getToolMode: () => "native",
@@ -792,6 +793,7 @@ test("native wrapper tool replay store preserves output and incomplete tool erro
       },
       cancelSession() {},
       async prompt(_sid, _blocks, opts) {
+        promptCalls += 1;
         opts?.onUpdate?.({
           sessionUpdate: "tool_call",
           toolCallId: "n1",
@@ -815,7 +817,10 @@ test("native wrapper tool replay store preserves output and incomplete tool erro
           status: "in_progress",
           rawInput: { cmd: "sleep 10" },
         });
-        return { stopReason: "end_turn" };
+        return {
+          stopReason: "end_turn",
+          usage: { inputTokens: 100, outputTokens: 20, totalTokens: 120 },
+        };
       },
       async dispose() {},
     }),
@@ -828,23 +833,214 @@ test("native wrapper tool replay store preserves output and incomplete tool erro
     replayStore,
   });
 
-  const s = streamSimple(
-    testModel(),
-    makeTranscript([{ role: "user", content: "go", timestamp: 1 }]),
-  );
+  const messages: unknown[] = [{ role: "user", content: "go", timestamp: 1 }];
+  const s = streamSimple(testModel(), makeTranscript(messages));
   const events = [];
   for await (const ev of s) events.push(ev);
   assertDeltasMatchPartial(events);
-  const msg = await s.result();
-  assert.equal(msg.stopReason, "toolUse");
-  const calls = msg.content.filter((b) => b.type === "toolCall");
+  const msg1 = await s.result();
+  assert.equal(msg1.stopReason, "toolUse");
+  assert.equal(
+    msg1.content.some((b) => b.type === "text"),
+    false,
+  );
+  const calls = msg1.content.filter((b) => b.type === "toolCall");
   assert.equal(calls.length, 2);
   assert.equal(replayStore.take(calls[0].id)?.output, "line1");
   assert.equal(replayStore.take(calls[1].id)?.error, INCOMPLETE_ACP_TOOL_MESSAGE);
   assert.equal(workingStatuses[0], "Read a.txt…");
   assert.ok(workingStatuses.includes("Run sleep 10…"));
   assert.equal(workingStatuses.at(-1), undefined);
+
+  const followMessages = [
+    ...messages,
+    msg1,
+    ...calls.map((call, idx) => ({
+      role: "toolResult",
+      toolCallId: call.id,
+      toolName: "antigravity",
+      content: [{ type: "text", text: idx === 0 ? "line1" : INCOMPLETE_ACP_TOOL_MESSAGE }],
+      isError: idx === 1,
+      timestamp: 2 + idx,
+    })),
+  ];
+  const wave2 = streamSimple(testModel(), makeTranscript(followMessages));
+  const events2 = [];
+  for await (const ev of wave2) events2.push(ev);
+  assertDeltasMatchPartial(events2);
+  const msg2 = await wave2.result();
+  assert.equal(promptCalls, 1);
+  assert.equal(msg2.stopReason, "stop");
+  assert.deepEqual(msg2.content, []);
+  assert.equal(msg2.usage.totalTokens, 120);
   await runtime.dispose();
+});
+
+test("native acp:agy multi-step tools split waves at thinking/text boundaries so final reply renders last", async () => {
+  const replayStore = new AgyReplayStore();
+  let promptCalls = 0;
+  const runtime = new AgyRuntime({
+    cwd: "/work",
+    getToolMode: () => "native",
+    checkBinary: async () => ({ binary: "agy", version: "1.5.14" }),
+    createClient: () => ({
+      isAlive: true,
+      async initialize() {
+        return { protocolVersion: 1 };
+      },
+      async newSession() {
+        return { sessionId: "native-multi-wave" };
+      },
+      async resumeSession() {
+        return { sessionId: "native-multi-wave" };
+      },
+      async setConfigOption() {
+        return {};
+      },
+      cancelSession() {},
+      async prompt(_sid, _blocks, opts) {
+        promptCalls += 1;
+        opts?.onUpdate?.({
+          sessionUpdate: "agent_thought_chunk",
+          content: { type: "text", text: "thinking_1" },
+        });
+        opts?.onUpdate?.({
+          sessionUpdate: "tool_call",
+          toolCallId: "t1",
+          title: "Run check 1",
+          kind: "execute",
+          status: "in_progress",
+        });
+        opts?.onUpdate?.({
+          sessionUpdate: "tool_call_update",
+          toolCallId: "t1",
+          status: "completed",
+          content: [{ type: "content", content: { type: "text", text: "out1" } }],
+        });
+        opts?.onUpdate?.({
+          sessionUpdate: "agent_thought_chunk",
+          content: { type: "text", text: "thinking_2" },
+        });
+        opts?.onUpdate?.({
+          sessionUpdate: "tool_call",
+          toolCallId: "t2",
+          title: "Read file 2",
+          kind: "read",
+          status: "in_progress",
+        });
+        opts?.onUpdate?.({
+          sessionUpdate: "tool_call_update",
+          toolCallId: "t2",
+          status: "completed",
+          content: [{ type: "content", content: { type: "text", text: "out2" } }],
+        });
+        opts?.onUpdate?.({
+          sessionUpdate: "tool_call",
+          toolCallId: "t3",
+          title: "Read file 3",
+          kind: "read",
+          status: "in_progress",
+        });
+        opts?.onUpdate?.({
+          sessionUpdate: "tool_call_update",
+          toolCallId: "t3",
+          status: "completed",
+          content: [{ type: "content", content: { type: "text", text: "out3" } }],
+        });
+        opts?.onUpdate?.({
+          sessionUpdate: "agent_thought_chunk",
+          content: { type: "text", text: "thinking_3" },
+        });
+        opts?.onUpdate?.({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Final report" },
+        });
+        return {
+          stopReason: "end_turn",
+          usage: { inputTokens: 300, outputTokens: 50, totalTokens: 350 },
+        };
+      },
+      async dispose() {},
+    }),
+  });
+
+  const streamSimple = createAntigravityStreamSimple({
+    getRuntime: () => runtime,
+    getSessionId: () => "pi-native-multi",
+    getBranchEntries: () => [],
+    replayStore,
+  });
+
+  try {
+    let messages: unknown[] = [{ role: "user", content: "audit repo", timestamp: 1 }];
+
+    const wave1 = streamSimple(testModel(), makeTranscript(messages));
+    const events1 = [];
+    for await (const ev of wave1) events1.push(ev);
+    assertDeltasMatchPartial(events1);
+    const msg1 = await wave1.result();
+    assert.equal(msg1.stopReason, "toolUse");
+    assert.equal(msg1.content.length, 2);
+    assert.deepEqual(msg1.content[0], { type: "thinking", thinking: "thinking_1" });
+    assert.equal(msg1.content[1]?.type, "toolCall");
+    const call1 = msg1.content[1];
+    assert.ok(call1?.type === "toolCall");
+    assert.equal(replayStore.take(call1.id)?.output, "out1");
+
+    messages = [
+      ...messages,
+      msg1,
+      {
+        role: "toolResult",
+        toolCallId: call1.id,
+        toolName: "antigravity",
+        content: [{ type: "text", text: "out1" }],
+        isError: false,
+        timestamp: 2,
+      },
+    ];
+
+    const wave2 = streamSimple(testModel(), makeTranscript(messages));
+    const events2 = [];
+    for await (const ev of wave2) events2.push(ev);
+    assertDeltasMatchPartial(events2);
+    const msg2 = await wave2.result();
+    assert.equal(msg2.stopReason, "toolUse");
+    assert.equal(msg2.content.length, 3);
+    assert.deepEqual(msg2.content[0], { type: "thinking", thinking: "thinking_2" });
+    const calls2 = msg2.content.filter((b) => b.type === "toolCall");
+    assert.equal(calls2.length, 2);
+    assert.equal(replayStore.take(calls2[0].id)?.output, "out2");
+    assert.equal(replayStore.take(calls2[1].id)?.output, "out3");
+
+    messages = [
+      ...messages,
+      msg2,
+      ...calls2.map((call, idx) => ({
+        role: "toolResult",
+        toolCallId: call.id,
+        toolName: "antigravity",
+        content: [{ type: "text", text: idx === 0 ? "out2" : "out3" }],
+        isError: false,
+        timestamp: 3 + idx,
+      })),
+    ];
+
+    const wave3 = streamSimple(testModel(), makeTranscript(messages));
+    const events3 = [];
+    for await (const ev of wave3) events3.push(ev);
+    assertDeltasMatchPartial(events3);
+    const msg3 = await wave3.result();
+    assert.equal(promptCalls, 1);
+    assert.equal(msg3.stopReason, "stop");
+    assert.deepEqual(msg3.content, [
+      { type: "thinking", thinking: "thinking_3" },
+      { type: "text", text: "Final report" },
+    ]);
+    assert.equal(msg3.usage.totalTokens, 350);
+  } finally {
+    await runtime.dispose();
+  }
 });
 
 test("warmupSession completes setup before streamSimple and reloads client when bridge catalog changes", async () => {
@@ -1053,6 +1249,14 @@ test("antigravityExtension defers CLI flag reads until after Pi populates flag v
     Array<(event: unknown, ctx: unknown) => Promise<unknown> | unknown>
   >();
   const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+  let registeredTool:
+    | {
+        execute: (
+          id: string,
+          params: { tool: string; kind?: string; input: Record<string, unknown> },
+        ) => Promise<{ terminate?: boolean }>;
+      }
+    | undefined;
 
   const mockPi = {
     registerFlag() {},
@@ -1064,7 +1268,9 @@ test("antigravityExtension defers CLI flag reads until after Pi populates flag v
     setActiveTools() {},
     getCommands: () => [],
     registerProvider() {},
-    registerTool() {},
+    registerTool(def: typeof registeredTool) {
+      registeredTool = def;
+    },
     registerEntryRenderer() {},
     registerCommand(name: string, def: { handler: (args: string, ctx: unknown) => Promise<void> }) {
       commands.set(name, def);
@@ -1078,6 +1284,10 @@ test("antigravityExtension defers CLI flag reads until after Pi populates flag v
   };
 
   antigravityExtension(mockPi as unknown as Parameters<typeof antigravityExtension>[0]);
+
+  assert.ok(registeredTool);
+  const missingToolRes = await registeredTool.execute("missing-id", { tool: "Read a", input: {} });
+  assert.equal(missingToolRes.terminate, undefined);
 
   // Pi populates CLI flag values after extension factory execution.
   flagValues.set("agy-tools", "agy");

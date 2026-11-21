@@ -42,7 +42,7 @@ export interface AgyTurnResult {
 }
 
 export type AgyTurnWaveResult =
-  | { wave: "bridge_wave"; contextTokens?: number }
+  | { wave: "tool_wave"; contextTokens?: number }
   | { wave: "settled"; result: AgyTurnResult }
   | { wave: "aborted" };
 
@@ -50,6 +50,19 @@ type QueuedTurnItem =
   | { kind: "activity"; activity: AgyTurnActivity }
   | { kind: "settled"; result: AgyTurnResult }
   | { kind: "error"; error: Error };
+
+function isToolWaveActivity(activity: AgyTurnActivity): boolean {
+  return (
+    activity.type === "bridge_call" ||
+    activity.type === "tool_done" ||
+    activity.type === "tool_error"
+  );
+}
+
+function breaksToolWave(item: QueuedTurnItem): boolean {
+  if (item.kind === "settled" || item.kind === "error") return true;
+  return item.activity.type === "thinking_delta" || item.activity.type === "text_delta";
+}
 
 /**
  * Single-turn async coordinator bridging push-based ACP updates + bridged MCP
@@ -59,12 +72,17 @@ export class AgyTurnController {
   #queue: QueuedTurnItem[] = [];
   #notify?: () => void;
   #settled = false;
+  #consumed = false;
   #error?: Error;
   #settledResult?: AgyTurnResult;
   #latestContextTokens: number | undefined;
 
   get isSettled(): boolean {
     return this.#settled;
+  }
+
+  get isConsumed(): boolean {
+    return this.#consumed;
   }
 
   pushActivity(activity: AgyTurnActivity): void {
@@ -94,7 +112,7 @@ export class AgyTurnController {
 
   /**
    * Consume events for the current Pi assistant wave until either:
-   * - one or more `bridge_call`s suspend the turn for Pi tool execution,
+   * - bridged MCP or native ACP tool calls suspend the turn into a `toolUse` wave,
    * - the underlying ACP turn settles (completed / aborted / error), or
    * - the per-wave `signal` aborts.
    */
@@ -103,8 +121,8 @@ export class AgyTurnController {
     options?: { signal?: AbortSignal },
   ): Promise<AgyTurnWaveResult> {
     const signal = options?.signal;
-    const bridgeWave = (): AgyTurnWaveResult => ({
-      wave: "bridge_wave",
+    const toolWave = (): AgyTurnWaveResult => ({
+      wave: "tool_wave",
       ...(this.#latestContextTokens !== undefined
         ? { contextTokens: this.#latestContextTokens }
         : {}),
@@ -112,42 +130,43 @@ export class AgyTurnController {
 
     while (true) {
       if (signal?.aborted) {
+        this.#consumed = true;
         return { wave: "aborted" };
       }
 
       if (this.#queue.length > 0) {
-        let sawBridgeCall = false;
+        let sawToolCall = false;
         while (this.#queue.length > 0) {
           const next = this.#queue[0];
-          if (
-            sawBridgeCall &&
-            !(next.kind === "activity" && next.activity.type === "bridge_call")
-          ) {
-            return bridgeWave();
+          if (sawToolCall && breaksToolWave(next)) {
+            return toolWave();
           }
           this.#queue.shift();
           if (next.kind === "error") {
+            this.#consumed = true;
             throw next.error;
           }
           if (next.kind === "settled") {
-            if (sawBridgeCall) return bridgeWave();
+            this.#consumed = true;
             return { wave: "settled", result: this.#enrichSettled(next.result) };
           }
           await onActivity(next.activity);
-          if (next.activity.type === "bridge_call") {
-            sawBridgeCall = true;
+          if (isToolWaveActivity(next.activity)) {
+            sawToolCall = true;
           }
         }
-        if (sawBridgeCall) {
-          return bridgeWave();
+        if (sawToolCall) {
+          return toolWave();
         }
         continue;
       }
 
       if (this.#error) {
+        this.#consumed = true;
         throw this.#error;
       }
       if (this.#settledResult) {
+        this.#consumed = true;
         return { wave: "settled", result: this.#enrichSettled(this.#settledResult) };
       }
 

@@ -14,7 +14,7 @@ import {
   type Usage,
 } from "@earendil-works/pi-ai";
 import type { AcpContentBlock } from "../acp/client.ts";
-import { type AgyUsage, isBridgedMcpTool } from "../acp/events.ts";
+import type { AgyUsage } from "../acp/events.ts";
 import type { AgyExecutionMode } from "../acp/models.ts";
 import { WRAPPER_TOOL_NAME } from "../bridge/server.ts";
 import { extractSystemPromptAppend, extractTrailingUserPrompt } from "./prompt.ts";
@@ -301,9 +301,6 @@ export function createAntigravityStreamSimple(
               }
 
               case "tool_done": {
-                if (turn.bridgeServerName && isBridgedMcpTool(activity, turn.bridgeServerName)) {
-                  break;
-                }
                 const replayId = `agy_${randomUUID()}`;
                 deps.replayStore.record(replayId, {
                   title: activity.title,
@@ -324,9 +321,6 @@ export function createAntigravityStreamSimple(
               }
 
               case "tool_error": {
-                if (turn.bridgeServerName && isBridgedMcpTool(activity, turn.bridgeServerName)) {
-                  break;
-                }
                 const replayId = `agy_${randomUUID()}`;
                 deps.replayStore.record(replayId, {
                   title: activity.title,
@@ -364,7 +358,7 @@ export function createAntigravityStreamSimple(
           return;
         }
 
-        if (waveResult.wave === "bridge_wave") {
+        if (waveResult.wave === "tool_wave") {
           if (waveResult.contextTokens && waveResult.contextTokens > 0) {
             partial.usage = { ...zeroUsage(), totalTokens: waveResult.contextTokens };
           }

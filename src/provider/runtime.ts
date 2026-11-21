@@ -166,6 +166,15 @@ function stableEnvFingerprint(env: Record<string, string> | undefined): string {
   return JSON.stringify(entries);
 }
 
+function isContinuationAfterToolUse(messages: TranscriptContext["messages"]): boolean {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const role = messages[i]?.role;
+    if (role === "toolResult") return true;
+    if (role === "assistant") return false;
+  }
+  return false;
+}
+
 /**
  * Owns the persistent `agy acp` child process, session/resume lifecycle, config
  * synchronization (`mode -> model -> thought_level`), bridged MCP wave loop,
@@ -264,11 +273,18 @@ export class AgyRuntime {
     await task;
   }
 
+  clearSettledTurn(): void {
+    if (this.#activeTurn?.controller.isSettled) {
+      this.#activeTurn = undefined;
+    }
+  }
+
   /** Pre-start and initialize `agy acp` + bridge agent without creating an empty ACP conversation. */
   async warmupClient(params?: {
     env?: Record<string, string>;
     signal?: AbortSignal;
   }): Promise<void> {
+    this.clearSettledTurn();
     if (this.#activeTurn) return;
     if (this.#activeWarmup) {
       await this.#activeWarmup.catch(() => {});
@@ -294,6 +310,7 @@ export class AgyRuntime {
     env?: Record<string, string>;
     signal?: AbortSignal;
   }): Promise<void> {
+    this.clearSettledTurn();
     if (this.#activeTurn) return;
     if (this.#activeWarmup) {
       await this.#activeWarmup.catch(() => {});
@@ -608,15 +625,25 @@ export class AgyRuntime {
   async startOrContinueTurn(params: StartTurnParams): Promise<TurnSessionHandle> {
     const active = this.#activeTurn;
 
-    // 1. Continuation wave: resolve pending bridged Pi tool calls and re-attach to active turn.
-    if (active && !active.controller.isSettled) {
-      this.resolveBridgeResultsFromMessages(params.messages);
-      return {
-        controller: active.controller,
-        attachExisting: true,
-        bridgeServerName: active.bridgeServerName,
-        signalTurnAbort: () => active.requestAbort(),
-      };
+    // 1. Continuation wave: attach to an active or settled-but-unconsumed turn after tool results.
+    if (active) {
+      const canContinue =
+        active.piSessionId === params.sessionId &&
+        !active.controller.isConsumed &&
+        (!active.controller.isSettled || isContinuationAfterToolUse(params.messages));
+      if (canContinue) {
+        this.resolveBridgeResultsFromMessages(params.messages);
+        return {
+          controller: active.controller,
+          attachExisting: true,
+          bridgeServerName: active.bridgeServerName,
+          signalTurnAbort: () => active.requestAbort(),
+        };
+      }
+      if (!active.controller.isSettled) {
+        active.requestAbort();
+      }
+      this.#activeTurn = undefined;
     }
 
     if (params.signal?.aborted) {
@@ -693,10 +720,16 @@ export class AgyRuntime {
     };
     this.#activeTurn = activeTurn;
 
-    const cleanupActive = () => {
+    const cleanupActive = (dropTurn = false) => {
       clearTimeoutTimer();
       setWorkingStatus(undefined);
-      if (this.#activeTurn === activeTurn) {
+      if (this.#activeTurn === activeTurn && (dropTurn || controller.isConsumed)) {
+        this.#activeTurn = undefined;
+      }
+    };
+
+    const dropIfConsumed = () => {
+      if (this.#activeTurn === activeTurn && controller.isConsumed) {
         this.#activeTurn = undefined;
       }
     };
@@ -704,7 +737,7 @@ export class AgyRuntime {
     timeoutTimer = setTimeout(() => {
       if (sawFirstResponse || controller.isSettled || promptAbort.signal.aborted) return;
       timedOut = true;
-      cleanupActive();
+      cleanupActive(true);
       try {
         client.cancelSession(sessionId);
       } catch {
@@ -791,7 +824,7 @@ export class AgyRuntime {
       .then((promptResult) => {
         params.signal?.removeEventListener("abort", onExternalAbort);
         if (timedOut || controller.isSettled) return;
-        cleanupActive();
+        cleanupActive(false);
 
         const normalizedUsage = normalizeAcpPromptUsage(promptResult.usage);
         const errorBanner = quotaTracker.detectTurnErrorBanner({
@@ -803,15 +836,18 @@ export class AgyRuntime {
           controller.fail(
             new AgyQuotaError(errorBanner.message, { resetsIn: errorBanner.resetsIn }),
           );
+          dropIfConsumed();
           return;
         }
         if (errorBanner?.kind === "api_error") {
           controller.fail(new Error(errorBanner.message));
+          dropIfConsumed();
           return;
         }
 
         if (promptResult.stopReason === "error") {
           controller.fail(new Error("Antigravity ACP turn failed with stopReason: error."));
+          dropIfConsumed();
           return;
         }
 
@@ -847,14 +883,16 @@ export class AgyRuntime {
           stopReason: promptResult.stopReason,
           usage: normalizedUsage,
         });
+        dropIfConsumed();
       })
       .catch((err) => {
         params.signal?.removeEventListener("abort", onExternalAbort);
         if (timedOut || controller.isSettled) return;
-        cleanupActive();
+        cleanupActive(false);
 
         if (promptAbort.signal.aborted || (err instanceof Error && err.name === "AbortError")) {
           controller.finish({ status: "aborted", stopReason: "aborted" });
+          dropIfConsumed();
           return;
         }
 
@@ -862,6 +900,7 @@ export class AgyRuntime {
         if (isAgyQuotaError(error.message)) {
           this.#lastQuotaError = error.message;
           controller.fail(new AgyQuotaError(error.message));
+          dropIfConsumed();
           return;
         }
 
@@ -870,6 +909,7 @@ export class AgyRuntime {
           void this.#disposeClient(50);
         }
         controller.fail(error);
+        dropIfConsumed();
       });
 
     return {

@@ -9,7 +9,7 @@ Communicates over Antigravity CLI's public stdio JSON-RPC Agent Client Protocol 
 - `src/acp/` — Process-group cleanup, binary verification (`agy >= 1.5.0`), ACP JSON-RPC 2.0 client transport, protocol event normalization, model discovery & config planning, `/usage` quota fetching/formatting, and quota error classification.
 - `src/bridge/` — Localhost HTTP MCP server bridging Pi active tools & Pi-private skills (`pi__activate_skill`), plus `--agent` lifecycle helpers.
 - `src/provider/` — Extension settings (`~/.pi/agent/antigravity.json`), session-branch persistence, transcript prompt/system extraction (`getCurrentSystemMessage`), wave turn controller + replay store, runtime & first-response stall timeout, Pi `streamSimple` adapter, and TUI card rendering.
-- `index.ts` — Thin Pi extension entrypoint registering provider `"antigravity"` (with `refreshModels` & `streamSimple`), flags, display-only `antigravity` wrapper tool (`terminate: true`), commands, and session hooks.
+- `index.ts` — Thin Pi extension entrypoint registering provider `"antigravity"` (with `refreshModels` & `streamSimple`), flags, display-only `antigravity` wrapper tool, commands, and session hooks.
 
 ## Requirements
 

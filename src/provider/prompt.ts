@@ -171,7 +171,7 @@ export function collectTurnToolResults(
   const collected: CollectedToolResult[] = [];
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const msg = messages[i];
-    if (msg.role === "system") continue;
+    if (msg.role === "system" || msg.role === "user") continue;
     if (msg.role !== "toolResult") break;
     if (!pendingCallIds.has(msg.toolCallId)) continue;
     collected.unshift({

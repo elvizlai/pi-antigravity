@@ -355,7 +355,6 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
             title: params.tool,
             ...(params.kind ? { kind: params.kind } : {}),
           },
-          terminate: true,
         };
       }
       const text = recorded.error ?? recorded.output ?? "";
@@ -369,7 +368,6 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
             : {}),
         },
         ...(recorded.error ? { isError: true } : {}),
-        terminate: true,
       };
     },
     renderCall(args, theme) {
@@ -679,6 +677,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       pi.appendEntry(AGY_STATE_ENTRY_TYPE, pendingState);
       pendingState = undefined;
     }
+    runtime?.clearSettledTurn();
     replayStore.clear();
     if (activeCtx?.model?.provider === PROVIDER_ID) {
       void refreshUsageSummary(activeCtx, Boolean(runtime?.lastQuotaError));
