@@ -399,29 +399,16 @@ export class AgyAcpClient {
     });
   }
 
-  async newSession(options: {
-    cwd: string;
-    systemPromptAppend?: string;
-    mcpServers?: unknown[];
-  }): Promise<AcpSessionResult> {
-    const params: Record<string, unknown> = {
+  async newSession(options: { cwd: string; mcpServers?: unknown[] }): Promise<AcpSessionResult> {
+    return this.#request<AcpSessionResult>("session/new", {
       cwd: options.cwd,
       mcpServers: options.mcpServers ?? [],
-    };
-    if (options.systemPromptAppend) {
-      params._meta = {
-        antigravity: {
-          systemPrompt: { append: options.systemPromptAppend },
-        },
-      };
-    }
-    return this.#request<AcpSessionResult>("session/new", params);
+    });
   }
 
   async resumeSession(options: {
     sessionId: string;
     cwd: string;
-    systemPromptAppend?: string;
     mcpServers?: unknown[];
   }): Promise<AcpSessionResult> {
     const params: Record<string, unknown> = {
@@ -429,13 +416,6 @@ export class AgyAcpClient {
       cwd: options.cwd,
       mcpServers: options.mcpServers ?? [],
     };
-    if (options.systemPromptAppend) {
-      params._meta = {
-        antigravity: {
-          systemPrompt: { append: options.systemPromptAppend },
-        },
-      };
-    }
     let result: AcpSessionResult;
     try {
       result = await this.#request<AcpSessionResult>("session/resume", params);

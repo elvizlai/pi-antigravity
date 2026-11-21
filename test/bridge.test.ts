@@ -154,7 +154,11 @@ test("pi-tools agent files and dead bridge sweeping avoid private agy caches", a
       { agentsDir, modelId: "gemini-4-hydrogen" },
     );
     await stdAgent.write();
-    assert.match(fs.readFileSync(stdAgent.agentFile, "utf-8"), /tools: \[\]/);
+    assert.equal(stdAgent.agentFile.endsWith(`${path.sep}agent.md`), true);
+    const stdContent = fs.readFileSync(stdAgent.agentFile, "utf-8");
+    assert.match(stdContent, /"inheritCustomizations": false/);
+    assert.match(stdContent, /"serverUrl": "http:\/\/127\.0\.0\.1:9999\/mcp"/);
+    assert.match(stdContent, /"tools": \[\]/);
     await stdAgent.remove();
 
     const orchAgent = createPiToolsAgent(
@@ -162,7 +166,7 @@ test("pi-tools agent files and dead bridge sweeping avoid private agy caches", a
       { agentsDir, modelId: "gemini-pro-orchestrator" },
     );
     await orchAgent.write();
-    assert.match(fs.readFileSync(orchAgent.agentFile, "utf-8"), /enter_plan_mode/);
+    assert.match(fs.readFileSync(orchAgent.agentFile, "utf-8"), /"enter_plan_mode"/);
 
     const mcp = createPrivateMcpConfig(bridgesRoot);
     await mcp.write("http://127.0.0.1:9999/mcp", "tok");

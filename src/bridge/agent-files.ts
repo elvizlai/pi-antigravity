@@ -49,6 +49,7 @@ export interface PiToolsAgentOptions {
 
 export interface PiToolsAgentHandle {
   agentName: string;
+  agentDir: string;
   agentFile: string;
   write(): Promise<void>;
   remove(): Promise<void>;
@@ -72,49 +73,34 @@ function defaultIsPidDead(pid: number): boolean {
   }
 }
 
-function yamlString(value: string): string {
-  return JSON.stringify(value);
-}
-
 function formatPiToolsAgentFile(
   agentName: string,
   bridge: PiToolsAgentBridge,
   orchestrator: boolean,
 ): string {
-  const mcpServerJson = JSON.stringify({
-    url: bridge.url,
-    headers: { "x-pi-bridge-token": bridge.token },
-    timeoutSeconds: BRIDGE_MCP_TIMEOUT_SECONDS,
-  });
+  const definition = {
+    name: agentName,
+    description: PI_TOOLS_AGENT_DESCRIPTION,
+    hidden: true,
+    mainAgent: true,
+    subagent: false,
+    inheritCustomizations: false,
+    tools: orchestrator ? [...PI_TOOLS_ORCHESTRATOR_TOOLS] : [],
+    mcpServers: [
+      {
+        name: bridge.serverName,
+        serverUrl: bridge.url,
+        headers: { "x-pi-bridge-token": bridge.token },
+        timeoutSeconds: BRIDGE_MCP_TIMEOUT_SECONDS,
+      },
+    ],
+  };
 
-  const lines = [
-    "---",
-    `name: ${yamlString(agentName)}`,
-    `description: ${yamlString(PI_TOOLS_AGENT_DESCRIPTION)}`,
-  ];
-
-  if (orchestrator) {
-    lines.push("tools:");
-    for (const tool of PI_TOOLS_ORCHESTRATOR_TOOLS) {
-      lines.push(`  - ${tool}`);
-    }
-  } else {
-    lines.push("tools: []");
-  }
-
-  lines.push(
-    "mcpServers:",
-    `  ${yamlString(bridge.serverName)}: ${mcpServerJson}`,
-    "---",
-    piToolsAgentPrompt(bridge.serverName),
-    "",
-  );
-
-  return lines.join("\n");
+  return `---\n${JSON.stringify(definition, null, 2)}\n---\n\n${piToolsAgentPrompt(bridge.serverName)}\n`;
 }
 
 /**
- * Create a static agy agent markdown definition (`~/.gemini/config/agents/<name>.md`)
+ * Create a static agy agent markdown definition (`~/.gemini/config/agents/<name>/agent.md`)
  * that wires only this Pi process's HTTP MCP bridge.
  */
 export function createPiToolsAgent(
@@ -126,19 +112,21 @@ export function createPiToolsAgent(
   const agentName =
     options?.agentName ??
     `pi-tools-${process.pid}-${randomUUID()}${orchestrator ? "-orchestrator" : ""}`;
-  const agentFile = path.join(agentsDir, `${agentName}.md`);
+  const agentDir = path.join(agentsDir, agentName);
+  const agentFile = path.join(agentDir, "agent.md");
 
   return {
     agentName,
+    agentDir,
     agentFile,
     async write(): Promise<void> {
-      await mkdir(agentsDir, { recursive: true, mode: 0o700 });
+      await mkdir(agentDir, { recursive: true, mode: 0o700 });
       await writeFile(agentFile, formatPiToolsAgentFile(agentName, bridge, orchestrator), {
         mode: 0o600,
       });
     },
     async remove(): Promise<void> {
-      await rm(agentFile, { force: true });
+      await rm(agentDir, { recursive: true, force: true });
     },
   };
 }

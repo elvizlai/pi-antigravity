@@ -16,16 +16,19 @@ function asTranscript(messages: TranscriptContext["messages"]): TranscriptContex
   return messages;
 }
 
-test("extractSystemPromptAppend strips tools, skills, and cwd structurally without regex", () => {
+test("extractSystemPromptAppend strips all built-in Pi sections while preserving custom extensions", () => {
   const messages = asTranscript([
     {
       role: "system",
-      content: "Base instructions.",
+      content: "Base custom note.",
       sections: {
+        preamble: "You are a coding assistant running inside pi, a coding agent harness.",
         tools: "Available tools:\n- bash\n- read",
+        rules: "<rules>\n- Use bash\n</rules>",
+        docs: "<docs>\nPi documentation\n</docs>",
         skills: "<available_skills>foo</available_skills>",
         cwd: "/tmp/work",
-        projectContext: "# Project Rules\nFollow strict types.",
+        customSection: "# Custom Rule\nFollow strict types.",
       },
       timestamp: 1,
     },
@@ -42,9 +45,11 @@ test("extractSystemPromptAppend strips tools, skills, and cwd structurally witho
   const append = extractSystemPromptAppend(messages);
   assert.equal(
     append,
-    "Base instructions.\n\n# Project Rules\nFollow strict types.\n\nRecall enabled.",
+    "Base custom note.\n\n# Custom Rule\nFollow strict types.\n\nRecall enabled.",
   );
+  assert.equal(append?.includes("running inside pi"), false);
   assert.equal(append?.includes("Available tools"), false);
+  assert.equal(append?.includes("Pi documentation"), false);
   assert.equal(append?.includes("available_skills"), false);
   assert.equal(append?.includes("/tmp/work"), false);
 });
@@ -75,13 +80,13 @@ test("extractTrailingUserPrompt merges contiguous user turns, strips system mess
 
   const blocks = extractTrailingUserPrompt(messages, { allowImages: true });
   assert.deepEqual(blocks, [
-    { type: "text", text: "<memory>recalled context</memory>" },
-    { type: "text", text: "actual user prompt" },
+    { type: "text", text: "<memory>recalled context</memory>\n\nactual user prompt" },
     { type: "image", data: "Zm9v", mimeType: "image/png" },
   ]);
 
   const textOnly = extractTrailingUserPrompt(messages, { allowImages: false });
-  assert.equal(textOnly[2]?.type, "text");
+  assert.equal(textOnly.length, 1);
+  assert.equal(textOnly[0]?.type, "text");
 
   const huge = asTranscript([
     { role: "user", content: "prefix ".repeat(500), timestamp: 1 },
@@ -94,7 +99,7 @@ test("extractTrailingUserPrompt merges contiguous user turns, strips system mess
   );
   assert.ok(totalBytes <= 200);
   const last = capped.at(-1);
-  assert.equal(last?.type === "text" ? last.text : "", "final question");
+  assert.equal(last?.type === "text" && last.text.endsWith("final question"), true);
 });
 
 test("collectTurnToolResults gathers trailing matching tool results", () => {

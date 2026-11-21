@@ -83,15 +83,10 @@ export class AgyFirstResponseTimeoutError extends Error {
 export interface AgyAcpClientLike {
   readonly isAlive: boolean;
   initialize(): Promise<AcpInitializeResult>;
-  newSession(options: {
-    cwd: string;
-    systemPromptAppend?: string;
-    mcpServers?: unknown[];
-  }): Promise<AcpSessionResult>;
+  newSession(options: { cwd: string; mcpServers?: unknown[] }): Promise<AcpSessionResult>;
   resumeSession(options: {
     sessionId: string;
     cwd: string;
-    systemPromptAppend?: string;
     mcpServers?: unknown[];
   }): Promise<AcpSessionResult>;
   setConfigOption(
@@ -433,7 +428,6 @@ export class AgyRuntime {
         const resumed = await client.resumeSession({
           sessionId: candidateId,
           cwd: this.#deps.cwd,
-          systemPromptAppend: params.systemPromptAppend,
         });
         this.#conversationId = resumed.sessionId;
         this.#piSessionId = params.piSessionId;
@@ -451,7 +445,6 @@ export class AgyRuntime {
 
     const created = await client.newSession({
       cwd: this.#deps.cwd,
-      systemPromptAppend: params.systemPromptAppend,
     });
     this.#conversationId = created.sessionId;
     this.#piSessionId = params.piSessionId;
@@ -639,21 +632,36 @@ export class AgyRuntime {
       }
     }
 
+    const outboundPrompt = [...params.prompt];
+    const customSys = params.systemPromptAppend?.trim();
+    if (this.#turns === 0 && customSys) {
+      const firstTextIdx = outboundPrompt.findIndex((block) => block.type === "text");
+      if (firstTextIdx >= 0 && outboundPrompt[firstTextIdx]?.type === "text") {
+        outboundPrompt[firstTextIdx] = {
+          type: "text",
+          text: `${customSys}\n\n${outboundPrompt[firstTextIdx].text}`,
+        };
+      } else {
+        outboundPrompt.unshift({ type: "text", text: customSys });
+      }
+    }
+
     // Fire `session/prompt` asynchronously while `streamSimple` consumes `controller.drainWave()`.
     void client
-      .prompt(session.sessionId, params.prompt, {
+      .prompt(session.sessionId, outboundPrompt, {
         signal: promptAbort.signal,
         onUpdate: (update) => {
           if (timedOut || controller.isSettled) return;
-          noteFirstResponse();
           const activity = acpUpdateToActivity(update, acpTools);
-          if (!activity) return;
-
-          if (activity.type === "status_hint") return;
+          if (!activity || activity.type === "status_hint") return;
 
           if (activity.type === "context_usage") {
             this.#contextTokens = activity.usedTokens;
-            quotaTracker.noteUsageUpdate();
+            // Pre-turn `usage_update` (usedTokens === 0) must not disarm the watchdog or quota guard.
+            if (activity.usedTokens > 0) {
+              noteFirstResponse();
+              quotaTracker.noteUsageUpdate();
+            }
             this.#deps.onContextUsage?.({
               usedTokens: activity.usedTokens,
               sizeTokens: activity.sizeTokens,
@@ -661,6 +669,8 @@ export class AgyRuntime {
             controller.pushActivity(activity);
             return;
           }
+
+          noteFirstResponse();
 
           if (activity.type === "thinking_delta") {
             quotaTracker.noteThought();

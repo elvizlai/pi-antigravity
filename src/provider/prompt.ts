@@ -30,7 +30,7 @@ export const AGY_PARKED_TURN_ERROR =
 /** Maximum UTF-8 byte budget allocated to text blocks in a single `session/prompt`. */
 export const MAX_AGY_PROMPT_BYTES = 185_000;
 
-const OMITTED_SYSTEM_SECTIONS = new Set(["tools", "skills", "cwd"]);
+const OMITTED_SYSTEM_SECTIONS = new Set(["preamble", "tools", "rules", "docs", "skills", "cwd"]);
 
 /** Replay diagnostics must not promise that an unobserved task survived or stopped. */
 export function agyIncompleteToolError(tool: string, resultError?: string): string {
@@ -59,10 +59,10 @@ export function omittedImagesPrompt(images: number): string {
 }
 
 /**
- * Extract instructions from Pi's normalized transcript system message via
- * `@earendil-works/pi-ai` public helpers (`getCurrentSystemMessage` + `contentText`).
- * Strips Pi-specific `"tools"`, `"skills"`, and `"cwd"` sections structurally by
- * key instead of fragile prompt text regexes.
+ * Extract custom (non-harness) instructions from Pi's normalized transcript
+ * system message via `@earendil-works/pi-ai` (`getCurrentSystemMessage` + `contentText`).
+ * Omits all built-in Pi sections (`preamble`, `tools`, `rules`, `docs`, `skills`, `cwd`)
+ * so standard Pi harness framing is never forwarded to Antigravity.
  */
 export function extractSystemPromptAppend(
   messages: TranscriptContext["messages"],
@@ -176,12 +176,12 @@ function clampPromptTextBlocks(
 
 /**
  * Collect contiguous trailing `user` messages (skipping `system` entries) in
- * chronological order so extension-injected context + user prompt merge
- * seamlessly for `session/prompt`.
+ * chronological order and merge all text parts into a single `text` block
+ * (followed by any `image` blocks) within the UTF-8 byte ceiling.
  */
 export function extractTrailingUserPrompt(
   messages: TranscriptContext["messages"],
-  options?: { maxBytes?: number; allowImages?: boolean },
+  options?: { maxBytes?: number; allowImages?: boolean; customSystemContext?: string },
 ): AcpContentBlock[] {
   const trailingUsers: Extract<TranscriptContext["messages"][number], { role: "user" }>[] = [];
   for (let i = messages.length - 1; i >= 0; i -= 1) {
@@ -193,23 +193,29 @@ export function extractTrailingUserPrompt(
 
   if (trailingUsers.length === 0) return [];
 
-  const blocks: AcpContentBlock[] = [];
+  const textParts: string[] = [];
+  const imageBlocks: AcpContentBlock[] = [];
   let omittedImages = 0;
   const allowImages = options?.allowImages ?? true;
+
+  const customSys = options?.customSystemContext?.trim();
+  if (customSys) {
+    textParts.push(customSys);
+  }
 
   for (const msg of trailingUsers) {
     if (typeof msg.content === "string") {
       if (msg.content.trim()) {
-        blocks.push({ type: "text", text: msg.content });
+        textParts.push(msg.content);
       }
       continue;
     }
     for (const part of msg.content) {
       if (part.type === "text") {
-        if (part.text.trim()) blocks.push({ type: "text", text: part.text });
+        if (part.text.trim()) textParts.push(part.text);
       } else if (part.type === "image") {
         if (allowImages) {
-          blocks.push({ type: "image", data: part.data, mimeType: part.mimeType });
+          imageBlocks.push({ type: "image", data: part.data, mimeType: part.mimeType });
         } else {
           omittedImages += 1;
         }
@@ -218,12 +224,23 @@ export function extractTrailingUserPrompt(
   }
 
   if (omittedImages > 0) {
-    blocks.push({ type: "text", text: omittedImagesPrompt(omittedImages) });
+    textParts.push(omittedImagesPrompt(omittedImages));
   }
 
   const maxBytes = options?.maxBytes ?? MAX_AGY_PROMPT_BYTES;
-  return clampPromptTextBlocks(blocks, maxBytes);
+  const joined = textParts.join("\n\n");
+  const boundedText = joined ? truncateUtf8Tail(joined, maxBytes) : "";
+
+  const result: AcpContentBlock[] = [];
+  if (boundedText) {
+    result.push({ type: "text", text: boundedText });
+  }
+  result.push(...imageBlocks);
+  return result;
 }
+
+void truncateUtf8Head;
+void clampPromptTextBlocks;
 
 export interface CollectedToolResult {
   callId: string;

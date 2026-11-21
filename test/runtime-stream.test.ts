@@ -201,7 +201,19 @@ test("first-response stall timeout cancels/disposes hung worker and lets Pi auto
         },
         async prompt(_sid, _blocks, promptOpts) {
           if (attempt === 1) {
-            // Simulate agy stuck silently retrying upstream 429 before emitting any event.
+            // Emit pre-turn metadata updates (including used: 0) — watchdog must NOT disarm!
+            promptOpts?.onUpdate?.({ sessionUpdate: "config_option_update", configOptions: [] });
+            promptOpts?.onUpdate?.({
+              sessionUpdate: "available_commands_update",
+              availableCommands: [],
+            });
+            promptOpts?.onUpdate?.({ sessionUpdate: "session_info_update", title: "Say Hi" });
+            promptOpts?.onUpdate?.({
+              sessionUpdate: "usage_update",
+              used: 0,
+              size: 1_048_576,
+            });
+            // Simulate agy stuck silently retrying upstream 429 before emitting any real response.
             return new Promise(() => {});
           }
           // Retry attempt emits first chunk before 40ms, then streams >40ms without false timeout!
