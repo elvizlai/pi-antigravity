@@ -198,6 +198,8 @@ export class AgyRuntime {
   #client: AgyAcpClientLike | undefined;
   #clientFingerprint: string | undefined;
   #pendingDispose: Promise<void> | undefined;
+  #activeWarmup: Promise<void> | undefined;
+  #warmupAbort: AbortController | undefined;
   #agentHandle: PiToolsAgentHandle | undefined;
   #agentKey: string | undefined;
   #conversationId: string | undefined;
@@ -243,6 +245,11 @@ export class AgyRuntime {
   }
 
   async dispose(): Promise<void> {
+    this.#warmupAbort?.abort();
+    this.#warmupAbort = undefined;
+    if (this.#activeWarmup) {
+      await this.#activeWarmup.catch(() => {});
+    }
     const active = this.#activeTurn;
     this.#activeTurn = undefined;
     if (active) {
@@ -250,6 +257,84 @@ export class AgyRuntime {
     }
     await this.#disposeClient();
     await this.#removeAgentFile();
+  }
+
+  async #runWarmup(
+    externalSignal: AbortSignal | undefined,
+    fn: (signal: AbortSignal) => Promise<void>,
+  ): Promise<void> {
+    const abort = new AbortController();
+    this.#warmupAbort = abort;
+    const onAbort = () => abort.abort();
+    if (externalSignal) {
+      if (externalSignal.aborted) {
+        abort.abort();
+      } else {
+        externalSignal.addEventListener("abort", onAbort, { once: true });
+      }
+    }
+    const task = fn(abort.signal).finally(() => {
+      externalSignal?.removeEventListener("abort", onAbort);
+      if (this.#warmupAbort === abort) {
+        this.#warmupAbort = undefined;
+      }
+      if (this.#activeWarmup === task) {
+        this.#activeWarmup = undefined;
+      }
+    });
+    this.#activeWarmup = task;
+    await task;
+  }
+
+  /** Pre-start and initialize `agy acp` + bridge agent without creating an empty ACP conversation. */
+  async warmupClient(params: {
+    modelId: string;
+    env?: Record<string, string>;
+    signal?: AbortSignal;
+  }): Promise<void> {
+    if (this.#activeTurn) return;
+    if (this.#activeWarmup) {
+      await this.#activeWarmup.catch(() => {});
+    }
+    if (params.signal?.aborted || this.#activeTurn) return;
+    await this.#runWarmup(params.signal, async (signal) => {
+      if (signal.aborted || this.#activeTurn) return;
+      const toolMode = this.#deps.getToolMode?.() ?? "pi";
+      this.#deps.bridge?.refreshTools();
+      const { agentName } = await this.#ensurePiToolsAgent(toolMode, params.modelId);
+      if (signal.aborted || this.#activeTurn) return;
+      await this.#ensureClient({ agentName, env: params.env, signal });
+    });
+  }
+
+  /** Pre-open/resume and configure the active ACP session right before `streamSimple` begins timing. */
+  async warmupSession(params: {
+    modelId: string;
+    effort?: string;
+    executionMode?: AgyExecutionMode;
+    sessionId: string;
+    branchEntries: readonly SessionEntryLike[];
+    env?: Record<string, string>;
+    signal?: AbortSignal;
+  }): Promise<void> {
+    if (this.#activeTurn) return;
+    if (this.#activeWarmup) {
+      await this.#activeWarmup.catch(() => {});
+    }
+    if (params.signal?.aborted || this.#activeTurn) return;
+    await this.#runWarmup(params.signal, async (signal) => {
+      if (signal.aborted || this.#activeTurn) return;
+      const executionMode = params.executionMode ?? this.#deps.getExecutionMode?.() ?? "agent";
+      await this.#prepareConfiguredSession({
+        modelId: params.modelId,
+        effort: params.effort,
+        executionMode,
+        sessionId: params.sessionId,
+        branchEntries: params.branchEntries,
+        env: params.env,
+        signal,
+      });
+    });
   }
 
   #handleBridgeCall(call: BridgeCall): boolean {
@@ -348,6 +433,7 @@ export class AgyRuntime {
 
     const fingerprint = JSON.stringify({
       agentName: params.agentName ?? "",
+      bridgeCatalogRevision: params.agentName ? (this.#deps.bridge?.catalogRevision ?? 0) : 0,
       sandbox: Boolean(this.#deps.sandbox),
       extraDirs: this.#deps.extraDirs ?? [],
       env: stableEnvFingerprint(params.env),
@@ -505,9 +591,46 @@ export class AgyRuntime {
     this.#configOptions = currentOptions ? [...currentOptions] : undefined;
   }
 
+  async #prepareConfiguredSession(params: {
+    modelId: string;
+    effort?: string;
+    executionMode: AgyExecutionMode;
+    sessionId: string;
+    branchEntries: readonly SessionEntryLike[];
+    env?: Record<string, string>;
+    signal?: AbortSignal;
+  }): Promise<{
+    client: AgyAcpClientLike;
+    sessionId: string;
+    toolMode: AgyToolMode;
+    bridgeServerName?: string;
+  }> {
+    const toolMode = this.#deps.getToolMode?.() ?? "pi";
+    this.#deps.bridge?.refreshTools();
+    const { agentName, bridgeServerName } = await this.#ensurePiToolsAgent(
+      toolMode,
+      params.modelId,
+    );
+    const client = await this.#ensureClient({
+      agentName,
+      env: params.env,
+      signal: params.signal,
+    });
+    const session = await this.#openOrResumeSession(client, {
+      piSessionId: params.sessionId,
+      branchEntries: params.branchEntries,
+    });
+    await this.#syncSessionConfig(
+      client,
+      session.sessionId,
+      { modelId: params.modelId, effort: params.effort, executionMode: params.executionMode },
+      session.configOptions,
+    );
+    return { client, sessionId: session.sessionId, toolMode, bridgeServerName };
+  }
+
   async startOrContinueTurn(params: StartTurnParams): Promise<TurnSessionHandle> {
     const active = this.#activeTurn;
-    const bridge = this.#deps.bridge;
 
     // 1. Continuation wave: resolve pending bridged Pi tool calls and re-attach to active turn.
     if (active && !active.controller.isSettled) {
@@ -526,31 +649,21 @@ export class AgyRuntime {
       throw abort;
     }
 
-    // 2. Fresh ACP prompt turn.
-    const toolMode = this.#deps.getToolMode?.() ?? "pi";
-    const executionMode = params.executionMode ?? this.#deps.getExecutionMode?.() ?? "agent";
+    if (this.#activeWarmup) {
+      await this.#activeWarmup.catch(() => {});
+    }
 
-    bridge?.refreshTools();
-    const { agentName, bridgeServerName } = await this.#ensurePiToolsAgent(
-      toolMode,
-      params.modelId,
-    );
-    const client = await this.#ensureClient({
-      agentName,
+    // 2. Fresh ACP prompt turn.
+    const executionMode = params.executionMode ?? this.#deps.getExecutionMode?.() ?? "agent";
+    const { client, sessionId, toolMode, bridgeServerName } = await this.#prepareConfiguredSession({
+      modelId: params.modelId,
+      effort: params.effort,
+      executionMode,
+      sessionId: params.sessionId,
+      branchEntries: params.branchEntries,
       env: params.env,
       signal: params.signal,
     });
-    const session = await this.#openOrResumeSession(client, {
-      piSessionId: params.sessionId,
-      branchEntries: params.branchEntries,
-      systemPromptAppend: params.systemPromptAppend,
-    });
-    await this.#syncSessionConfig(
-      client,
-      session.sessionId,
-      { modelId: params.modelId, effort: params.effort, executionMode },
-      session.configOptions,
-    );
 
     const controller = new AgyTurnController();
     const acpTools = new Map<string, AgyToolView>();
@@ -584,7 +697,7 @@ export class AgyRuntime {
 
     const activeTurn: ActiveTurn = {
       controller,
-      sessionId: session.sessionId,
+      sessionId,
       modelId: params.modelId,
       piSessionId: params.sessionId,
       toolMode,
@@ -609,7 +722,7 @@ export class AgyRuntime {
       timedOut = true;
       cleanupActive();
       try {
-        client.cancelSession(session.sessionId);
+        client.cancelSession(sessionId);
       } catch {
         // Best-effort cancel before hard client disposal.
       }
@@ -648,7 +761,7 @@ export class AgyRuntime {
 
     // Fire `session/prompt` asynchronously while `streamSimple` consumes `controller.drainWave()`.
     void client
-      .prompt(session.sessionId, outboundPrompt, {
+      .prompt(sessionId, outboundPrompt, {
         signal: promptAbort.signal,
         onUpdate: (update) => {
           if (timedOut || controller.isSettled) return;
@@ -742,7 +855,7 @@ export class AgyRuntime {
           version: 1,
           kind: "conversation",
           sessionId: params.sessionId,
-          conversationId: session.sessionId,
+          conversationId: sessionId,
           cwd: this.#deps.cwd,
           modelId: params.modelId,
           toolMode,

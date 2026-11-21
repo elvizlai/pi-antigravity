@@ -558,3 +558,146 @@ test("native wrapper tool replay store preserves output and daemon parked errors
   assert.match(replayStore.take(calls[1].id)?.error ?? "", /background task/);
   await runtime.dispose();
 });
+
+test("warmupSession completes setup before streamSimple and reloads client when bridge catalog changes", async () => {
+  let spawnCount = 0;
+  const calls: string[] = [];
+  const bridge = new AgyPiBridge("pi-warmup-test");
+  bridge.setToolSource(() => [{ name: "read", description: "read file", parameters: {} }]);
+  bridge.refreshTools();
+  await bridge.start();
+
+  try {
+    let aliveClient: { isAlive: boolean } | undefined;
+    const runtime = new AgyRuntime({
+      cwd: "/work",
+      bridge,
+      getToolMode: () => "pi",
+      checkBinary: async () => ({ binary: "agy", version: "1.5.13" }),
+      createClient: () => {
+        spawnCount += 1;
+        const clientId = spawnCount;
+        const client = {
+          isAlive: true,
+          async initialize() {
+            calls.push(`init:${clientId}`);
+            return { protocolVersion: 1 };
+          },
+          async newSession() {
+            calls.push(`new:${clientId}`);
+            return {
+              sessionId: `sess-${clientId}`,
+              configOptions: [
+                { id: "mode", category: "mode", type: "select", currentValue: "agent" },
+                {
+                  id: "model",
+                  category: "model",
+                  type: "select",
+                  currentValue: "gemini-4-hydrogen",
+                },
+              ],
+            };
+          },
+          async resumeSession({ sessionId }: { sessionId: string }) {
+            calls.push(`resume:${clientId}:${sessionId}`);
+            return {
+              sessionId,
+              configOptions: [
+                { id: "mode", category: "mode", type: "select", currentValue: "agent" },
+                {
+                  id: "model",
+                  category: "model",
+                  type: "select",
+                  currentValue: "gemini-4-hydrogen",
+                },
+              ],
+            };
+          },
+          async setConfigOption(_sid: string, configId: string, value: string) {
+            calls.push(`set:${clientId}:${configId}=${value}`);
+            return { configOptions: [] };
+          },
+          cancelSession() {},
+          async prompt(
+            _sid: string,
+            _blocks: unknown,
+            opts?: { onUpdate?: (u: Record<string, unknown>) => void },
+          ) {
+            calls.push(`prompt:${clientId}`);
+            opts?.onUpdate?.({
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "hi" },
+            });
+            return {
+              stopReason: "end_turn",
+              usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
+            };
+          },
+          async dispose() {
+            client.isAlive = false;
+            calls.push(`dispose:${clientId}`);
+          },
+        };
+        aliveClient = client;
+        return client;
+      },
+    });
+
+    await runtime.warmupSession({
+      modelId: "gemini-4-hydrogen",
+      executionMode: "agent",
+      sessionId: "pi-warmup-1",
+      branchEntries: [],
+    });
+    assert.deepEqual(calls, ["init:1", "new:1"]);
+
+    calls.length = 0;
+    const streamSimple = createAntigravityStreamSimple({
+      getRuntime: () => runtime,
+      getSessionId: () => "pi-warmup-1",
+      getBranchEntries: () => [],
+      replayStore: new AgyReplayStore(),
+    });
+    const wave1 = streamSimple(
+      testModel(),
+      makeTranscript([{ role: "user", content: "hi", timestamp: 1 }]),
+    );
+    for await (const _ev of wave1) {
+      // Drain stream events.
+    }
+    const msg1 = await wave1.result();
+    assert.equal(msg1.stopReason, "stop");
+    assert.deepEqual(calls, ["prompt:1"]);
+
+    // Changing dynamic bridge tools bumps catalogRevision and forces a fresh agy acp process.
+    bridge.setDynamicTools([
+      {
+        name: "activate_skill",
+        description: "load skill",
+        parameters: { type: "object", properties: {} },
+        handler: async () => ({ content: "ok", isError: false }),
+      },
+    ]);
+    calls.length = 0;
+    const wave2 = streamSimple(
+      testModel(),
+      makeTranscript([
+        { role: "user", content: "hi", timestamp: 1 },
+        { role: "assistant", content: [{ type: "text", text: "hi" }], timestamp: 2 },
+        { role: "user", content: "again", timestamp: 3 },
+      ]),
+    );
+    for await (const _ev of wave2) {
+      // Drain stream events.
+    }
+    await wave2.result();
+    assert.equal(spawnCount, 2);
+    assert.ok(calls.includes("dispose:1"));
+    assert.ok(calls.includes("init:2"));
+    assert.ok(calls.includes("prompt:2"));
+    assert.equal(aliveClient?.isAlive, true);
+    await runtime.dispose();
+  } finally {
+    await bridge.close();
+  }
+});

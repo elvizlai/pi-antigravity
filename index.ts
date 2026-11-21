@@ -502,6 +502,17 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     },
   });
 
+  const triggerBackgroundWarmup = (ctx: ExtensionContext) => {
+    if (!ctx.hasUI || ctx.model?.provider !== PROVIDER_ID) return;
+    const modelId = ctx.model.id;
+    void (async () => {
+      if (toolMode === "pi") {
+        await bridgeLifecycle.ensureRegistered();
+      }
+      await getRuntime().warmupClient({ modelId });
+    })().catch(() => {});
+  };
+
   pi.on("session_start", async (_event, ctx) => {
     activeCtx = ctx;
     pendingState = undefined;
@@ -516,6 +527,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     updateStatus(ctx);
     if (ctx.model?.provider === PROVIDER_ID) {
       void refreshUsageSummary(ctx);
+      triggerBackgroundWarmup(ctx);
     }
   });
 
@@ -525,6 +537,11 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     updateStatus(ctx);
     if (ctx.model?.provider === PROVIDER_ID) {
       void refreshUsageSummary(ctx);
+      triggerBackgroundWarmup(ctx);
+    } else if (runtime) {
+      const prev = runtime;
+      runtime = undefined;
+      void prev.dispose();
     }
   });
 
@@ -557,6 +574,19 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       await bridgeLifecycle.ensureRegistered((msg) => notify(ctx, msg, "warning"));
       bridgeLifecycle.warnSkillsUnavailable(privateSkills);
     }
+    const effort = ctx.thinkingLevel === "off" ? undefined : ctx.thinkingLevel;
+    await getRuntime()
+      .warmupSession({
+        modelId: ctx.model.id,
+        effort,
+        executionMode,
+        sessionId: ctx.sessionManager.getSessionId(),
+        branchEntries: ctx.sessionManager.getBranch(),
+        signal: ctx.signal,
+      })
+      .catch(() => {
+        // Defer binary/auth/config failures to streamSimple so Pi renders standard turn errors.
+      });
   });
 
   pi.on("agent_end", () => {
