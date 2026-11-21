@@ -46,6 +46,7 @@ import { AgyRuntime } from "./src/provider/runtime.ts";
 import {
   type AgyExecutionMode,
   type AgyToolMode,
+  formatAgyFooterStatus,
   formatAgyToolModeStatus,
   loadAgySettings,
   parseAgyPlanArg,
@@ -91,7 +92,7 @@ function parseExtraDirs(raw: unknown): string[] {
 export default function antigravityExtension(pi: ExtensionAPI): void {
   pi.registerFlag("agy-tools", {
     type: "string",
-    description: "Antigravity tool routing mode (pi | agy | native)",
+    description: "Antigravity tool routing mode (pi | agy)",
   });
   pi.registerFlag("agy-plan", {
     type: "boolean",
@@ -155,12 +156,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       ctx.ui.setStatus(PROVIDER_ID, undefined);
       return;
     }
-    const modeLabel = formatAgyToolModeStatus(toolMode);
-    const planLabel = executionMode === "plan" ? " plan" : "";
-    const usageLabel = lastUsage
-      ? ` ${Math.round((lastUsage.usedTokens / lastUsage.sizeTokens) * 100)}%`
-      : "";
-    ctx.ui.setStatus(PROVIDER_ID, `agy ${modeLabel}${planLabel}${usageLabel}`);
+    ctx.ui.setStatus(PROVIDER_ID, formatAgyFooterStatus(toolMode, executionMode, lastUsage));
   };
 
   const syncWrapperTool = (ctx: ExtensionContext) => {
@@ -344,7 +340,15 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("agy-tools", {
-    description: "Switch Antigravity tool routing mode (pi | agy | native | status)",
+    description: "Switch Antigravity tool routing mode (pi | agy)",
+    getArgumentCompletions(prefix) {
+      const query = prefix.trim().toLowerCase();
+      const items = [
+        { value: "pi", label: "pi", description: "Use Pi tools via MCP bridge (acp:pi)" },
+        { value: "agy", label: "agy", description: "Use agy built-in tools (acp:agy)" },
+      ].filter((item) => item.value.startsWith(query));
+      return items.length > 0 ? items : null;
+    },
     async handler(args, ctx) {
       const action = parseAgyToolModeArg(args);
       if (action.kind === "status") {
@@ -352,12 +356,15 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         return;
       }
       if (action.kind === "invalid") {
-        notify(ctx, `Invalid tool mode "${action.raw}". Use: pi | agy | status`, "warning");
+        notify(ctx, `Invalid tool mode "${action.raw}". Use: pi | agy`, "warning");
         return;
       }
       toolMode = action.mode;
       saveAgySettings({ toolMode });
       bridge.refreshTools();
+      if (toolMode !== "pi") {
+        await bridgeLifecycle.teardown();
+      }
       updateStatus(ctx);
       notify(
         ctx,
@@ -367,7 +374,15 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("agy-plan", {
-    description: "Toggle Antigravity plan execution mode (on | off | status)",
+    description: "Toggle Antigravity plan execution mode (on | off)",
+    getArgumentCompletions(prefix) {
+      const query = prefix.trim().toLowerCase();
+      const items = [
+        { value: "on", label: "on", description: "Enable ACP plan mode" },
+        { value: "off", label: "off", description: "Use ACP agent mode" },
+      ].filter((item) => item.value.startsWith(query));
+      return items.length > 0 ? items : null;
+    },
     async handler(args, ctx) {
       const action = parseAgyPlanArg(args);
       if (action.kind === "status") {
@@ -375,7 +390,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       } else if (action.kind === "set") {
         executionMode = resolveAgyExecutionMode(action.enabled);
       } else {
-        notify(ctx, `Invalid argument "${action.raw}". Use: on | off | status`, "warning");
+        notify(ctx, `Invalid argument "${action.raw}". Use: on | off`, "warning");
         return;
       }
       updateStatus(ctx);

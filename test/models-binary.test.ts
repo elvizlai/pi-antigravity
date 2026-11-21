@@ -21,6 +21,7 @@ import {
 } from "../src/acp/models.ts";
 import {
   agySettingsPath,
+  formatAgyFooterStatus,
   formatAgyToolModeStatus,
   loadAgySettings,
   parseAgyToolModeArg,
@@ -149,6 +150,12 @@ test("extension settings persist atomically to antigravity.json without touching
     assert.equal(fs.readFileSync(piSettings, "utf-8"), JSON.stringify({ theme: "dark" }));
     assert.equal(formatAgyToolModeStatus("pi"), "acp:pi");
     assert.equal(formatAgyToolModeStatus("native"), "acp:agy");
+    assert.equal(formatAgyFooterStatus("pi"), "acp:pi");
+    assert.equal(formatAgyFooterStatus("native"), "acp:agy");
+    assert.equal(
+      formatAgyFooterStatus("pi", "plan", { usedTokens: 120, sizeTokens: 1000 }),
+      "acp:pi plan 12%",
+    );
     assert.deepEqual(parseAgyToolModeArg("agy"), { kind: "set", mode: "native" });
     assert.equal(parseAgyToolModeFlag("agy"), "native");
   } finally {

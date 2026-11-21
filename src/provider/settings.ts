@@ -43,6 +43,20 @@ export function formatAgyToolModeStatus(mode: AgyToolMode): string {
   return mode === "pi" ? "acp:pi" : "acp:agy";
 }
 
+export function formatAgyFooterStatus(
+  mode: AgyToolMode,
+  executionMode: AgyExecutionMode = "agent",
+  usage?: { usedTokens: number; sizeTokens: number },
+): string {
+  const modeLabel = formatAgyToolModeStatus(mode);
+  const planLabel = executionMode === "plan" ? " plan" : "";
+  const usageLabel =
+    usage && usage.sizeTokens > 0
+      ? ` ${Math.round((usage.usedTokens / usage.sizeTokens) * 100)}%`
+      : "";
+  return `${modeLabel}${planLabel}${usageLabel}`;
+}
+
 export function parseAgyToolModeFlag(raw: unknown): AgyToolMode | undefined {
   if (typeof raw !== "string") return undefined;
   const normalized = raw.trim().toLowerCase();

@@ -40,7 +40,7 @@ Extension settings are stored independently in `~/.pi/agent/antigravity.json` (n
 
 - **`pi` (default)** — Status: `acp:pi`
   Bridges Pi's active tools (`read`, `bash`, `edit`, `write`, `codemode`, MCP tools) and Pi-private skills (`pi__activate_skill`) into `agy acp` via `--agent pi-tools-<pid>` and a loopback HTTP MCP server.
-- **`agy` / `native`** — Status: `acp:agy`
+- **`agy`** — Status: `acp:agy`
   Lets `agy` execute its own built-in tools directly.
 
 ## Retries & Timeouts
@@ -51,8 +51,8 @@ Extension settings are stored independently in `~/.pi/agent/antigravity.json` (n
 
 ## Commands & Flags
 
-- `/agy-tools [pi|agy|native|on|off|status]` — Switch or inspect tool routing (persists to `~/.pi/agent/antigravity.json`)
-- `/agy-plan [on|off|status]` — Toggle ACP `plan` execution mode vs `agent`
+- `/agy-tools [pi|agy]` — Switch or inspect tool routing (persists to `~/.pi/agent/antigravity.json`)
+- `/agy-plan [on|off]` — Toggle ACP `plan` execution mode vs `agent`
 - `/agy-reset` — Reset the bound ACP conversation and start fresh on the next turn
 - `/agy-doctor` — Verify `agy >= 1.5.0`, bridge server state, ACP connection, and quota status
 - `/agy-models` — Refresh available models from `agy models`
