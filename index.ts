@@ -440,7 +440,7 @@ export default function antigravityExtension(pi: ExtensionAPI) {
     AGY_CONVERSATION_STATE_ENTRY,
     (entry, _options, theme) => {
       const parsed = parsePersistedAgyState(entry.data);
-      if (!parsed || parsed.kind !== "reset") return undefined;
+      if (parsed?.kind !== "reset") return undefined;
       return new Text(theme.fg("dim", "antigravity conversation reset"), 0, 0);
     },
   );

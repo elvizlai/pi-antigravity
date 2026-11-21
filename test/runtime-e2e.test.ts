@@ -1,10 +1,18 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { createInterface } from "node:readline";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import { AgyAcpClient } from "../lib/acp-client.ts";
-import { AgyAcpRuntime, AgyQuotaError } from "../src/runtime.ts";
+import {
+  AgyAcpRuntime,
+  type AgyAcpRuntimeOptions,
+  AgyQuotaError,
+  AgyRetryExhaustedError,
+} from "../src/runtime.ts";
 
 function createFakeAcpRuntime(
   handler: (params: {
@@ -13,11 +21,13 @@ function createFakeAcpRuntime(
     spawnIndex: number;
     exitWith: (code: number) => void;
   }) => void,
+  extraOptions: Partial<AgyAcpRuntimeOptions> = {},
 ) {
   let spawnCount = 0;
   const runtime = new AgyAcpRuntime({
     checkBinary: async () => ({ binary: "/fake/agy", version: "1.5.13" }),
     cancelGraceMs: 200,
+    ...extraOptions,
     createClient: (opts) => {
       const spawnIndex = spawnCount++;
       return new AgyAcpClient({
@@ -358,4 +368,112 @@ test("AgyAcpRuntime parks bridge waves and resumes via continueParkedTurn", asyn
   }
   assert.equal(runtime.hasParkedTurn, false);
   await runtime.stop();
+});
+
+test("AgyAcpRuntime caps retries at 3 attempts, cancels session, and fails with AgyRetryExhaustedError", async () => {
+  const brainDir = mkdtempSync(path.join(os.tmpdir(), "agy-retry-"));
+  const logsDir = path.join(brainDir, "r-1", ".system_generated", "logs");
+  mkdirSync(logsDir, { recursive: true });
+  const transcriptPath = path.join(logsDir, "transcript.jsonl");
+
+  let cancelNotificationSent = false;
+  let quotaCallbackFired = false;
+  const hints: string[] = [];
+
+  const { runtime } = createFakeAcpRuntime(
+    ({ msg, sendLine }) => {
+      if (msg.method === "initialize") {
+        sendLine({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1 } });
+      } else if (msg.method === "session/new") {
+        sendLine({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "r-1", configOptions: [] } });
+      } else if (msg.method === "session/prompt") {
+        writeFileSync(
+          transcriptPath,
+          `${JSON.stringify({
+            step_index: 1,
+            source: "SYSTEM",
+            type: "ERROR_MESSAGE",
+            error: "API error (attempt 1): RESOURCE_EXHAUSTED (code 429)",
+          })}\n`,
+        );
+        setTimeout(() => {
+          writeFileSync(
+            transcriptPath,
+            [
+              JSON.stringify({
+                step_index: 1,
+                source: "SYSTEM",
+                type: "ERROR_MESSAGE",
+                error: "API error (attempt 1): RESOURCE_EXHAUSTED (code 429)",
+              }),
+              JSON.stringify({
+                step_index: 2,
+                source: "SYSTEM",
+                type: "ERROR_MESSAGE",
+                error: "API error (attempt 2): RESOURCE_EXHAUSTED (code 429)",
+              }),
+            ].join("\n") + "\n",
+          );
+        }, 35);
+        setTimeout(() => {
+          writeFileSync(
+            transcriptPath,
+            [
+              JSON.stringify({
+                step_index: 1,
+                source: "SYSTEM",
+                type: "ERROR_MESSAGE",
+                error: "API error (attempt 1): RESOURCE_EXHAUSTED (code 429)",
+              }),
+              JSON.stringify({
+                step_index: 2,
+                source: "SYSTEM",
+                type: "ERROR_MESSAGE",
+                error: "API error (attempt 2): RESOURCE_EXHAUSTED (code 429)",
+              }),
+              JSON.stringify({
+                step_index: 3,
+                source: "SYSTEM",
+                type: "ERROR_MESSAGE",
+                error: "API error (attempt 3): RESOURCE_EXHAUSTED (code 429)",
+              }),
+            ].join("\n") + "\n",
+          );
+        }, 75);
+      } else if (msg.method === "session/cancel") {
+        cancelNotificationSent = true;
+      }
+    },
+    { brainDir, transcriptPollIntervalMs: 20, maxApiAttempts: 3 },
+  );
+
+  try {
+    await assert.rejects(
+      runtime.runTurn({
+        cwd: "/repo",
+        modelId: "gemini-4-neon",
+        onQuotaExhausted: () => {
+          quotaCallbackFired = true;
+        },
+        onActivity: (act) => {
+          if (act.type === "status_hint") hints.push(act.text);
+        },
+        buildPrompt: () => ({ blocks: [{ type: "text", text: "hi" }] }),
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof AgyRetryExhaustedError);
+        assert.equal(err.attempts, 3);
+        assert.ok(err.message.includes("quota exceeded"));
+        return true;
+      },
+    );
+
+    assert.ok(hints.some((h) => h.startsWith("retry 1/3")));
+    assert.ok(hints.some((h) => h.startsWith("retry 2/3")));
+    assert.equal(cancelNotificationSent, true);
+    assert.equal(quotaCallbackFired, true);
+  } finally {
+    await runtime.stop();
+    rmSync(brainDir, { recursive: true, force: true });
+  }
 });

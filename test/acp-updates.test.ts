@@ -191,7 +191,20 @@ test("extractLatestTranscriptRetryError surfaces trailing 429 retries and clears
 
   assert.deepEqual(extractLatestTranscriptRetryError(retryingTail), {
     stepIndex: 2,
+    attempt: 2,
     message: "API error (attempt 2): RESOURCE_EXHAUSTED (code 429): Resource has been exhausted.",
+  });
+
+  // Falls back to consecutive ERROR_MESSAGE count when message omits `attempt N`.
+  const noAttemptTail = [
+    JSON.stringify({ step_index: 1, type: "ERROR_MESSAGE", error: "upstream error 1" }),
+    JSON.stringify({ step_index: 2, type: "ERROR_MESSAGE", error: "upstream error 2" }),
+    JSON.stringify({ step_index: 3, type: "ERROR_MESSAGE", error: "upstream error 3" }),
+  ].join("\n");
+  assert.deepEqual(extractLatestTranscriptRetryError(noAttemptTail), {
+    stepIndex: 3,
+    attempt: 3,
+    message: "upstream error 3",
   });
 
   const recoveredTail = [

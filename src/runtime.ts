@@ -28,13 +28,32 @@ import { AgyQuotaTurnTracker, isAgyQuotaError } from "../lib/quota.ts";
 import { trackActiveToolStep } from "../lib/tool-steps.ts";
 import { AgyTurnController, type AgyTurnOutcome } from "./turn.ts";
 
+export const DEFAULT_MAX_API_ATTEMPTS = 3;
+const DEFAULT_TRANSCRIPT_POLL_MS = 500;
+
 export class AgyQuotaError extends Error {
   readonly resetsIn?: string;
 
   constructor(message: string, resetsIn?: string) {
-    super(message);
+    // Include "quota exceeded" so Pi's `isRetryableAssistantError` does not trigger outer 429 retries.
+    super(/quota exceeded/i.test(message) ? message : `Antigravity quota exceeded: ${message}`);
     this.name = "AgyQuotaError";
     this.resetsIn = resetsIn;
+  }
+}
+
+export class AgyRetryExhaustedError extends Error {
+  readonly attempts: number;
+  readonly lastError: string;
+
+  constructor(lastError: string, attempts: number) {
+    // Match Pi's non-retryable pattern ("quota exceeded") so outer Pi auto-retry stops cleanly.
+    super(
+      `Antigravity API failed after ${attempts} attempts (quota exceeded / upstream capacity): ${lastError}`,
+    );
+    this.name = "AgyRetryExhaustedError";
+    this.attempts = attempts;
+    this.lastError = lastError;
   }
 }
 
@@ -90,6 +109,9 @@ export interface AgyAcpRuntimeOptions {
   checkBinary?: () => Promise<AgyBinaryInfo>;
   createClient?: (options: AgyAcpClientOptions) => AgyAcpClient;
   cancelGraceMs?: number;
+  maxApiAttempts?: number;
+  transcriptPollIntervalMs?: number;
+  brainDir?: string;
 }
 
 interface ParkedTurnState {
@@ -104,6 +126,9 @@ export class AgyAcpRuntime {
   readonly #checkBinary: () => Promise<AgyBinaryInfo>;
   readonly #createClient: (options: AgyAcpClientOptions) => AgyAcpClient;
   readonly #cancelGraceMs?: number;
+  readonly #maxApiAttempts: number;
+  readonly #transcriptPollIntervalMs: number;
+  readonly #brainDir?: string;
 
   #client?: AgyAcpClient;
   #spawnKey?: string;
@@ -116,6 +141,9 @@ export class AgyAcpRuntime {
     this.#checkBinary = options.checkBinary ?? (() => checkAgyBinary());
     this.#createClient = options.createClient ?? ((opts) => new AgyAcpClient(opts));
     this.#cancelGraceMs = options.cancelGraceMs;
+    this.#maxApiAttempts = options.maxApiAttempts ?? DEFAULT_MAX_API_ATTEMPTS;
+    this.#transcriptPollIntervalMs = options.transcriptPollIntervalMs ?? DEFAULT_TRANSCRIPT_POLL_MS;
+    this.#brainDir = options.brainDir;
   }
 
   get isConnected(): boolean {
@@ -370,7 +398,7 @@ export class AgyAcpRuntime {
 
     // Start the background ACP prompt loop; each Pi wave awaits `waitNextWave`.
     const transcriptPath = path.join(
-      agyBrainDir(),
+      this.#brainDir ?? agyBrainDir(),
       sessionId,
       ".system_generated",
       "logs",
@@ -380,6 +408,7 @@ export class AgyAcpRuntime {
     let retryHintActive = false;
     let polling = false;
     let stopped = false;
+    let promptSettled = false;
 
     const pollTranscriptRetry = async () => {
       if (polling || stopped) return;
@@ -397,10 +426,31 @@ export class AgyAcpRuntime {
         const latest = extractLatestTranscriptRetryError(
           buf.subarray(0, bytesRead).toString("utf8"),
         );
-        if (latest && latest.stepIndex !== lastRetryStep) {
+        if (!latest) return;
+
+        if (latest.attempt >= this.#maxApiAttempts) {
+          clearRetryWatcher();
+          if (isAgyQuotaError(latest.message) || /\bRESOURCE_EXHAUSTED\b/i.test(latest.message)) {
+            request.onQuotaExhausted?.();
+          }
+          controller.fail(new AgyRetryExhaustedError(latest.message, latest.attempt));
+          client.cancelSession(sessionId);
+          const killTimer = setTimeout(() => {
+            if (!promptSettled && this.#client === client) {
+              void this.#disposeClient();
+            }
+          }, 1_000);
+          killTimer.unref?.();
+          return;
+        }
+
+        if (latest.stepIndex !== lastRetryStep) {
           lastRetryStep = latest.stepIndex;
           retryHintActive = true;
-          controller.onActivity({ type: "status_hint", text: latest.message });
+          controller.onActivity({
+            type: "status_hint",
+            text: `retry ${latest.attempt}/${this.#maxApiAttempts} — ${latest.message}`,
+          });
         }
       } catch {
         // Missing or unreadable brain transcript while initializing is non-fatal.
@@ -412,7 +462,7 @@ export class AgyAcpRuntime {
 
     const retryPollTimer = setInterval(() => {
       void pollTranscriptRetry();
-    }, 2_000);
+    }, this.#transcriptPollIntervalMs);
     retryPollTimer.unref?.();
 
     const clearRetryWatcher = () => {
@@ -465,6 +515,7 @@ export class AgyAcpRuntime {
         },
       })
       .then((result) => {
+        promptSettled = true;
         clearRetryWatcher();
         const usage = normalizeAcpPromptUsage(result.usage);
         const quotaNotice = quotaTracker.detectTurnQuotaExhaustion(result.usage);
@@ -479,6 +530,7 @@ export class AgyAcpRuntime {
         });
       })
       .catch((error) => {
+        promptSettled = true;
         clearRetryWatcher();
         const err = error instanceof Error ? error : new Error(String(error));
         if (isAgyQuotaError(err.message)) {

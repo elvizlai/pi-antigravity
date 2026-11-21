@@ -4,6 +4,7 @@ import { createInterface } from "node:readline";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import type { AssistantMessageEvent, Model, TranscriptContext } from "@earendil-works/pi-ai";
+import { isRetryableAssistantError } from "@earendil-works/pi-ai/utils/retry";
 import { AgyAcpClient } from "../lib/acp-client.ts";
 import { AgyPiBridge, BRIDGE_CALL_TIMEOUT_MS } from "../lib/bridge.ts";
 import { AgyReplayStore } from "../lib/replay.ts";
@@ -13,7 +14,7 @@ import {
   createAntigravityStreamSimple,
   extractTrailingUserPrompt,
 } from "../src/provider.ts";
-import { AgyAcpRuntime } from "../src/runtime.ts";
+import { AgyAcpRuntime, AgyQuotaError, AgyRetryExhaustedError } from "../src/runtime.ts";
 import { assertDeltasMatchPartial } from "./delta-replay.ts";
 
 const TEST_MODEL: Model<string> = {
@@ -338,4 +339,34 @@ test("extractTrailingUserPrompt preserves user text followed by hindsight/custom
   const t2 = extractTrailingUserPrompt(turn2Messages);
   assert.equal(t2.userIndex, 4);
   assert.equal(t2.text, "turn2\n\n<hindsight_pages>memory2</hindsight_pages>");
+});
+
+test("AgyQuotaError and AgyRetryExhaustedError prevent outer Pi 429 retry loops", () => {
+  const retryExhausted = new AgyRetryExhaustedError(
+    "API error (attempt 3): RESOURCE_EXHAUSTED (code 429): Resource has been exhausted.",
+    3,
+  );
+  const quotaErr = new AgyQuotaError("Individual quota reached", "2h 10m");
+
+  for (const err of [retryExhausted, quotaErr]) {
+    const msg = {
+      role: "assistant" as const,
+      content: [],
+      api: "antigravity-acp",
+      provider: "antigravity",
+      model: "gemini-4-neon",
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "error" as const,
+      errorMessage: err.message,
+      timestamp: Date.now(),
+    };
+    assert.equal(isRetryableAssistantError(msg), false);
+  }
 });

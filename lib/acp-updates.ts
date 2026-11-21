@@ -429,18 +429,28 @@ export function isBridgedMcpTool(
   return false;
 }
 
+export interface AgyTranscriptRetryError {
+  stepIndex: number;
+  attempt: number;
+  message: string;
+}
+
+const RETRY_ATTEMPT_RE = /\battempt\s+(\d+)\b/i;
+
 /**
- * Extract the trailing retry error from a slice of `agy`'s `transcript.jsonl`,
- * ignoring partial leading lines and clearing once a model step begins after it.
+ * Extract the trailing retry error and attempt count from a slice of `agy`'s
+ * `transcript.jsonl`, ignoring partial leading lines and clearing once a
+ * non-error step (such as a model response or new user input) follows it.
  */
 export function extractLatestTranscriptRetryError(
   jsonlTail: string,
-): { stepIndex: number; message: string } | undefined {
-  let latest: { stepIndex: number; message: string } | undefined;
+): AgyTranscriptRetryError | undefined {
+  let latest: AgyTranscriptRetryError | undefined;
+  let consecutiveErrors = 0;
   const lines = jsonlTail.split("\n");
   for (let i = 0; i < lines.length; i += 1) {
     const raw = lines[i]?.trim();
-    if (!raw || !raw.startsWith("{")) continue;
+    if (!raw?.startsWith("{")) continue;
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
@@ -449,14 +459,23 @@ export function extractLatestTranscriptRetryError(
     }
     const rec = asRecord(parsed);
     if (!rec) continue;
-    if (rec.type === "PLANNER_RESPONSE" || rec.source === "MODEL") {
+    if (rec.type !== "ERROR_MESSAGE") {
       latest = undefined;
+      consecutiveErrors = 0;
       continue;
     }
-    if (rec.type === "ERROR_MESSAGE" && typeof rec.error === "string" && rec.error.trim()) {
+    if (typeof rec.error === "string" && rec.error.trim()) {
+      consecutiveErrors += 1;
+      const message = rec.error.trim();
+      const attemptMatch = RETRY_ATTEMPT_RE.exec(message);
+      const parsedAttempt = attemptMatch ? Number.parseInt(attemptMatch[1], 10) : undefined;
+      const attempt = Math.max(
+        Number.isFinite(parsedAttempt) ? (parsedAttempt as number) : 0,
+        consecutiveErrors,
+      );
       const stepIndex =
         typeof rec.step_index === "number" && Number.isFinite(rec.step_index) ? rec.step_index : i;
-      latest = { stepIndex, message: rec.error.trim() };
+      latest = { stepIndex, attempt, message };
     }
   }
   return latest;
