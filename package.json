@@ -1,0 +1,61 @@
+{
+  "name": "@sdrzlyz/pi-antigravity",
+  "version": "0.1.0",
+  "description": "Standalone pure-ACP Antigravity provider extension for Pi using `agy acp`",
+  "license": "MIT",
+  "author": "elvizlai <sdrzlyz@gmail.com>",
+  "keywords": [
+    "pi",
+    "pi-package",
+    "pi-extension",
+    "antigravity",
+    "acp"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/elvizlai/pi-antigravity.git"
+  },
+  "homepage": "https://github.com/elvizlai/pi-antigravity#readme",
+  "bugs": {
+    "url": "https://github.com/elvizlai/pi-antigravity/issues"
+  },
+  "type": "module",
+  "main": "./index.ts",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "check": "biome check . && tsc --noEmit",
+    "test": "node --experimental-strip-types --test test/*.test.ts"
+  },
+  "dependencies": {
+    "proper-lockfile": "4.1.2",
+    "semver": "^7.8.5",
+    "typebox": "^1.3.27",
+    "which": "^7.0.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "^1.6.0",
+    "@earendil-works/pi-coding-agent": "^1.6.0",
+    "@earendil-works/pi-tui": "^1.6.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.6.8",
+    "@earendil-works/pi-ai": "1.6.0",
+    "@earendil-works/pi-coding-agent": "1.6.0",
+    "@earendil-works/pi-tui": "1.6.0",
+    "@types/node": "^22.0.0",
+    "@types/proper-lockfile": "4.1.4",
+    "@types/semver": "^7.7.1",
+    "@types/which": "^3.0.4",
+    "typescript": "7.0.2"
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  }
+}
