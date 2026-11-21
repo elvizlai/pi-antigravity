@@ -40,24 +40,24 @@ Extension settings are stored independently in `~/.pi/agent/antigravity.json` (n
 
 - **`pi` (default)** — Status: `acp:pi`
   Bridges Pi's active tools (`read`, `bash`, `edit`, `write`, `codemode`, MCP tools) and Pi-private skills (`pi__activate_skill`) into `agy acp` via `--agent pi-tools-<pid>` and a loopback HTTP MCP server.
-- **`native`** — Status: `acp:native`
+- **`agy` / `native`** — Status: `acp:agy`
   Lets `agy` execute its own built-in tools directly.
 
 ## Retries & Timeouts
 
-- **No extension retry loops**: transient failures surface directly to Pi's built-in retry mechanism (`settings.retry`, default `maxRetries: 3`, exponential backoff, cancellable with `Esc`).
-- **First-response stall guard (`15s` default)**: if `agy acp` receives no first ACP `session/update` or bridged tool call within 15 seconds (e.g. silent upstream 429/503 retries inside `agy`), the runtime cancels and disposes the wedged worker and returns a retryable timeout error so Pi cleanly retries on a fresh worker.
+- **Transient RPC/transport errors**: surface directly to Pi's built-in `autoRetry` (`settings.retry`, default `maxRetries: 3`, exponential backoff, cancellable with `Esc`).
+- **First-event watchdog (`60s` default)**: applies **only before the first ACP event** (`session/update` or bridged tool call) and clears immediately once any thinking, text, or tool/subagent activity begins — so subagents and long-running tasks have no time limit. If `agy acp` produces zero initial events for 60 seconds, the runtime sends `session/cancel`, disposes the stalled worker, and stops cleanly without stacking extra 60s retries.
 - **Explicit quota exhaustion**: fails fast with `Antigravity quota exceeded` (`0` retries).
 
 ## Commands & Flags
 
-- `/agy-tools [pi|native|on|off|status]` — Switch or inspect tool routing mode (persists to `~/.pi/agent/antigravity.json`)
+- `/agy-tools [pi|agy|native|on|off|status]` — Switch or inspect tool routing (persists to `~/.pi/agent/antigravity.json`)
 - `/agy-plan [on|off|status]` — Toggle ACP `plan` execution mode vs `agent`
 - `/agy-reset` — Reset the bound ACP conversation and start fresh on the next turn
 - `/agy-doctor` — Verify `agy >= 1.5.0`, bridge server state, ACP connection, and quota status
 - `/agy-models` — Refresh available models from `agy models`
 
-CLI flags: `--agy-tools pi|native`, `--agy-plan`, `--agy-sandbox`, `--agy-add-dir dir1,dir2`.
+CLI flags: `--agy-tools pi|agy`, `--agy-plan`, `--agy-sandbox`, `--agy-add-dir dir1,dir2`.
 
 ## Development
 

@@ -33,14 +33,24 @@ export function resolveAgyToolMode(mode: AgyToolMode | undefined): AgyToolMode {
 }
 
 export function formatAgyToolModeStatus(mode: AgyToolMode): string {
-  return mode === "pi" ? "acp:pi" : "acp:native";
+  return mode === "pi" ? "acp:pi" : "acp:agy";
+}
+
+export function parseAgyToolModeFlag(raw: unknown): AgyToolMode | undefined {
+  if (typeof raw !== "string") return undefined;
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === "pi") return "pi";
+  if (normalized === "agy" || normalized === "native") return "native";
+  return undefined;
 }
 
 export function parseAgyToolModeArg(raw: string | undefined): AgyToolModeCommandAction {
   const normalized = raw?.trim().toLowerCase() ?? "";
   if (!normalized || normalized === "status") return { kind: "status" };
   if (normalized === "pi" || normalized === "on") return { kind: "set", mode: "pi" };
-  if (normalized === "native" || normalized === "off") return { kind: "set", mode: "native" };
+  if (normalized === "agy" || normalized === "native" || normalized === "off") {
+    return { kind: "set", mode: "native" };
+  }
   return { kind: "invalid", raw: raw?.trim() ?? "" };
 }
 

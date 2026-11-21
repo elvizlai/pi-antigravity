@@ -12,6 +12,7 @@ import {
   AgyFirstResponseTimeoutError,
   AgyQuotaError,
   AgyRuntime,
+  DEFAULT_FIRST_RESPONSE_TIMEOUT_MS,
 } from "../src/provider/runtime.ts";
 import { AGY_STATE_ENTRY_TYPE, type AgyConversationState } from "../src/provider/state.ts";
 import { createAntigravityStreamSimple } from "../src/provider/stream.ts";
@@ -233,7 +234,7 @@ test("first-response stall timeout cancels/disposes hung worker and lets Pi auto
     replayStore,
   });
 
-  // Attempt 1 hits 40ms first-response stall timeout -> retryable error for Pi.
+  // Attempt 1 hits 40ms first-event watchdog -> non-stacking error after cancel & dispose.
   const firstStream = streamSimple(
     testModel(),
     makeTranscript([{ role: "user", content: "hello", timestamp: 1 }]),
@@ -241,12 +242,12 @@ test("first-response stall timeout cancels/disposes hung worker and lets Pi auto
   );
   const firstMsg = await firstStream.result();
   assert.equal(firstMsg.stopReason, "error");
-  assert.match(firstMsg.errorMessage ?? "", /timed out/i);
-  assert.equal(isRetryableAssistantError(firstMsg), true);
+  assert.match(firstMsg.errorMessage ?? "", /within .*s — cancelled stalled turn/);
+  assert.equal(isRetryableAssistantError(firstMsg), false);
   assert.equal(cancelCount, 1);
   assert.equal(disposeCount, 1);
 
-  // Attempt 2 (driven by Pi's autoRetry) spawns fresh client and streams longer than 40ms cleanly.
+  // Subsequent turn spawns a fresh client and streams >40ms past first event cleanly.
   const secondStream = streamSimple(
     testModel(),
     makeTranscript([{ role: "user", content: "hello", timestamp: 1 }]),
@@ -259,6 +260,49 @@ test("first-response stall timeout cancels/disposes hung worker and lets Pi auto
   assert.equal(secondMsg.stopReason, "stop");
   assert.equal(spawnCount, 2);
   assert.deepEqual(seenEnvs[0], { TEST_TOKEN: "abc" });
+  await runtime.dispose();
+});
+
+test("fast transient RPC errors remain retryable for Pi built-in autoRetry", async () => {
+  const runtime = new AgyRuntime({
+    cwd: "/work",
+    getToolMode: () => "native",
+    checkBinary: async () => ({ binary: "agy", version: "1.5.13" }),
+    createClient: () => ({
+      isAlive: true,
+      async initialize() {
+        return { protocolVersion: 1 };
+      },
+      async newSession() {
+        return { sessionId: "transient-sess" };
+      },
+      async resumeSession() {
+        return { sessionId: "transient-sess" };
+      },
+      async setConfigOption() {
+        return {};
+      },
+      cancelSession() {},
+      async prompt() {
+        throw new Error("503 Service Unavailable");
+      },
+      async dispose() {},
+    }),
+  });
+
+  const streamSimple = createAntigravityStreamSimple({
+    getRuntime: () => runtime,
+    getSessionId: () => "pi-transient",
+    getBranchEntries: () => [],
+    replayStore: new AgyReplayStore(),
+  });
+
+  const msg = await streamSimple(
+    testModel(),
+    makeTranscript([{ role: "user", content: "hi", timestamp: 1 }]),
+  ).result();
+  assert.equal(msg.stopReason, "error");
+  assert.equal(isRetryableAssistantError(msg), true);
   await runtime.dispose();
 });
 
@@ -328,7 +372,8 @@ test("AgyQuotaError maps to non-retryable Pi error (0 retries) and hooks/env wor
   assert.match(msg.errorMessage ?? "", /quota exceeded/i);
   assert.equal(isRetryableAssistantError(msg), false);
 
-  assert.equal(new AgyFirstResponseTimeoutError(15_000).timeoutMs, 15_000);
+  assert.equal(DEFAULT_FIRST_RESPONSE_TIMEOUT_MS, 60_000);
+  assert.equal(new AgyFirstResponseTimeoutError(60_000).timeoutMs, 60_000);
   assert.match(new AgyQuotaError("Individual quota reached").message, /quota exceeded/i);
   await runtime.dispose();
 });

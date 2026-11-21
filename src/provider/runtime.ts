@@ -36,7 +36,7 @@ import {
 } from "./state.ts";
 import { type AgyReplayStore, AgyTurnController } from "./turn.ts";
 
-export const DEFAULT_FIRST_RESPONSE_TIMEOUT_MS = 15_000;
+export const DEFAULT_FIRST_RESPONSE_TIMEOUT_MS = 60_000;
 
 /**
  * Quota exhaustion error (`"quota exceeded"` matches `@earendil-works/pi-ai`
@@ -62,9 +62,10 @@ export function toAgyQuotaError(raw: unknown, resetsIn?: string): AgyQuotaError 
 }
 
 /**
- * First-response timeout error (`"timed out"` matches `@earendil-works/pi-ai`
- * `RETRYABLE_PROVIDER_ERROR_PATTERN` and omits `"quota exceeded"`, so Pi's built-in
- * `autoRetry` drives transient retries cleanly).
+ * First-event watchdog error: avoids `"timed out"` / `"timeout"` so Pi does not
+ * stack extra 60s retries on top of `agy`'s own internal backoff window. Fast
+ * transient RPC/transport errors (e.g. `503` / `ECONNRESET`) still route to Pi's
+ * native `autoRetry` (`maxRetries: 3`).
  */
 export class AgyFirstResponseTimeoutError extends Error {
   readonly timeoutMs: number;
@@ -72,7 +73,7 @@ export class AgyFirstResponseTimeoutError extends Error {
   constructor(timeoutMs: number) {
     const seconds = Math.max(1, Math.round(timeoutMs / 1000));
     super(
-      `antigravity: request timed out after ${seconds}s waiting for first ACP response from agy`,
+      `antigravity: no initial ACP response from agy within ${seconds}s — cancelled stalled turn`,
     );
     this.name = "AgyFirstResponseTimeoutError";
     this.timeoutMs = timeoutMs;

@@ -18,7 +18,14 @@ import {
   resolveAcpModelCandidate,
   resolveAcpThoughtLevel,
 } from "../src/acp/models.ts";
-import { agySettingsPath, loadAgySettings, saveAgySettings } from "../src/provider/settings.ts";
+import {
+  agySettingsPath,
+  formatAgyToolModeStatus,
+  loadAgySettings,
+  parseAgyToolModeArg,
+  parseAgyToolModeFlag,
+  saveAgySettings,
+} from "../src/provider/settings.ts";
 
 test("parseAgyVersion and checkAgyBinary enforce >= 1.5.0 and cache per binary fingerprint", async () => {
   resetAgyBinaryCache();
@@ -125,6 +132,10 @@ test("extension settings persist atomically to antigravity.json without touching
     assert.deepEqual(loadAgySettings(agentDir), saved);
     assert.equal(fs.existsSync(agySettingsPath(agentDir)), true);
     assert.equal(fs.readFileSync(piSettings, "utf-8"), JSON.stringify({ theme: "dark" }));
+    assert.equal(formatAgyToolModeStatus("pi"), "acp:pi");
+    assert.equal(formatAgyToolModeStatus("native"), "acp:agy");
+    assert.deepEqual(parseAgyToolModeArg("agy"), { kind: "set", mode: "native" });
+    assert.equal(parseAgyToolModeFlag("agy"), "native");
   } finally {
     fs.rmSync(agentDir, { recursive: true, force: true });
   }

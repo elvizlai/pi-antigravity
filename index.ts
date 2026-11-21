@@ -41,10 +41,10 @@ import {
   type AgyExecutionMode,
   type AgyToolMode,
   formatAgyToolModeStatus,
-  isAgyToolMode,
   loadAgySettings,
   parseAgyPlanArg,
   parseAgyToolModeArg,
+  parseAgyToolModeFlag,
   resolveAgyExecutionMode,
   resolveAgyToolMode,
   saveAgySettings,
@@ -85,7 +85,7 @@ function parseExtraDirs(raw: unknown): string[] {
 export default async function antigravityExtension(pi: ExtensionAPI): Promise<void> {
   pi.registerFlag("agy-tools", {
     type: "string",
-    description: "Antigravity tool routing mode (pi | native)",
+    description: "Antigravity tool routing mode (pi | agy | native)",
   });
   pi.registerFlag("agy-plan", {
     type: "boolean",
@@ -104,9 +104,8 @@ export default async function antigravityExtension(pi: ExtensionAPI): Promise<vo
 
   const savedSettings = loadAgySettings();
   const flagToolRaw = pi.getFlag("agy-tools");
-  let toolMode: AgyToolMode = isAgyToolMode(flagToolRaw)
-    ? flagToolRaw
-    : resolveAgyToolMode(savedSettings.toolMode);
+  let toolMode: AgyToolMode =
+    parseAgyToolModeFlag(flagToolRaw) ?? resolveAgyToolMode(savedSettings.toolMode);
   let executionMode: AgyExecutionMode = resolveAgyExecutionMode(Boolean(pi.getFlag("agy-plan")));
   const sandbox = Boolean(pi.getFlag("agy-sandbox"));
   const extraDirs = parseExtraDirs(pi.getFlag("agy-add-dir"));
@@ -330,22 +329,25 @@ export default async function antigravityExtension(pi: ExtensionAPI): Promise<vo
   });
 
   pi.registerCommand("agy-tools", {
-    description: "Switch Antigravity tool routing mode (pi | native | status)",
+    description: "Switch Antigravity tool routing mode (pi | agy | native | status)",
     async handler(args, ctx) {
       const action = parseAgyToolModeArg(args);
       if (action.kind === "status") {
-        notify(ctx, `Antigravity tool mode: ${toolMode} (${formatAgyToolModeStatus(toolMode)})`);
+        notify(ctx, `Antigravity tool mode: ${formatAgyToolModeStatus(toolMode)}`);
         return;
       }
       if (action.kind === "invalid") {
-        notify(ctx, `Invalid tool mode "${action.raw}". Use: pi | native | status`, "warning");
+        notify(ctx, `Invalid tool mode "${action.raw}". Use: pi | agy | status`, "warning");
         return;
       }
       toolMode = action.mode;
       saveAgySettings({ toolMode });
       bridge.refreshTools();
       updateStatus(ctx);
-      notify(ctx, `Antigravity tool mode set to ${toolMode} (saved to antigravity.json)`);
+      notify(
+        ctx,
+        `Antigravity tool mode set to ${formatAgyToolModeStatus(toolMode)} (saved to antigravity.json)`,
+      );
     },
   });
 
