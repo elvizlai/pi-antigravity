@@ -1,6 +1,5 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import { withAgyAutoUpdateDisabled } from "./binary.ts";
 import type { AgyAcpConfigOption } from "./models.ts";
 import {
   killProcessTree,
@@ -17,7 +16,6 @@ export interface AcpInitializeResult {
   protocolVersion?: number;
   agentInfo?: { name?: string; version?: string };
   agentCapabilities?: Record<string, unknown>;
-  _meta?: Record<string, unknown>;
 }
 
 export interface AcpHttpMcpServer {
@@ -32,7 +30,6 @@ export interface AcpSessionResult {
   configOptions?: AgyAcpConfigOption[];
   models?: unknown;
   modes?: unknown;
-  _meta?: Record<string, unknown>;
 }
 
 export interface AcpPromptResult {
@@ -45,7 +42,6 @@ export interface AcpPromptResult {
     cachedWriteTokens?: number;
     thoughtTokens?: number;
   };
-  _meta?: Record<string, unknown>;
 }
 
 export interface AcpPermissionOption {
@@ -185,9 +181,7 @@ export class AgyAcpClient {
     const spawner = options.spawnProcess ?? spawn;
     this.#child = spawner(options.binary, args, {
       cwd: options.cwd,
-      env: withAgyAutoUpdateDisabled(
-        options.env ? { ...process.env, ...options.env } : process.env,
-      ),
+      env: options.env ? { ...process.env, ...options.env } : process.env,
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
     });

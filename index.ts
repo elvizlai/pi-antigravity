@@ -570,12 +570,11 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
 
   const triggerBackgroundWarmup = (ctx: ExtensionContext) => {
     if (!ctx.hasUI || ctx.model?.provider !== PROVIDER_ID) return;
-    const modelId = ctx.model.id;
     void (async () => {
       if (toolMode === "pi") {
         await ensureBridgeStarted();
       }
-      await getRuntime().warmupClient({ modelId });
+      await getRuntime().warmupClient();
     })().catch(() => {});
   };
 

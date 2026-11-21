@@ -18,7 +18,6 @@ import {
   type AgyAcpConfigOption,
   type AgyExecutionMode,
   extractAcpConfigOption,
-  isAgyOrchestratorModel,
   resolveAcpExecutionMode,
   resolveAcpModelCandidate,
   resolveAcpThoughtLevel,
@@ -266,8 +265,7 @@ export class AgyRuntime {
   }
 
   /** Pre-start and initialize `agy acp` + bridge agent without creating an empty ACP conversation. */
-  async warmupClient(params: {
-    modelId: string;
+  async warmupClient(params?: {
     env?: Record<string, string>;
     signal?: AbortSignal;
   }): Promise<void> {
@@ -275,14 +273,14 @@ export class AgyRuntime {
     if (this.#activeWarmup) {
       await this.#activeWarmup.catch(() => {});
     }
-    if (params.signal?.aborted || this.#activeTurn) return;
-    await this.#runWarmup(params.signal, async (signal) => {
+    if (params?.signal?.aborted || this.#activeTurn) return;
+    await this.#runWarmup(params?.signal, async (signal) => {
       if (signal.aborted || this.#activeTurn) return;
       const toolMode = this.#deps.getToolMode?.() ?? "pi";
       this.#deps.bridge?.refreshTools();
-      const { agentName, mcpServers } = await this.#ensurePiToolsAgent(toolMode, params.modelId);
+      const { agentName, mcpServers } = await this.#ensurePiToolsAgent(toolMode);
       if (signal.aborted || this.#activeTurn) return;
-      await this.#ensureClient({ agentName, mcpServers, env: params.env, signal });
+      await this.#ensureClient({ agentName, mcpServers, env: params?.env, signal });
     });
   }
 
@@ -362,7 +360,6 @@ export class AgyRuntime {
 
   async #ensurePiToolsAgent(
     toolMode: AgyToolMode,
-    modelId: string,
   ): Promise<{ agentName?: string; bridgeServerName?: string; mcpServers: AcpHttpMcpServer[] }> {
     const bridge = this.#deps.bridge;
     if (toolMode !== "pi" || !bridge) {
@@ -386,8 +383,7 @@ export class AgyRuntime {
       },
     ];
 
-    const orchestrator = isAgyOrchestratorModel(modelId);
-    const desiredKey = `${bridge.serverName}:${orchestrator}`;
+    const desiredKey = bridge.serverName;
     if (this.#agentHandle && this.#agentKey === desiredKey) {
       return {
         agentName: this.#agentHandle.agentName,
@@ -399,11 +395,7 @@ export class AgyRuntime {
     await this.#removeAgentFile();
     const handle = createPiToolsAgent(
       { serverName: bridge.serverName },
-      {
-        agentsDir: this.#deps.agentsDir,
-        modelId,
-        orchestrator,
-      },
+      { agentsDir: this.#deps.agentsDir },
     );
     await handle.write();
     this.#agentHandle = handle;
@@ -592,10 +584,7 @@ export class AgyRuntime {
   }> {
     const toolMode = this.#deps.getToolMode?.() ?? "pi";
     this.#deps.bridge?.refreshTools();
-    const { agentName, bridgeServerName, mcpServers } = await this.#ensurePiToolsAgent(
-      toolMode,
-      params.modelId,
-    );
+    const { agentName, bridgeServerName, mcpServers } = await this.#ensurePiToolsAgent(toolMode);
     const client = await this.#ensureClient({
       agentName,
       mcpServers,

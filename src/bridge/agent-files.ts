@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
-import { isAgyOrchestratorModel } from "../acp/models.ts";
 import type { PiToolInfo } from "./server.ts";
 
 export const PI_TOOLS_AGENT_DESCRIPTION =
@@ -25,14 +24,6 @@ export function piToolsAgentPrompt(serverName: string): string {
   ].join("\n\n");
 }
 
-/**
- * Built-in phase-handoff tools needed by agy's Orchestrator models so the
- * Planner -> Worker pipeline stays intact. Non-orchestrator models fail executor
- * construction if either is declared, so standard and Orchestrator models use
- * separate static agent definitions.
- */
-export const PI_TOOLS_ORCHESTRATOR_TOOLS = ["enter_plan_mode", "exit_plan_mode"] as const;
-
 export interface PiToolsAgentBridge {
   serverName: string;
 }
@@ -42,10 +33,6 @@ export interface PiToolsAgentOptions {
   agentsDir?: string;
   /** Override the generated agent name (defaults to `pi-tools-<pid>-<uuid>`). */
   agentName?: string;
-  /** Include orchestrator phase-handoff tools (`enter_plan_mode`, `exit_plan_mode`). */
-  orchestrator?: boolean;
-  /** Model ID used to auto-detect whether orchestrator phase-handoff tools are needed. */
-  modelId?: string;
 }
 
 export interface PiToolsAgentHandle {
@@ -56,7 +43,7 @@ export interface PiToolsAgentHandle {
   remove(): Promise<void>;
 }
 
-const PI_TOOLS_AGENT_PATTERN = /^pi-tools-(\d+)-[0-9a-f-]+(?:-orchestrator)?(?:\.md)?$/i;
+const PI_TOOLS_AGENT_PATTERN = /^pi-tools-(\d+)-/i;
 const MCP_ADAPTER_SOURCE = /(?:^|[:/\\])pi-mcp-adapter(?=$|[@/\\.])/;
 
 function defaultIsPidDead(pid: number): boolean {
@@ -72,21 +59,17 @@ function defaultIsPidDead(pid: number): boolean {
 /**
  * Format an `agy --agent` definition (`~/.gemini/config/agents/<name>/agent.md`).
  *
- * Uses strictly documented agent schema fields (`name`, `description`, `mainAgent`,
- * `subagent`, `tools`) to restrict built-in tools while the loopback HTTP MCP server
- * is attached via standard ACP `session/new` and `session/resume`.
+ * Uses strictly documented agent frontmatter fields (`name`, `description`,
+ * `mainAgent`, `subagent`, `tools`) to restrict built-in tools while the loopback
+ * HTTP MCP server is attached via standard ACP `session/new` and `session/resume`.
  */
-function formatPiToolsAgentFile(
-  agentName: string,
-  bridge: PiToolsAgentBridge,
-  orchestrator: boolean,
-): string {
+function formatPiToolsAgentFile(agentName: string, bridge: PiToolsAgentBridge): string {
   const definition = {
     name: agentName,
     description: PI_TOOLS_AGENT_DESCRIPTION,
     mainAgent: true,
     subagent: false,
-    tools: orchestrator ? [...PI_TOOLS_ORCHESTRATOR_TOOLS] : [],
+    tools: [],
   };
 
   return `---\n${JSON.stringify(definition, null, 2)}\n---\n\n${piToolsAgentPrompt(bridge.serverName)}\n`;
@@ -100,11 +83,8 @@ export function createPiToolsAgent(
   bridge: PiToolsAgentBridge,
   options?: PiToolsAgentOptions,
 ): PiToolsAgentHandle {
-  const orchestrator = options?.orchestrator ?? isAgyOrchestratorModel(options?.modelId);
   const agentsDir = options?.agentsDir ?? path.join(homedir(), ".gemini", "config", "agents");
-  const agentName =
-    options?.agentName ??
-    `pi-tools-${process.pid}-${randomUUID()}${orchestrator ? "-orchestrator" : ""}`;
+  const agentName = options?.agentName ?? `pi-tools-${process.pid}-${randomUUID()}`;
   const agentDir = path.join(agentsDir, agentName);
   const agentFile = path.join(agentDir, "agent.md");
 
@@ -114,7 +94,7 @@ export function createPiToolsAgent(
     agentFile,
     async write(): Promise<void> {
       await mkdir(agentDir, { recursive: true, mode: 0o700 });
-      await writeFile(agentFile, formatPiToolsAgentFile(agentName, bridge, orchestrator), {
+      await writeFile(agentFile, formatPiToolsAgentFile(agentName, bridge), {
         mode: 0o600,
       });
     },

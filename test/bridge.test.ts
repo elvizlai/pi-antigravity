@@ -148,28 +148,27 @@ test("pi-tools agent files, adapter guard, and dead agent sweeping stay clean", 
   const agentsDir = path.join(tmpDir, "agents");
 
   try {
-    const stdAgent = createPiToolsAgent(
-      { serverName: "pi-abc" },
-      { agentsDir, modelId: "gemini-4-hydrogen" },
-    );
+    const stdAgent = createPiToolsAgent({ serverName: "pi-abc" }, { agentsDir });
     await stdAgent.write();
     assert.equal(stdAgent.agentFile.endsWith(`${path.sep}agent.md`), true);
     const stdContent = fs.readFileSync(stdAgent.agentFile, "utf-8");
-    assert.match(stdContent, /"mainAgent": true/);
-    assert.match(stdContent, /"subagent": false/);
-    assert.doesNotMatch(stdContent, /"hidden"/);
-    assert.doesNotMatch(stdContent, /"inheritCustomizations"/);
-    assert.doesNotMatch(stdContent, /"mcpServers"/);
-    assert.doesNotMatch(stdContent, /<plan_execute_protocol>/);
-    assert.match(stdContent, /"tools": \[\]/);
+    const match = /^---\n([\s\S]*?)\n---/.exec(stdContent);
+    assert.ok(match);
+    const frontmatter = JSON.parse(match[1]) as Record<string, unknown>;
+    assert.deepEqual(Object.keys(frontmatter).sort(), [
+      "description",
+      "mainAgent",
+      "name",
+      "subagent",
+      "tools",
+    ]);
+    assert.equal(frontmatter.mainAgent, true);
+    assert.equal(frontmatter.subagent, false);
+    assert.deepEqual(frontmatter.tools, []);
     await stdAgent.remove();
 
-    const orchAgent = createPiToolsAgent(
-      { serverName: "pi-abc" },
-      { agentsDir, modelId: "gemini-pro-orchestrator" },
-    );
-    await orchAgent.write();
-    assert.match(fs.readFileSync(orchAgent.agentFile, "utf-8"), /"enter_plan_mode"/);
+    const liveAgent = createPiToolsAgent({ serverName: "pi-abc" }, { agentsDir });
+    await liveAgent.write();
 
     const deadAgent = path.join(agentsDir, "pi-tools-999999-11111111");
     fs.mkdirSync(deadAgent, { recursive: true });
@@ -180,7 +179,8 @@ test("pi-tools agent files, adapter guard, and dead agent sweeping stay clean", 
       isPidDead: (pid) => pid === 999999,
     });
     assert.equal(fs.existsSync(deadAgent), false);
-    assert.equal(fs.existsSync(orchAgent.agentDir), true);
+    assert.equal(fs.existsSync(liveAgent.agentDir), true);
+    await liveAgent.remove();
 
     assert.equal(
       hasUnsupportedMcpAdapter([{ sourceInfo: { source: "npm:pi-mcp-adapter" } }]),

@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { getAgyBinary, withAgyAutoUpdateDisabled } from "./binary.ts";
+import { getAgyBinary } from "./binary.ts";
 import {
   killProcessTree,
   registerProcessGroupDeathHooks,
@@ -8,8 +8,9 @@ import {
 } from "./process-tree.ts";
 
 /**
- * Fetches Antigravity account quotas by expanding `/usage` via public CLI print mode
- * (`agy --print /usage --output-format json --print-timeout <n>s`), reporting 0 LLM tokens.
+ * Neither ACP nor `agy` CLI subcommands expose a dedicated quota endpoint, so `/agy-usage`
+ * invokes public CLI print mode (`agy --print /usage --output-format json --print-timeout <n>s`)
+ * and reads the structured `command.data.groups` JSON envelope written to `stdout` (0 LLM tokens).
  */
 
 export const USAGE_TIMEOUT_MS = 30_000;
@@ -271,7 +272,7 @@ export async function fetchAgyUsage(options: FetchAgyUsageOptions = {}): Promise
     let errOut = "";
 
     const child = doSpawn(binary, buildAgyUsageArgs(timeoutMs), {
-      env: withAgyAutoUpdateDisabled(),
+      env: process.env,
       stdio: ["ignore", "pipe", "pipe"],
       detached: process.platform !== "win32",
       windowsHide: true,

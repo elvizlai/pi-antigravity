@@ -11,21 +11,13 @@ import {
   untrackProcessGroup,
 } from "./process-tree.ts";
 
-/** Minimum `agy` CLI version required for `agy acp` (`--process-per-session`, `_meta`, `session/resume`). */
+/** Minimum `agy` CLI version required for `agy acp` (`--process-per-session`, `session/resume`). */
 export const MIN_AGY_VERSION = "1.5.0";
 
 export const AGY_INSTALL_HINT =
   "Install Antigravity CLI >= 1.5.0 (`npm i -g @google/antigravity` or official installer) and ensure `agy` is on PATH.";
 
 const AGY_PROBE_TIMEOUT_MS = 10_000;
-
-export function withAgyAutoUpdateDisabled(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  return {
-    ...env,
-    // Verified against agy: `"1"` does not suppress auto-update checks; `"true"` does.
-    AGY_CLI_DISABLE_AUTO_UPDATE: "true",
-  };
-}
 
 export function isRegularFileSync(filePath: string): boolean {
   try {
@@ -106,7 +98,6 @@ function defaultVersionRunner(binary: string, signal?: AbortSignal): Promise<str
     const child = spawn(binary, ["--version"], {
       stdio: ["ignore", "pipe", "pipe"],
       detached: process.platform !== "win32",
-      env: withAgyAutoUpdateDisabled(),
     });
     registerProcessGroupDeathHooks();
     trackProcessGroup(child.pid);

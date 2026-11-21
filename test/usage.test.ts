@@ -200,16 +200,12 @@ test("formatAgyUsageShort selects model group and paints warning/error pace", ()
   assert.equal(paced, "<error>5m:5%</error> · <warning>5d:38%</warning>");
 });
 
-test("fetchAgyUsage sets AGY_CLI_DISABLE_AUTO_UPDATE=true, surfaces errors, and honors AbortSignal", async () => {
-  let capturedEnv: NodeJS.ProcessEnv | undefined;
+test("fetchAgyUsage invokes public print /usage flags, surfaces errors, and honors AbortSignal", async () => {
+  let capturedArgs: readonly string[] | undefined;
   const report = await fetchAgyUsage({
     binary: "agy-test",
-    spawnOverride: ((
-      _file: string,
-      _args: readonly string[],
-      options: { env?: NodeJS.ProcessEnv },
-    ) => {
-      capturedEnv = options.env;
+    spawnOverride: ((_file: string, args: readonly string[]) => {
+      capturedArgs = args;
       const child = new EventEmitter() as EventEmitter & {
         stdout: PassThrough;
         stderr: PassThrough;
@@ -223,7 +219,14 @@ test("fetchAgyUsage sets AGY_CLI_DISABLE_AUTO_UPDATE=true, surfaces errors, and 
       return child;
     }) as never,
   });
-  assert.equal(capturedEnv?.AGY_CLI_DISABLE_AUTO_UPDATE, "true");
+  assert.deepEqual(capturedArgs, [
+    "--print",
+    "/usage",
+    "--output-format",
+    "json",
+    "--print-timeout",
+    "30s",
+  ]);
   assert.equal(report.groups.length, 2);
 
   await assert.rejects(

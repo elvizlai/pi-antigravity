@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import type { Model } from "@earendil-works/pi-ai";
-import { getAgyBinary, withAgyAutoUpdateDisabled } from "./binary.ts";
+import { getAgyBinary } from "./binary.ts";
 import {
   killProcessTree,
   registerProcessGroupDeathHooks,
@@ -147,10 +147,6 @@ function specToPiModel(spec: AgyModelSpec): Model<string> {
   };
 }
 
-export function isAgyOrchestratorModel(modelId: string | undefined): boolean {
-  return typeof modelId === "string" && modelId.startsWith("gemini-pro-orchestrator");
-}
-
 /** Return built-in fallback models derived from live `agy 1.5.13` ACP capabilities. */
 export function getFallbackModels(): Model<string>[] {
   return DEFAULT_FALLBACK_SPECS.map(specToPiModel);
@@ -293,7 +289,7 @@ export async function probeAgyModels(options?: {
     const child = spawn(binary, ["models"], {
       stdio: ["ignore", "pipe", "pipe"],
       detached: process.platform !== "win32",
-      env: withAgyAutoUpdateDisabled(),
+      env: process.env,
     });
     registerProcessGroupDeathHooks();
     trackProcessGroup(child.pid);

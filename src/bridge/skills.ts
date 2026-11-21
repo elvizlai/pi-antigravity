@@ -1,20 +1,11 @@
 /**
- * Skill passing for agy — Phase 2 of the pi-tool & skill bridge.
+ * Skill bridge for Pi-private skills (`~/.pi/agent` and `<cwd>/.pi`).
  *
- * agy's native skill expansion is disabled by our always-on
- * `--disable-slash-commands`, so pi-private skills reach agy through one
- * `activate_skill` MCP tool (session-prefixed) whose JSON-schema enum is the
- * catalog and whose description carries each skill's one-liner — pi's
- * progressive disclosure, so agy can tell when a skill applies. Calling it
- * returns the full SKILL.md. Nothing is appended to the user prompt:
- * tools/list is refreshed on every agy spawn, including after pi compaction.
- *
- * When the bridge is off or fails to register, the catalog is NOT injected
- * into the prompt — shared/agy-native skills still reach agy on their own,
- * and the user is warned once that pi-private skills are unavailable.
- *
- * Catalogs stay name + one-liner only — oversized catalogs derail headless
- * turns the same way agy's built-in antigravity_guide skill does.
+ * Antigravity discovers shared `.agents/skills` directories natively, whereas
+ * Pi-private skills live under Pi's own config roots. When the MCP bridge is
+ * active, those Pi-private skills are exposed through a single `activate_skill`
+ * MCP tool (`pi__activate_skill`) using progressive disclosure (skill name enum
+ * + one-line description in `tools/list`, full `SKILL.md` + resource paths on call).
  */
 
 import { readdir, readFile } from "node:fs/promises";
