@@ -6,7 +6,7 @@ Communicates over Antigravity CLI's public stdio JSON-RPC Agent Client Protocol 
 
 ## Architecture
 
-- `src/acp/` — Process-group cleanup, binary verification (`agy >= 1.5.0`), ACP JSON-RPC 2.0 client transport, protocol event normalization, model discovery & config planning, and quota error classification.
+- `src/acp/` — Process-group cleanup, binary verification (`agy >= 1.5.0`), ACP JSON-RPC 2.0 client transport, protocol event normalization, model discovery & config planning, `/usage` quota fetching/formatting, and quota error classification.
 - `src/bridge/` — Localhost HTTP MCP server bridging Pi active tools & Pi-private skills (`pi__activate_skill`), plus `--agent` / workspace MCP lifecycle helpers.
 - `src/provider/` — Extension settings (`~/.pi/agent/antigravity.json`), session-branch persistence, transcript prompt/system extraction (`getCurrentSystemMessage`), wave turn controller + replay store, runtime & first-response stall timeout, Pi `streamSimple` adapter, and TUI card rendering.
 - `index.ts` — Thin Pi extension entrypoint registering provider `"antigravity"` (with `refreshModels` & `streamSimple`), flags, display-only `antigravity` wrapper tool (`terminate: true`), commands, and session hooks.
@@ -38,9 +38,9 @@ Or install from a local checkout:
 
 Extension settings are stored independently in `~/.pi/agent/antigravity.json` (never modifying Pi's `settings.json`):
 
-- **`pi` (default)** — Status: `acp:pi`
+- **`pi` (default)** — Status: `acp:pi · 25m:88% · 7d:96%`
   Bridges Pi's active tools (`read`, `bash`, `edit`, `write`, `codemode`, MCP tools) and Pi-private skills (`pi__activate_skill`) into `agy acp` via `--agent pi-tools-<pid>` and a loopback HTTP MCP server.
-- **`agy`** — Status: `acp:agy`
+- **`agy`** — Status: `acp:agy · 25m:88% · 7d:96%`
   Lets `agy` execute its own built-in tools directly.
 
 ## Retries & Timeouts
@@ -56,6 +56,7 @@ Extension settings are stored independently in `~/.pi/agent/antigravity.json` (n
 - `/agy-reset` — Reset the bound ACP conversation and start fresh on the next turn
 - `/agy-doctor` — Verify `agy >= 1.5.0`, bridge server state, ACP connection, and quota status
 - `/agy-models` — Refresh available models from `agy models`
+- `/agy-usage` — Show Antigravity 5-hour and weekly model quotas (progress bars & reset times)
 
 CLI flags: `--agy-tools pi|agy`, `--agy-plan`, `--agy-sandbox`, `--agy-add-dir dir1,dir2`.
 

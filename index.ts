@@ -9,7 +9,6 @@ import type {
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { checkAgyBinary } from "./src/acp/binary.ts";
-import type { AgyContextUsage } from "./src/acp/events.ts";
 import {
   getFallbackModels,
   mergeModelLists,
@@ -17,6 +16,7 @@ import {
   modelsFromCachedEntries,
   probeAgyModels,
 } from "./src/acp/models.ts";
+import { type AgyUsageReport, fetchAgyUsage, formatAgyUsageShort } from "./src/acp/usage.ts";
 import {
   createBridgeLifecycleManager,
   createPrivateMcpConfig,
@@ -39,6 +39,7 @@ import {
 import {
   formatAgyCall,
   formatAgyDoctorReport,
+  openAgyUsagePicker,
   summarizeAgyResult,
   wrapperToolActiveAfterModelSwitch,
 } from "./src/provider/render.ts";
@@ -123,11 +124,16 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   bridge.requireToken(bridgeToken);
   bridge.setToolSource(() => selectBridgedTools(pi.getAllTools(), pi.getActiveTools(), toolMode));
 
+  const USAGE_SUMMARY_TTL_MS = 5 * 60_000;
+  const USAGE_ERROR_BACKOFF_MS = 60_000;
+
   const replayStore = new AgyReplayStore();
   let activeCtx: ExtensionContext | undefined;
   let pendingState: AgyConversationState | undefined;
   let runtime: AgyRuntime | undefined;
-  let lastUsage: AgyContextUsage | undefined;
+  let usageReport: AgyUsageReport | undefined;
+  let usageFetchInFlight = false;
+  let nextUsageFetchAt = 0;
   let privateSkills: SkillLite[] = [];
 
   const notify = (
@@ -156,7 +162,27 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       ctx.ui.setStatus(PROVIDER_ID, undefined);
       return;
     }
-    ctx.ui.setStatus(PROVIDER_ID, formatAgyFooterStatus(toolMode, executionMode, lastUsage));
+    const quotaSummary = usageReport
+      ? formatAgyUsageShort(usageReport, ctx.model.id, new Date(), (level, text) =>
+          ctx.ui.theme.fg(level, text),
+        )
+      : "";
+    ctx.ui.setStatus(PROVIDER_ID, formatAgyFooterStatus(toolMode, executionMode, quotaSummary));
+  };
+
+  const refreshUsageSummary = async (ctx: ExtensionContext | undefined, force = false) => {
+    if (!ctx?.hasUI || ctx.model?.provider !== PROVIDER_ID) return;
+    if (usageFetchInFlight || (!force && Date.now() < nextUsageFetchAt)) return;
+    usageFetchInFlight = true;
+    try {
+      usageReport = await fetchAgyUsage();
+      nextUsageFetchAt = Date.now() + USAGE_SUMMARY_TTL_MS;
+    } catch {
+      nextUsageFetchAt = Date.now() + USAGE_ERROR_BACKOFF_MS;
+    } finally {
+      usageFetchInFlight = false;
+    }
+    updateStatus(activeCtx ?? ctx);
   };
 
   const syncWrapperTool = (ctx: ExtensionContext) => {
@@ -210,10 +236,6 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         bridgeLifecycle.ensureRegistered((msg) => notify(activeCtx, msg, "warning")),
       onPersistedState: (state) => {
         pendingState = state;
-      },
-      onContextUsage: (usage) => {
-        lastUsage = usage;
-        updateStatus(activeCtx);
       },
       onWarning: (msg) => notify(activeCtx, msg, "warning"),
     });
@@ -403,7 +425,6 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     async handler(_args, ctx) {
       await runtime?.resetConversation();
       pendingState = undefined;
-      lastUsage = undefined;
       pi.appendEntry(AGY_STATE_ENTRY_TYPE, {
         version: 1,
         kind: "reset",
@@ -464,10 +485,26 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     },
   });
 
+  pi.registerCommand("agy-usage", {
+    description: "Show Antigravity model quotas (5-hour and weekly limits)",
+    async handler(args, ctx) {
+      if (args.trim()) {
+        notify(ctx, "Usage: /agy-usage", "warning");
+        return;
+      }
+      await openAgyUsagePicker(ctx, async (signal) => {
+        const report = await fetchAgyUsage({ signal });
+        usageReport = report;
+        nextUsageFetchAt = Date.now() + USAGE_SUMMARY_TTL_MS;
+        updateStatus(ctx);
+        return report;
+      });
+    },
+  });
+
   pi.on("session_start", async (_event, ctx) => {
     activeCtx = ctx;
     pendingState = undefined;
-    lastUsage = undefined;
     void sweepDeadBridgeArtifacts();
     if (runtime) {
       await runtime.dispose();
@@ -477,18 +514,23 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     syncSkills(ctx);
     bridge.refreshTools();
     updateStatus(ctx);
+    if (ctx.model?.provider === PROVIDER_ID) {
+      void refreshUsageSummary(ctx);
+    }
   });
 
   pi.on("model_select", (_event, ctx) => {
     activeCtx = ctx;
     syncWrapperTool(ctx);
     updateStatus(ctx);
+    if (ctx.model?.provider === PROVIDER_ID) {
+      void refreshUsageSummary(ctx);
+    }
   });
 
   pi.on("session_tree", async (_event, ctx) => {
     activeCtx = ctx;
     pendingState = undefined;
-    lastUsage = undefined;
     if (runtime) {
       await runtime.dispose();
       runtime = undefined;
@@ -523,6 +565,9 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       pendingState = undefined;
     }
     replayStore.clear();
+    if (activeCtx?.model?.provider === PROVIDER_ID) {
+      void refreshUsageSummary(activeCtx, Boolean(runtime?.lastQuotaError));
+    }
   });
 
   pi.on("session_shutdown", async () => {

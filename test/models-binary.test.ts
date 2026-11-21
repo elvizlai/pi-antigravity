@@ -153,8 +153,8 @@ test("extension settings persist atomically to antigravity.json without touching
     assert.equal(formatAgyFooterStatus("pi"), "acp:pi");
     assert.equal(formatAgyFooterStatus("native"), "acp:agy");
     assert.equal(
-      formatAgyFooterStatus("pi", "plan", { usedTokens: 120, sizeTokens: 1000 }),
-      "acp:pi plan 12%",
+      formatAgyFooterStatus("pi", "plan", "25m:88% · 7d:96%"),
+      "acp:pi plan · 25m:88% · 7d:96%",
     );
     assert.deepEqual(parseAgyToolModeArg("agy"), { kind: "set", mode: "native" });
     assert.equal(parseAgyToolModeFlag("agy"), "native");

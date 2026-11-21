@@ -46,15 +46,12 @@ export function formatAgyToolModeStatus(mode: AgyToolMode): string {
 export function formatAgyFooterStatus(
   mode: AgyToolMode,
   executionMode: AgyExecutionMode = "agent",
-  usage?: { usedTokens: number; sizeTokens: number },
+  quotaSummary?: string,
 ): string {
   const modeLabel = formatAgyToolModeStatus(mode);
   const planLabel = executionMode === "plan" ? " plan" : "";
-  const usageLabel =
-    usage && usage.sizeTokens > 0
-      ? ` ${Math.round((usage.usedTokens / usage.sizeTokens) * 100)}%`
-      : "";
-  return `${modeLabel}${planLabel}${usageLabel}`;
+  const quotaLabel = quotaSummary ? ` · ${quotaSummary}` : "";
+  return `${modeLabel}${planLabel}${quotaLabel}`;
 }
 
 export function parseAgyToolModeFlag(raw: unknown): AgyToolMode | undefined {

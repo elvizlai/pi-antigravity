@@ -8,7 +8,12 @@
  */
 
 import os from "node:os";
-import type { Theme } from "@earendil-works/pi-coding-agent";
+import {
+  BorderedLoader,
+  type ExtensionCommandContext,
+  type Theme,
+} from "@earendil-works/pi-coding-agent";
+import { type AgyUsageReport, formatAgyUsageReport } from "../acp/usage.ts";
 
 /** agy tool name → native-equivalent label shown on the card. */
 const LABELS: Record<string, string> = {
@@ -263,4 +268,102 @@ export function formatAgyDoctorReport(input: {
     lines.push(`- Quota warning: ${input.quotaError}`);
   }
   return lines.join("\n");
+}
+
+const USAGE_REFRESH_ACTION = "Refresh";
+const USAGE_CLOSE_ACTION = "Close";
+
+type UsageLoaderResult = { ok: true; value: AgyUsageReport } | { ok: false; error: unknown } | null;
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+async function loadQuotaWithOverlay(
+  ctx: ExtensionCommandContext,
+  label: string,
+  parentSignal: AbortSignal,
+  fetchReport: (signal?: AbortSignal) => Promise<AgyUsageReport>,
+): Promise<AgyUsageReport | undefined> {
+  if (ctx.mode !== "tui") return fetchReport(parentSignal);
+  const result = await ctx.ui.custom<UsageLoaderResult>((tui, theme, _keybindings, done) => {
+    const loader = new BorderedLoader(tui, theme, label, { cancellable: true });
+    let finished = false;
+    const finish = (value: UsageLoaderResult) => {
+      if (finished) return;
+      finished = true;
+      done(value);
+    };
+    loader.onAbort = () => finish(null);
+    const signal = AbortSignal.any([parentSignal, loader.signal]);
+    void fetchReport(signal)
+      .then((value) => finish({ ok: true, value }))
+      .catch((error) => {
+        if (isAbortError(error)) finish(null);
+        else finish({ ok: false, error });
+      });
+    return loader;
+  });
+  if (!result) return undefined;
+  if (!result.ok) throw result.error;
+  return result.value;
+}
+
+/** Open the `/agy-usage` quota picker with a cancellable loader and Refresh / Close actions. */
+export async function openAgyUsagePicker(
+  ctx: ExtensionCommandContext,
+  fetchReport: (signal?: AbortSignal) => Promise<AgyUsageReport>,
+): Promise<void> {
+  if (!ctx.hasUI) {
+    try {
+      ctx.ui.notify(formatAgyUsageReport(await fetchReport()), "info");
+    } catch (error) {
+      ctx.ui.notify(
+        `agy-usage: ${error instanceof Error ? error.message : String(error)}`,
+        "error",
+      );
+    }
+    return;
+  }
+
+  const controller = new AbortController();
+  try {
+    let report = await loadQuotaWithOverlay(
+      ctx,
+      "Checking agy quota…",
+      controller.signal,
+      fetchReport,
+    );
+    if (!report) return;
+    while (!controller.signal.aborted) {
+      const action = await ctx.ui.select(
+        formatAgyUsageReport(report),
+        [USAGE_REFRESH_ACTION, USAGE_CLOSE_ACTION],
+        { signal: controller.signal },
+      );
+      if (!action || action === USAGE_CLOSE_ACTION) return;
+      if (action === USAGE_REFRESH_ACTION) {
+        try {
+          const refreshed = await loadQuotaWithOverlay(
+            ctx,
+            "Refreshing usage…",
+            controller.signal,
+            fetchReport,
+          );
+          if (refreshed) report = refreshed;
+        } catch (error) {
+          if (isAbortError(error)) return;
+          ctx.ui.notify(
+            `agy-usage: ${error instanceof Error ? error.message : String(error)}`,
+            "error",
+          );
+        }
+      }
+    }
+  } catch (error) {
+    if (isAbortError(error)) return;
+    ctx.ui.notify(`agy-usage: ${error instanceof Error ? error.message : String(error)}`, "error");
+  } finally {
+    controller.abort();
+  }
 }
