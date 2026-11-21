@@ -111,12 +111,25 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   });
 
   const savedSettings = loadAgySettings();
-  const flagToolRaw = pi.getFlag("agy-tools");
-  let toolMode: AgyToolMode =
-    parseAgyToolModeFlag(flagToolRaw) ?? resolveAgyToolMode(savedSettings.toolMode);
-  let executionMode: AgyExecutionMode = resolveAgyExecutionMode(Boolean(pi.getFlag("agy-plan")));
-  const sandbox = Boolean(pi.getFlag("agy-sandbox"));
-  const extraDirs = parseExtraDirs(pi.getFlag("agy-add-dir"));
+  let toolMode: AgyToolMode = resolveAgyToolMode(savedSettings.toolMode);
+  let executionMode: AgyExecutionMode = "default";
+  let sandbox = false;
+  let extraDirs: string[] = [];
+  let cliFlagsApplied = false;
+
+  const applyCliFlagsOnce = () => {
+    if (cliFlagsApplied) return;
+    cliFlagsApplied = true;
+    const flagToolMode = parseAgyToolModeFlag(pi.getFlag("agy-tools"));
+    if (flagToolMode) {
+      toolMode = flagToolMode;
+    }
+    if (pi.getFlag("agy-plan") === true) {
+      executionMode = "plan";
+    }
+    sandbox = Boolean(pi.getFlag("agy-sandbox"));
+    extraDirs = parseExtraDirs(pi.getFlag("agy-add-dir"));
+  };
 
   const bridgeToken = randomUUID();
   const bridgeServerName = `pi-${randomUUID().replaceAll("-", "").slice(0, 12)}`;
@@ -261,6 +274,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     });
 
   const getRuntime = (): AgyRuntime => {
+    applyCliFlagsOnce();
     const cwd = activeCtx?.cwd ?? process.cwd();
     if (!runtime) {
       runtime = createRuntimeForCwd(cwd);
@@ -392,6 +406,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       return items.length > 0 ? items : null;
     },
     async handler(args, ctx) {
+      applyCliFlagsOnce();
       const action = parseAgyToolModeArg(args);
       if (action.kind === "status") {
         notify(ctx, `Antigravity tool mode: ${formatAgyToolModeStatus(toolMode)}`);
@@ -426,6 +441,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       return items.length > 0 ? items : null;
     },
     async handler(args, ctx) {
+      applyCliFlagsOnce();
       const action = parseAgyPlanArg(args);
       if (action.kind === "status") {
         executionMode = executionMode === "plan" ? "default" : "plan";
@@ -459,6 +475,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   pi.registerCommand("agy-doctor", {
     description: "Verify agy CLI version, ACP transport, bridge state, and quota status",
     async handler(_args, ctx) {
+      applyCliFlagsOnce();
       let binary: string | undefined;
       let version: string | undefined;
       let binaryError: string | undefined;
@@ -534,6 +551,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   };
 
   pi.on("session_start", async (_event, ctx) => {
+    applyCliFlagsOnce();
     activeCtx = ctx;
     pendingState = undefined;
     void sweepDeadPiToolsAgents();
@@ -576,6 +594,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
+    applyCliFlagsOnce();
     activeCtx = ctx;
     if (ctx.model?.provider !== PROVIDER_ID) {
       pendingState = undefined;

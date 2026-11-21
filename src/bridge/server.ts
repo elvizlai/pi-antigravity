@@ -28,8 +28,6 @@ export const BRIDGE_SERVER_NAME = "pi-bridge";
 export const BRIDGE_TOOL_PREFIX = "pi__";
 /** Safety ceiling for one bridged Pi tool call; HTTP disconnect and agent_settled end dead calls immediately. */
 export const BRIDGE_CALL_TIMEOUT_MS = 1_800_000;
-/** MCP client call timeout in agy's mcpServers config (-1 disables agy's 3m0s per-call timeout so Bridge owns lifecycle/timeouts). */
-export const BRIDGE_MCP_TIMEOUT_SECONDS = -1;
 
 export interface BridgeToolDef {
   /** Real pi tool name (without the `pi__` prefix). */
@@ -560,29 +558,4 @@ export class AgyPiBridge {
       if (signal?.aborted) onDisconnect();
     });
   }
-}
-
-/** Extract bridge-awaiting tool results from a pi context and resolve them. */
-export function resolveBridgeResultsFromContext(
-  bridge: AgyPiBridge,
-  messages: readonly unknown[],
-): number {
-  let resolved = 0;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const message = messages[i] as {
-      role?: string;
-      toolCallId?: string;
-      isError?: boolean;
-      content?: Array<TextContent | ImageContent>;
-    };
-    if (message?.role !== "toolResult" || !message.toolCallId) continue;
-    bridge.acknowledgeDisconnected(message.toolCallId);
-    if (!bridge.isAwaiting(message.toolCallId)) continue;
-    bridge.resolveCall(message.toolCallId, {
-      content: message.content ?? [],
-      isError: message.isError === true,
-    });
-    resolved += 1;
-  }
-  return resolved;
 }

@@ -149,19 +149,19 @@ test("pi-tools agent files, adapter guard, and dead agent sweeping stay clean", 
 
   try {
     const stdAgent = createPiToolsAgent(
-      { serverName: "pi-abc", url: "http://127.0.0.1:9999/mcp", token: "tok" },
+      { serverName: "pi-abc" },
       { agentsDir, modelId: "gemini-4-hydrogen" },
     );
     await stdAgent.write();
     assert.equal(stdAgent.agentFile.endsWith(`${path.sep}agent.md`), true);
     const stdContent = fs.readFileSync(stdAgent.agentFile, "utf-8");
     assert.match(stdContent, /"inheritCustomizations": false/);
-    assert.match(stdContent, /"serverUrl": "http:\/\/127\.0\.0\.1:9999\/mcp"/);
+    assert.doesNotMatch(stdContent, /"mcpServers"/);
     assert.match(stdContent, /"tools": \[\]/);
     await stdAgent.remove();
 
     const orchAgent = createPiToolsAgent(
-      { serverName: "pi-abc", url: "http://127.0.0.1:9999/mcp", token: "tok" },
+      { serverName: "pi-abc" },
       { agentsDir, modelId: "gemini-pro-orchestrator" },
     );
     await orchAgent.write();

@@ -3,7 +3,7 @@ import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { isAgyOrchestratorModel } from "../acp/models.ts";
-import { BRIDGE_MCP_TIMEOUT_SECONDS, type PiToolInfo } from "./server.ts";
+import type { PiToolInfo } from "./server.ts";
 
 export const PI_TOOLS_AGENT_DESCRIPTION =
   "Complete Pi requests using the current Pi session tools through its MCP bridge.";
@@ -35,8 +35,6 @@ export const PI_TOOLS_ORCHESTRATOR_TOOLS = ["enter_plan_mode", "exit_plan_mode"]
 
 export interface PiToolsAgentBridge {
   serverName: string;
-  url: string;
-  token: string;
 }
 
 export interface PiToolsAgentOptions {
@@ -74,9 +72,9 @@ function defaultIsPidDead(pid: number): boolean {
 /**
  * Format an `agy --agent` definition (`~/.gemini/config/agents/<name>/agent.md`).
  *
- * Uses documented agent schema fields (`name`, `description`, `mainAgent`, `subagent`,
- * `tools`, `mcpServers`) plus minimal CLI scoping flags (`hidden`,
- * `inheritCustomizations: false`) safely ignored if absent in newer CLI versions.
+ * Scopes `agy` built-in tools and customizations (`inheritCustomizations: false`,
+ * `tools: []` or orchestrator handoff tools) while the loopback HTTP MCP server
+ * is attached via ACP `session/new` and `session/resume`.
  */
 function formatPiToolsAgentFile(
   agentName: string,
@@ -91,14 +89,6 @@ function formatPiToolsAgentFile(
     subagent: false,
     inheritCustomizations: false,
     tools: orchestrator ? [...PI_TOOLS_ORCHESTRATOR_TOOLS] : [],
-    mcpServers: [
-      {
-        name: bridge.serverName,
-        serverUrl: bridge.url,
-        headers: { "x-pi-bridge-token": bridge.token },
-        timeoutSeconds: BRIDGE_MCP_TIMEOUT_SECONDS,
-      },
-    ],
   };
 
   return `---\n${JSON.stringify(definition, null, 2)}\n---\n\n${piToolsAgentPrompt(bridge.serverName)}\n`;
@@ -106,7 +96,7 @@ function formatPiToolsAgentFile(
 
 /**
  * Create a static agy agent markdown definition (`~/.gemini/config/agents/<name>/agent.md`)
- * that wires only this Pi process's HTTP MCP bridge.
+ * that scopes `agy` built-in tools and points prompts at this Pi process's ACP MCP bridge.
  */
 export function createPiToolsAgent(
   bridge: PiToolsAgentBridge,

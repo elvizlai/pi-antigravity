@@ -20,6 +20,13 @@ export interface AcpInitializeResult {
   _meta?: Record<string, unknown>;
 }
 
+export interface AcpHttpMcpServer {
+  type: "http";
+  name: string;
+  url: string;
+  headers: Array<{ name: string; value: string }>;
+}
+
 export interface AcpSessionResult {
   sessionId: string;
   configOptions?: AgyAcpConfigOption[];
@@ -399,7 +406,10 @@ export class AgyAcpClient {
     });
   }
 
-  async newSession(options: { cwd: string; mcpServers?: unknown[] }): Promise<AcpSessionResult> {
+  async newSession(options: {
+    cwd: string;
+    mcpServers?: readonly AcpHttpMcpServer[];
+  }): Promise<AcpSessionResult> {
     return this.#request<AcpSessionResult>("session/new", {
       cwd: options.cwd,
       mcpServers: options.mcpServers ?? [],
@@ -409,7 +419,7 @@ export class AgyAcpClient {
   async resumeSession(options: {
     sessionId: string;
     cwd: string;
-    mcpServers?: unknown[];
+    mcpServers?: readonly AcpHttpMcpServer[];
   }): Promise<AcpSessionResult> {
     const params: Record<string, unknown> = {
       sessionId: options.sessionId,

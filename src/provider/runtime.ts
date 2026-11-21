@@ -2,6 +2,7 @@ import type { TranscriptContext } from "@earendil-works/pi-ai";
 import { checkAgyBinary } from "../acp/binary.ts";
 import {
   type AcpContentBlock,
+  type AcpHttpMcpServer,
   type AcpInitializeResult,
   type AcpSessionResult,
   AgyAcpClient,
@@ -77,11 +78,14 @@ export class AgyFirstResponseTimeoutError extends Error {
 export interface AgyAcpClientLike {
   readonly isAlive: boolean;
   initialize(): Promise<AcpInitializeResult>;
-  newSession(options: { cwd: string; mcpServers?: unknown[] }): Promise<AcpSessionResult>;
+  newSession(options: {
+    cwd: string;
+    mcpServers?: readonly AcpHttpMcpServer[];
+  }): Promise<AcpSessionResult>;
   resumeSession(options: {
     sessionId: string;
     cwd: string;
-    mcpServers?: unknown[];
+    mcpServers?: readonly AcpHttpMcpServer[];
   }): Promise<AcpSessionResult>;
   setConfigOption(
     sessionId: string,
@@ -273,9 +277,9 @@ export class AgyRuntime {
       if (signal.aborted || this.#activeTurn) return;
       const toolMode = this.#deps.getToolMode?.() ?? "pi";
       this.#deps.bridge?.refreshTools();
-      const { agentName } = await this.#ensurePiToolsAgent(toolMode, params.modelId);
+      const { agentName, mcpServers } = await this.#ensurePiToolsAgent(toolMode, params.modelId);
       if (signal.aborted || this.#activeTurn) return;
-      await this.#ensureClient({ agentName, env: params.env, signal });
+      await this.#ensureClient({ agentName, mcpServers, env: params.env, signal });
     });
   }
 
@@ -355,33 +359,42 @@ export class AgyRuntime {
   async #ensurePiToolsAgent(
     toolMode: AgyToolMode,
     modelId: string,
-  ): Promise<{ agentName?: string; bridgeServerName?: string }> {
+  ): Promise<{ agentName?: string; bridgeServerName?: string; mcpServers: AcpHttpMcpServer[] }> {
     const bridge = this.#deps.bridge;
     if (toolMode !== "pi" || !bridge) {
       await this.#removeAgentFile();
-      return {};
+      return { mcpServers: [] };
     }
 
     const ready = this.#deps.ensureBridge ? await this.#deps.ensureBridge() : bridge.running;
     if (!ready || !bridge.url) {
       await this.#removeAgentFile();
-      return {};
+      return { mcpServers: [] };
     }
 
+    const token = this.#deps.bridgeToken ?? "";
+    const mcpServers: AcpHttpMcpServer[] = [
+      {
+        type: "http",
+        name: bridge.serverName,
+        url: bridge.url,
+        headers: token ? [{ name: "x-pi-bridge-token", value: token }] : [],
+      },
+    ];
+
     const orchestrator = isAgyOrchestratorModel(modelId);
-    const desiredKey = `${bridge.serverName}:${bridge.url}:${orchestrator}`;
+    const desiredKey = `${bridge.serverName}:${orchestrator}`;
     if (this.#agentHandle && this.#agentKey === desiredKey) {
-      return { agentName: this.#agentHandle.agentName, bridgeServerName: bridge.serverName };
+      return {
+        agentName: this.#agentHandle.agentName,
+        bridgeServerName: bridge.serverName,
+        mcpServers,
+      };
     }
 
     await this.#removeAgentFile();
-    const token = this.#deps.bridgeToken ?? "";
     const handle = createPiToolsAgent(
-      {
-        serverName: bridge.serverName,
-        url: bridge.url,
-        token,
-      },
+      { serverName: bridge.serverName },
       {
         agentsDir: this.#deps.agentsDir,
         modelId,
@@ -391,11 +404,16 @@ export class AgyRuntime {
     await handle.write();
     this.#agentHandle = handle;
     this.#agentKey = desiredKey;
-    return { agentName: handle.agentName, bridgeServerName: bridge.serverName };
+    return {
+      agentName: handle.agentName,
+      bridgeServerName: bridge.serverName,
+      mcpServers,
+    };
   }
 
   async #ensureClient(params: {
     agentName?: string;
+    mcpServers?: readonly AcpHttpMcpServer[];
     env?: Record<string, string>;
     signal?: AbortSignal;
   }): Promise<AgyAcpClientLike> {
@@ -405,6 +423,7 @@ export class AgyRuntime {
 
     const fingerprint = JSON.stringify({
       agentName: params.agentName ?? "",
+      bridgeUrl: params.mcpServers?.[0]?.url ?? "",
       bridgeCatalogRevision: params.agentName ? (this.#deps.bridge?.catalogRevision ?? 0) : 0,
       sandbox: Boolean(this.#deps.sandbox),
       extraDirs: this.#deps.extraDirs ?? [],
@@ -449,6 +468,7 @@ export class AgyRuntime {
     params: {
       piSessionId: string;
       branchEntries: readonly SessionEntryLike[];
+      mcpServers: readonly AcpHttpMcpServer[];
     },
   ): Promise<{ sessionId: string; configOptions?: AgyAcpConfigOption[] }> {
     if (
@@ -483,6 +503,7 @@ export class AgyRuntime {
         const resumed = await client.resumeSession({
           sessionId: candidateId,
           cwd: this.#deps.cwd,
+          mcpServers: params.mcpServers,
         });
         this.#conversationId = resumed.sessionId;
         this.#piSessionId = params.piSessionId;
@@ -498,6 +519,7 @@ export class AgyRuntime {
 
     const created = await client.newSession({
       cwd: this.#deps.cwd,
+      mcpServers: params.mcpServers,
     });
     this.#conversationId = created.sessionId;
     this.#piSessionId = params.piSessionId;
@@ -566,18 +588,20 @@ export class AgyRuntime {
   }> {
     const toolMode = this.#deps.getToolMode?.() ?? "pi";
     this.#deps.bridge?.refreshTools();
-    const { agentName, bridgeServerName } = await this.#ensurePiToolsAgent(
+    const { agentName, bridgeServerName, mcpServers } = await this.#ensurePiToolsAgent(
       toolMode,
       params.modelId,
     );
     const client = await this.#ensureClient({
       agentName,
+      mcpServers,
       env: params.env,
       signal: params.signal,
     });
     const session = await this.#openOrResumeSession(client, {
       piSessionId: params.sessionId,
       branchEntries: params.branchEntries,
+      mcpServers,
     });
     await this.#syncSessionConfig(
       client,

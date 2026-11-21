@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import {
   type Api,
@@ -6,6 +9,8 @@ import {
   type Model,
   type TranscriptContext,
 } from "@earendil-works/pi-ai";
+import antigravityExtension from "../index.ts";
+import type { AcpHttpMcpServer } from "../src/acp/client.ts";
 import { AgyPiBridge } from "../src/bridge/server.ts";
 import {
   type AgyAcpClientLike,
@@ -40,6 +45,7 @@ function makeTranscript(messages: unknown[]): TranscriptContext {
 
 test("AgyRuntime reuses session, falls back from missing resume to newSession, and orders mode -> model -> thought_level", async () => {
   const calls: string[] = [];
+  const seenMcpServers: Array<{ method: string; mcpServers: readonly AcpHttpMcpServer[] }> = [];
   let resumeAttempts = 0;
   let currentMode = "default";
   let desiredExecutionMode: "default" | "plan" = "plan";
@@ -76,16 +82,18 @@ test("AgyRuntime reuses session, falls back from missing resume to newSession, a
       calls.push("initialize");
       return { protocolVersion: 1 };
     },
-    async newSession() {
+    async newSession(opts) {
       calls.push("newSession");
+      seenMcpServers.push({ method: "newSession", mcpServers: opts.mcpServers ?? [] });
       return {
         sessionId: "acp-fresh",
         configOptions: snapshotConfig(),
       };
     },
-    async resumeSession() {
+    async resumeSession(opts) {
       resumeAttempts += 1;
       calls.push("resumeSession");
+      seenMcpServers.push({ method: "resumeSession", mcpServers: opts.mcpServers ?? [] });
       throw new Error("missing session");
     },
     async setConfigOption(_sid, configId, value) {
@@ -152,6 +160,10 @@ test("AgyRuntime reuses session, falls back from missing resume to newSession, a
   for await (const ev of s1) events1.push(ev);
   assertDeltasMatchPartial(events1);
   assert.equal(resumeAttempts, 1);
+  assert.deepEqual(seenMcpServers, [
+    { method: "resumeSession", mcpServers: [] },
+    { method: "newSession", mcpServers: [] },
+  ]);
   assert.deepEqual(calls, [
     "initialize",
     "resumeSession",
@@ -404,14 +416,18 @@ test("AgyQuotaError maps to non-retryable Pi error (0 retries) and hooks/env wor
 });
 
 test("bridged MCP tool call suspends wave and resumes seamlessly when Pi toolResult returns", async () => {
+  const agentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-rt-agents-"));
   const bridge = new AgyPiBridge("pi-wave");
   bridge.setToolSource(() => [{ name: "read", description: "read", parameters: {} }]);
   bridge.refreshTools();
   await bridge.start();
+  let seenNewMcp: readonly AcpHttpMcpServer[] | undefined;
 
   const runtime = new AgyRuntime({
     cwd: "/work",
+    agentsDir,
     bridge,
+    bridgeToken: "tok-test",
     getToolMode: () => "pi",
     ensureBridge: async () => true,
     checkBinary: async () => ({ binary: "agy", version: "1.5.13" }),
@@ -420,7 +436,8 @@ test("bridged MCP tool call suspends wave and resumes seamlessly when Pi toolRes
       async initialize() {
         return { protocolVersion: 1 };
       },
-      async newSession() {
+      async newSession(opts) {
+        seenNewMcp = opts.mcpServers;
         return { sessionId: "bridge-sess" };
       },
       async resumeSession() {
@@ -495,9 +512,18 @@ test("bridged MCP tool call suspends wave and resumes seamlessly when Pi toolRes
     const msg2 = await wave2.result();
     assert.equal(msg2.stopReason, "stop");
     assert.equal(msg2.content[0]?.type === "text" ? msg2.content[0].text : "", "read:contents");
+    assert.deepEqual(seenNewMcp, [
+      {
+        type: "http",
+        name: "pi-wave",
+        url: bridge.url,
+        headers: [{ name: "x-pi-bridge-token", value: "tok-test" }],
+      },
+    ]);
   } finally {
     await runtime.dispose();
     await bridge.close();
+    fs.rmSync(agentsDir, { recursive: true, force: true });
   }
 });
 
@@ -573,8 +599,13 @@ test("native wrapper tool replay store preserves output and daemon parked errors
 });
 
 test("warmupSession completes setup before streamSimple and reloads client when bridge catalog changes", async () => {
+  const agentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-warmup-agents-"));
   let spawnCount = 0;
   const calls: string[] = [];
+  const sessionMcpCalls: Array<{
+    method: "newSession" | "resumeSession";
+    mcpServers: readonly AcpHttpMcpServer[];
+  }> = [];
   const bridge = new AgyPiBridge("pi-warmup-test");
   bridge.setToolSource(() => [{ name: "read", description: "read file", parameters: {} }]);
   bridge.refreshTools();
@@ -584,20 +615,23 @@ test("warmupSession completes setup before streamSimple and reloads client when 
     let aliveClient: { isAlive: boolean } | undefined;
     const runtime = new AgyRuntime({
       cwd: "/work",
+      agentsDir,
       bridge,
+      bridgeToken: "tok-warmup",
       getToolMode: () => "pi",
       checkBinary: async () => ({ binary: "agy", version: "1.5.13" }),
       createClient: () => {
         spawnCount += 1;
         const clientId = spawnCount;
-        const client = {
+        const client: AgyAcpClientLike & { isAlive: boolean } = {
           isAlive: true,
           async initialize() {
             calls.push(`init:${clientId}`);
             return { protocolVersion: 1 };
           },
-          async newSession() {
+          async newSession(opts) {
             calls.push(`new:${clientId}`);
+            sessionMcpCalls.push({ method: "newSession", mcpServers: opts.mcpServers ?? [] });
             return {
               sessionId: `sess-${clientId}`,
               configOptions: [
@@ -620,8 +654,13 @@ test("warmupSession completes setup before streamSimple and reloads client when 
               ],
             };
           },
-          async resumeSession({ sessionId }: { sessionId: string }) {
+          async resumeSession(opts) {
+            const { sessionId } = opts;
             calls.push(`resume:${clientId}:${sessionId}`);
+            sessionMcpCalls.push({
+              method: "resumeSession",
+              mcpServers: opts.mcpServers ?? [],
+            });
             return {
               sessionId,
               configOptions: [
@@ -727,8 +766,110 @@ test("warmupSession completes setup before streamSimple and reloads client when 
     assert.ok(calls.includes("init:2"));
     assert.ok(calls.includes("prompt:2"));
     assert.equal(aliveClient?.isAlive, true);
+    assert.deepEqual(sessionMcpCalls, [
+      {
+        method: "newSession",
+        mcpServers: [
+          {
+            type: "http",
+            name: "pi-warmup-test",
+            url: bridge.url!,
+            headers: [{ name: "x-pi-bridge-token", value: "tok-warmup" }],
+          },
+        ],
+      },
+      {
+        method: "resumeSession",
+        mcpServers: [
+          {
+            type: "http",
+            name: "pi-warmup-test",
+            url: bridge.url!,
+            headers: [{ name: "x-pi-bridge-token", value: "tok-warmup" }],
+          },
+        ],
+      },
+    ]);
     await runtime.dispose();
   } finally {
     await bridge.close();
+    fs.rmSync(agentsDir, { recursive: true, force: true });
+  }
+});
+
+test("antigravityExtension defers CLI flag reads until after Pi populates flag values", async () => {
+  const flagValues = new Map<string, unknown>();
+  const handlers = new Map<
+    string,
+    Array<(event: unknown, ctx: unknown) => Promise<unknown> | unknown>
+  >();
+  const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+
+  const mockPi = {
+    registerFlag() {},
+    getFlag(name: string) {
+      return flagValues.get(name);
+    },
+    getAllTools: () => [],
+    getActiveTools: () => [],
+    setActiveTools() {},
+    getCommands: () => [],
+    registerProvider() {},
+    registerTool() {},
+    registerEntryRenderer() {},
+    registerCommand(name: string, def: { handler: (args: string, ctx: unknown) => Promise<void> }) {
+      commands.set(name, def);
+    },
+    on(event: string, handler: (event: unknown, ctx: unknown) => Promise<unknown> | unknown) {
+      const list = handlers.get(event) ?? [];
+      list.push(handler);
+      handlers.set(event, list);
+    },
+    appendEntry() {},
+  };
+
+  antigravityExtension(mockPi as unknown as Parameters<typeof antigravityExtension>[0]);
+
+  // Pi populates CLI flag values after extension factory execution.
+  flagValues.set("agy-tools", "agy");
+  flagValues.set("agy-plan", true);
+
+  const statuses: Array<string | undefined> = [];
+  const notifications: string[] = [];
+  const mockCtx = {
+    hasUI: true,
+    cwd: "/work",
+    model: { provider: "antigravity", id: "gemini-4-hydrogen" },
+    sessionManager: { getSessionId: () => "pi-flag-test", getBranch: () => [] },
+    ui: {
+      theme: { fg: (_level: string, text: string) => text },
+      setStatus: (_id: string, text: string | undefined) => statuses.push(text),
+      notify: (msg: string) => notifications.push(msg),
+    },
+  };
+
+  try {
+    for (const handler of handlers.get("session_start") ?? []) {
+      await handler({}, { ...mockCtx, hasUI: false, model: { provider: "other", id: "m" } });
+    }
+    await commands.get("agy-doctor")?.handler("", mockCtx);
+    const doctorReport = notifications[0] ?? "";
+    assert.match(doctorReport, /- Tool mode: native/);
+    assert.match(doctorReport, /- Execution mode: plan/);
+
+    const statusHandler = commands.get("agy-tools")?.handler;
+    notifications.length = 0;
+    await statusHandler?.("", mockCtx);
+    assert.match(notifications[0] ?? "", /acp:agy/);
+
+    // Non-antigravity status update is cleared; antigravity renders acp:agy plan.
+    for (const handler of handlers.get("model_select") ?? []) {
+      await handler({}, { ...mockCtx, model: { provider: "other", id: "m" } });
+    }
+    assert.equal(statuses.at(-1), undefined);
+  } finally {
+    for (const handler of handlers.get("session_shutdown") ?? []) {
+      await handler({}, mockCtx);
+    }
   }
 });
