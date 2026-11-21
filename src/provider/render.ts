@@ -13,6 +13,7 @@ import {
   type ExtensionCommandContext,
   type Theme,
 } from "@earendil-works/pi-coding-agent";
+import type { AgyActivity } from "../acp/events.ts";
 import { type AgyUsageReport, formatAgyUsageReport } from "../acp/usage.ts";
 
 /** agy tool name → native-equivalent label shown on the card. */
@@ -20,13 +21,16 @@ const LABELS: Record<string, string> = {
   run_command: "bash",
   view_file: "read",
   read_file: "read",
+  write_file: "write",
   write_to_file: "write",
+  edit_file: "edit",
   replace_file_content: "edit",
   multi_replace_file_content: "edit",
   sed_file: "edit",
   list_dir: "ls",
   find_by_name: "find",
   grep_search: "grep",
+  invoke_subagent: "subagent",
 };
 
 export function agyToolLabel(tool: string): string {
@@ -40,6 +44,13 @@ function pickArg(input: Record<string, unknown>, keys: string[]): string | undef
     if (typeof value === "string" && value.trim()) return value;
   }
   return undefined;
+}
+
+function clipOneLine(value: string | undefined, max = 56): string | undefined {
+  if (!value) return undefined;
+  const collapsed = value.replace(/\s+/g, " ").trim();
+  if (!collapsed) return undefined;
+  return collapsed.length > max ? `${collapsed.slice(0, max - 1)}…` : collapsed;
 }
 
 /** Shorten an absolute path under the home directory to `~/...` like pi's own renderers. */
@@ -122,7 +133,9 @@ export function formatAgyCall(tool: string, input: unknown, theme: Theme): strin
     }
     case "view_file":
     case "read_file":
+    case "write_file":
     case "write_to_file":
+    case "edit_file":
     case "replace_file_content":
     case "multi_replace_file_content":
     case "sed_file":
@@ -158,16 +171,104 @@ export function formatAgyCall(tool: string, input: unknown, theme: Theme): strin
       return `${label} ${prompt === undefined ? invalid : theme.fg("accent", `"${prompt}"`)}`;
     }
     case "invoke_subagent": {
-      const name = pickArg(args, ["name", "Name", "agent", "Agent", "type"]);
-      return `${label} ${name === undefined ? invalid : theme.fg("accent", name)}`;
+      const typeName = pickArg(args, [
+        "TypeName",
+        "typeName",
+        "name",
+        "Name",
+        "agent",
+        "Agent",
+        "type",
+      ]);
+      const role = clipOneLine(pickArg(args, ["Role", "role"]), 40);
+      const model = pickArg(args, ["Model", "model"]);
+      const prompt = clipOneLine(pickArg(args, ["Prompt", "prompt"]), 48);
+      if (!typeName && !role && !prompt) return `${label} ${invalid}`;
+      const parts = [label];
+      if (typeName) parts.push(theme.fg("accent", typeName));
+      if (role) parts.push(theme.fg("accent", `"${role}"`));
+      else if (prompt) parts.push(theme.fg("toolOutput", `"${prompt}"`));
+      if (model && model !== "inherit") parts.push(theme.fg("muted", `(${model})`));
+      return parts.join(" ");
+    }
+    case "define_subagent": {
+      const name = pickArg(args, ["Name", "name"]);
+      const desc = clipOneLine(pickArg(args, ["Description", "description"]), 48);
+      if (!name && !desc) return `${label} ${invalid}`;
+      const parts = [label];
+      if (name) parts.push(theme.fg("accent", name));
+      if (desc) parts.push(theme.fg("toolOutput", `"${desc}"`));
+      return parts.join(" ");
+    }
+    case "manage_subagents": {
+      const action = pickArg(args, ["Action", "action"]);
+      const ids = Array.isArray(args.ConversationIds)
+        ? args.ConversationIds.filter((v): v is string => typeof v === "string")
+        : [];
+      if (!action) return `${label} ${invalid}`;
+      const suffix = ids.length > 0 ? theme.fg("muted", ` (${ids.length})`) : "";
+      return `${label} ${theme.fg("accent", action)}${suffix}`;
     }
     case "send_message": {
-      const to = pickArg(args, ["to", "To", "subagent", "Subagent", "target"]);
-      const message = pickArg(args, ["message", "Message", "text", "Text"]);
-      if (to === undefined && message === undefined) return `${label} ${invalid}`;
-      const toText = to === undefined ? "" : theme.fg("accent", to);
-      const msgText = message === undefined ? "" : theme.fg("accent", ` "${message}"`);
-      return `${label} ${toText}${msgText}`;
+      const to = pickArg(args, [
+        "Recipient",
+        "recipient",
+        "to",
+        "To",
+        "subagent",
+        "Subagent",
+        "target",
+      ]);
+      const message = clipOneLine(pickArg(args, ["Message", "message", "text", "Text"]), 56);
+      if (!to && !message) return `${label} ${invalid}`;
+      const parts = [label];
+      if (to) parts.push(theme.fg("accent", to));
+      if (message) parts.push(theme.fg("toolOutput", `"${message}"`));
+      return parts.join(" ");
+    }
+    case "swarm": {
+      const action = pickArg(args, ["action", "Action"]);
+      const name = pickArg(args, ["name", "Name"]);
+      const title = clipOneLine(pickArg(args, ["title", "Title"]), 48);
+      const brief = clipOneLine(pickArg(args, ["brief", "Brief"]), 48);
+      const model = pickArg(args, ["model", "Model"]);
+      const count =
+        typeof args.n === "number" && args.n > 1
+          ? args.n
+          : Array.isArray(args.tasks) && args.tasks.length > 1
+            ? args.tasks.length
+            : undefined;
+      if (!action) return `${label} ${invalid}`;
+      const parts = [label, theme.fg("accent", action)];
+      if (name) parts.push(theme.fg("accent", `${name}${count ? `×${count}` : ""}`));
+      if (action === "title" && title) {
+        parts.push(theme.fg("accent", `"${title}"`));
+      } else if (brief) {
+        parts.push(theme.fg("toolOutput", `"${brief}"`));
+      }
+      if (model) parts.push(theme.fg("muted", `(${model})`));
+      return parts.join(" ");
+    }
+    case "run_workflow": {
+      const desc = clipOneLine(pickArg(args, ["Description", "description"]), 56);
+      const scriptPath = pickArg(args, ["ScriptPath", "scriptPath"]);
+      const summary = desc
+        ? theme.fg("accent", `"${desc}"`)
+        : scriptPath
+          ? theme.fg("accent", shortenPath(scriptPath))
+          : theme.fg("muted", "(inline script)");
+      return `${label} ${summary}`;
+    }
+    case "schedule": {
+      const dur = typeof args.DurationSeconds === "number" ? `${args.DurationSeconds}s` : undefined;
+      const cron = pickArg(args, ["CronExpression", "cronExpression"]);
+      const prompt = clipOneLine(pickArg(args, ["Prompt", "prompt"]), 48);
+      const when = cron ?? dur;
+      if (!when && !prompt) return `${label} ${invalid}`;
+      const parts = [label];
+      if (when) parts.push(theme.fg("accent", when));
+      if (prompt) parts.push(theme.fg("toolOutput", `"${prompt}"`));
+      return parts.join(" ");
     }
     case "manage_task": {
       const action = pickArg(args, ["action", "Action"]);
@@ -268,6 +369,116 @@ export function formatAgyDoctorReport(input: {
     lines.push(`- Quota warning: ${input.quotaError}`);
   }
   return lines.join("\n");
+}
+
+/** Track in-flight native tools and background orchestration state for Pi's working spinner. */
+export class AgyWorkingStatusTracker {
+  #inFlight = new Map<string, { name: string; args: Record<string, unknown> }>();
+  #subagents: string[] = [];
+  #swarmWorkers = new Map<string, string>();
+
+  onActivity(activity: AgyActivity): string | undefined {
+    if (activity.type === "tool_start" || activity.type === "tool_update") {
+      this.#inFlight.set(activity.callId, {
+        name: activity.name,
+        args: asRecord(activity.args),
+      });
+    } else if (activity.type === "tool_done") {
+      this.#inFlight.delete(activity.callId);
+      this.#recordOrchestrationDone(activity.name, asRecord(activity.args));
+    } else if (activity.type === "tool_error") {
+      this.#inFlight.delete(activity.callId);
+    }
+
+    return this.#formatCurrentStatus();
+  }
+
+  #recordOrchestrationDone(name: string, args: Record<string, unknown>): void {
+    if (name === "invoke_subagent") {
+      const label =
+        clipOneLine(pickArg(args, ["Role", "role", "TypeName", "typeName", "name", "Name"]), 32) ??
+        "subagent";
+      this.#subagents.push(label);
+      return;
+    }
+
+    if (name === "manage_subagents") {
+      if (pickArg(args, ["Action", "action"]) === "kill_all") {
+        this.#subagents.length = 0;
+      }
+      return;
+    }
+
+    if (name === "swarm") {
+      const action = pickArg(args, ["action", "Action"]);
+      const workerName = pickArg(args, ["name", "Name"]);
+      if (!workerName) return;
+      if (action === "add") {
+        const count =
+          typeof args.n === "number" && args.n > 1
+            ? args.n
+            : Array.isArray(args.tasks) && args.tasks.length > 1
+              ? args.tasks.length
+              : undefined;
+        this.#swarmWorkers.set(workerName, `${workerName}${count ? `×${count}` : ""}`);
+      } else if (action === "kill") {
+        this.#swarmWorkers.delete(workerName);
+      }
+    }
+  }
+
+  #formatCurrentStatus(): string | undefined {
+    const latest = [...this.#inFlight.values()].at(-1);
+    if (latest) {
+      return this.#formatInFlight(latest.name, latest.args);
+    }
+
+    if (this.#swarmWorkers.size > 0) {
+      const workers = [...this.#swarmWorkers.values()];
+      const list = workers.slice(0, 3).join(", ") + (workers.length > 3 ? ", …" : "");
+      return `Swarm running: ${list}…`;
+    }
+
+    if (this.#subagents.length > 0) {
+      const list = this.#subagents.slice(-2).join(", ");
+      return `Subagent running: ${list}…`;
+    }
+
+    return undefined;
+  }
+
+  #formatInFlight(name: string, args: Record<string, unknown>): string {
+    switch (name) {
+      case "run_workflow": {
+        const desc = clipOneLine(pickArg(args, ["Description", "description"]), 40);
+        return `Running workflow${desc ? `: ${desc}` : ""}…`;
+      }
+      case "run_command": {
+        const cmd = clipOneLine(
+          pickArg(args, ["command", "Command", "cmd", "CommandLine", "commandline"]),
+          40,
+        );
+        return `Running bash${cmd ? `: ${cmd}` : ""}…`;
+      }
+      case "invoke_subagent": {
+        const roleOrType = clipOneLine(
+          pickArg(args, ["Role", "role", "TypeName", "typeName", "name", "Name"]),
+          36,
+        );
+        return `Starting subagent${roleOrType ? `: ${roleOrType}` : ""}…`;
+      }
+      case "swarm": {
+        const action = pickArg(args, ["action", "Action"]);
+        return `Updating swarm${action ? ` (${action})` : ""}…`;
+      }
+      case "search_web": {
+        const query = clipOneLine(pickArg(args, ["query", "Query", "search_query", "q"]), 40);
+        return `Searching web${query ? `: "${query}"` : ""}…`;
+      }
+      default:
+        return `Running ${agyToolLabel(name)}…`;
+    }
+  }
 }
 
 const USAGE_REFRESH_ACTION = "Refresh";

@@ -271,6 +271,9 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         pendingState = state;
       },
       onWarning: (msg) => notify(activeCtx, msg, "warning"),
+      onWorkingStatus: (message) => {
+        if (activeCtx?.hasUI) activeCtx.ui.setWorkingMessage(message);
+      },
     });
 
   const getRuntime = (): AgyRuntime => {
@@ -644,6 +647,9 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("agent_end", () => {
+    if (activeCtx?.hasUI) {
+      activeCtx.ui.setWorkingMessage(undefined);
+    }
     if (pendingState) {
       pi.appendEntry(AGY_STATE_ENTRY_TYPE, pendingState);
       pendingState = undefined;

@@ -28,6 +28,7 @@ import { type AgyQuotaNotice, AgyQuotaTurnTracker, isAgyQuotaError } from "../ac
 import { createPiToolsAgent, type PiToolsAgentHandle } from "../bridge/agent-files.ts";
 import type { AgyPiBridge, BridgeCall } from "../bridge/server.ts";
 import { AGY_PARKED_TURN_ERROR, agyIncompleteToolError, collectTurnToolResults } from "./prompt.ts";
+import { AgyWorkingStatusTracker } from "./render.ts";
 import type { AgyToolMode } from "./settings.ts";
 import {
   type AgyConversationState,
@@ -124,6 +125,7 @@ export interface AgyRuntimeDeps {
   createClient?: (options: AgyAcpClientOptions) => AgyAcpClientLike;
   onPersistedState?: (state: AgyConversationState) => void;
   onWarning?: (message: string) => void;
+  onWorkingStatus?: (message: string | undefined) => void;
 }
 
 export interface StartTurnParams {
@@ -230,6 +232,7 @@ export class AgyRuntime {
     this.#activeTurn = undefined;
     if (active) {
       active.requestAbort();
+      this.#deps.onWorkingStatus?.(undefined);
     }
     await this.#disposeClient();
     await this.#removeAgentFile();
@@ -653,7 +656,15 @@ export class AgyRuntime {
     const activeToolSteps = new Set<string>();
     const daemonToolSteps = new Set<string>();
     const quotaTracker = new AgyQuotaTurnTracker();
+    const workingTracker = new AgyWorkingStatusTracker();
     const promptAbort = new AbortController();
+    let lastWorkingStatus: string | undefined;
+
+    const setWorkingStatus = (next: string | undefined) => {
+      if (next === lastWorkingStatus) return;
+      lastWorkingStatus = next;
+      this.#deps.onWorkingStatus?.(next);
+    };
 
     const baseTimeoutMs = this.#deps.firstResponseTimeoutMs ?? DEFAULT_FIRST_RESPONSE_TIMEOUT_MS;
     const effectiveTimeoutMs =
@@ -695,6 +706,7 @@ export class AgyRuntime {
 
     const cleanupActive = () => {
       clearTimeoutTimer();
+      setWorkingStatus(undefined);
       if (this.#activeTurn === activeTurn) {
         this.#activeTurn = undefined;
       }
@@ -765,12 +777,14 @@ export class AgyRuntime {
 
           if (activity.type === "thinking_delta") {
             quotaTracker.noteThought();
+            setWorkingStatus(workingTracker.onActivity(activity));
             controller.pushActivity(activity);
             return;
           }
 
           if (activity.type === "text_delta") {
             quotaTracker.noteText(activity.text);
+            setWorkingStatus(workingTracker.onActivity(activity));
             controller.pushActivity(activity);
             return;
           }
@@ -782,6 +796,7 @@ export class AgyRuntime {
 
           trackActiveToolStep(activeToolSteps, activity, daemonToolSteps);
           quotaTracker.noteToolActivity();
+          setWorkingStatus(workingTracker.onActivity(activity));
           controller.pushActivity(activity);
         },
       })

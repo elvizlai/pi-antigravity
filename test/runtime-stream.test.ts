@@ -529,9 +529,11 @@ test("bridged MCP tool call suspends wave and resumes seamlessly when Pi toolRes
 
 test("native wrapper tool replay store preserves output and daemon parked errors accurately", async () => {
   const replayStore = new AgyReplayStore();
+  const workingStatuses: Array<string | undefined> = [];
   const runtime = new AgyRuntime({
     cwd: "/work",
     getToolMode: () => "native",
+    onWorkingStatus: (msg) => workingStatuses.push(msg),
     checkBinary: async () => ({ binary: "agy", version: "1.5.13" }),
     createClient: () => ({
       isAlive: true,
@@ -595,6 +597,9 @@ test("native wrapper tool replay store preserves output and daemon parked errors
   assert.equal(calls.length, 2);
   assert.equal(replayStore.take(calls[0].id)?.output, "line1");
   assert.match(replayStore.take(calls[1].id)?.error ?? "", /background task/);
+  assert.equal(workingStatuses[0], "Running read…");
+  assert.ok(workingStatuses.includes("Running bash: sleep 10…"));
+  assert.equal(workingStatuses.at(-1), undefined);
   await runtime.dispose();
 });
 
