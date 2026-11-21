@@ -149,6 +149,21 @@ export function getFallbackModels(): Model<string>[] {
   return DEFAULT_FALLBACK_SPECS.map(specToPiModel);
 }
 
+/** Hydrate lightweight `{ id, name }` cached model entries into Pi `Model` records synchronously. */
+export function modelsFromCachedEntries(
+  entries: ReadonlyArray<{ id: string; name?: string }>,
+): Model<string>[] {
+  if (entries.length === 0) return [];
+  const byId = new Map<string, Model<string>>();
+  for (const entry of entries) {
+    const id = entry.id.trim();
+    if (!id || byId.has(id)) continue;
+    const name = entry.name?.trim() || id;
+    byId.set(id, specToPiModel(inferModelSpec(id, name)));
+  }
+  return [...byId.values()];
+}
+
 const KNOWN_SPECS = new Map(DEFAULT_FALLBACK_SPECS.map((spec) => [spec.id, spec]));
 const SUFFIX_RE = /-(low|medium|high|xhigh)$/;
 

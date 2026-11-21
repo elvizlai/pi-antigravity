@@ -9,9 +9,16 @@ export type { AgyExecutionMode, AgyToolMode };
 
 export const DEFAULT_AGY_TOOL_MODE: AgyToolMode = "pi";
 
+export interface AgyCachedModelEntry {
+  id: string;
+  name: string;
+}
+
 export interface AgySettings {
   toolMode?: AgyToolMode;
   firstResponseTimeoutMs?: number;
+  cachedModels?: AgyCachedModelEntry[];
+  modelsFetchedAt?: number;
 }
 
 export type AgyToolModeCommandAction =
@@ -88,6 +95,27 @@ function sanitizeSettings(raw: unknown): AgySettings {
     obj.firstResponseTimeoutMs > 0
   ) {
     settings.firstResponseTimeoutMs = Math.floor(obj.firstResponseTimeoutMs);
+  }
+  if (Array.isArray(obj.cachedModels)) {
+    const cached: AgyCachedModelEntry[] = [];
+    for (const entry of obj.cachedModels.slice(0, 100)) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+      const rec = entry as Record<string, unknown>;
+      if (typeof rec.id !== "string" || !rec.id.trim()) continue;
+      const id = rec.id.trim();
+      const name = typeof rec.name === "string" && rec.name.trim() ? rec.name.trim() : id;
+      cached.push({ id, name });
+    }
+    if (cached.length > 0) {
+      settings.cachedModels = cached;
+    }
+  }
+  if (
+    typeof obj.modelsFetchedAt === "number" &&
+    Number.isFinite(obj.modelsFetchedAt) &&
+    obj.modelsFetchedAt > 0
+  ) {
+    settings.modelsFetchedAt = Math.floor(obj.modelsFetchedAt);
   }
   return settings;
 }

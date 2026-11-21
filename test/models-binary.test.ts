@@ -13,6 +13,7 @@ import {
   getFallbackModels,
   mergeModelLists,
   modelCacheIsFresh,
+  modelsFromCachedEntries,
   parseAgyModelsOutput,
   planAgyAcpSecondaryConfigWrites,
   resolveAcpModelCandidate,
@@ -127,9 +128,23 @@ test("extension settings persist atomically to antigravity.json without touching
 
   try {
     assert.deepEqual(loadAgySettings(agentDir), {});
-    const saved = saveAgySettings({ toolMode: "native", firstResponseTimeoutMs: 25_000 }, agentDir);
-    assert.deepEqual(saved, { toolMode: "native", firstResponseTimeoutMs: 25_000 });
+    const saved = saveAgySettings(
+      {
+        toolMode: "native",
+        firstResponseTimeoutMs: 25_000,
+        cachedModels: [{ id: "gemini-4-hydrogen", name: "Gemini 4 Hydrogen" }],
+        modelsFetchedAt: 1_700_000_000_000,
+      },
+      agentDir,
+    );
+    assert.deepEqual(saved, {
+      toolMode: "native",
+      firstResponseTimeoutMs: 25_000,
+      cachedModels: [{ id: "gemini-4-hydrogen", name: "Gemini 4 Hydrogen" }],
+      modelsFetchedAt: 1_700_000_000_000,
+    });
     assert.deepEqual(loadAgySettings(agentDir), saved);
+    assert.equal(modelsFromCachedEntries(saved.cachedModels ?? []).length, 1);
     assert.equal(fs.existsSync(agySettingsPath(agentDir)), true);
     assert.equal(fs.readFileSync(piSettings, "utf-8"), JSON.stringify({ theme: "dark" }));
     assert.equal(formatAgyToolModeStatus("pi"), "acp:pi");

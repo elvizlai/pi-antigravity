@@ -10,7 +10,13 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { checkAgyBinary } from "./src/acp/binary.ts";
 import type { AgyContextUsage } from "./src/acp/events.ts";
-import { getFallbackModels, mergeModelLists, probeAgyModels } from "./src/acp/models.ts";
+import {
+  getFallbackModels,
+  mergeModelLists,
+  modelCacheIsFresh,
+  modelsFromCachedEntries,
+  probeAgyModels,
+} from "./src/acp/models.ts";
 import {
   createBridgeLifecycleManager,
   createPrivateMcpConfig,
@@ -82,7 +88,7 @@ function parseExtraDirs(raw: unknown): string[] {
     .filter(Boolean);
 }
 
-export default async function antigravityExtension(pi: ExtensionAPI): Promise<void> {
+export default function antigravityExtension(pi: ExtensionAPI): void {
   pi.registerFlag("agy-tools", {
     type: "string",
     description: "Antigravity tool routing mode (pi | agy | native)",
@@ -224,15 +230,14 @@ export default async function antigravityExtension(pi: ExtensionAPI): Promise<vo
     return runtime;
   };
 
-  let currentModels = getFallbackModels();
-  try {
-    const probed = await probeAgyModels({ timeoutMs: 2_500 });
-    if (probed.length > 0) {
-      currentModels = mergeModelLists(probed, currentModels);
-    }
-  } catch {
-    // Offline or binary not ready at startup; fallback catalog stays usable.
-  }
+  const cachedModels = savedSettings.cachedModels
+    ? modelsFromCachedEntries(savedSettings.cachedModels)
+    : [];
+  let currentModels =
+    cachedModels.length > 0
+      ? mergeModelLists(cachedModels, getFallbackModels())
+      : getFallbackModels();
+  let modelsFetchedAt = savedSettings.modelsFetchedAt;
 
   pi.registerProvider(PROVIDER_ID, {
     name: "Antigravity (ACP)",
@@ -241,12 +246,22 @@ export default async function antigravityExtension(pi: ExtensionAPI): Promise<vo
     apiKey: "antigravity-acp-local",
     models: toProviderModelConfigs(currentModels),
     refreshModels: async (context) => {
-      if (context.signal.aborted) return toProviderModelConfigs(currentModels);
+      if (context.signal.aborted || (!context.allowNetwork && !context.force)) {
+        return toProviderModelConfigs(currentModels);
+      }
+      if (!context.force && modelCacheIsFresh({ fetchedAt: modelsFetchedAt, source: "live" })) {
+        return toProviderModelConfigs(currentModels);
+      }
       const probed = await probeAgyModels({ signal: context.signal, timeoutMs: 5_000 }).catch(
         () => [],
       );
       if (probed.length > 0) {
         currentModels = mergeModelLists(probed, getFallbackModels());
+        modelsFetchedAt = Date.now();
+        saveAgySettings({
+          cachedModels: currentModels.map((m) => ({ id: m.id, name: m.name })),
+          modelsFetchedAt,
+        });
       }
       return toProviderModelConfigs(currentModels);
     },
