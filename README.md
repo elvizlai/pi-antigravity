@@ -1,14 +1,16 @@
-# @sdrzlyz/pi-antigravity
+# elvizlai/pi-antigravity
 
 Clean 4-layer ACP [Pi](https://github.com/earendil-works/pi) provider extension powered directly by `agy acp` (`agy >= 1.5.0`).
 
-Communicates over Antigravity CLI's public stdio JSON-RPC Agent Client Protocol (`agy acp --dangerously-skip-permissions --process-per-session`) and delegates all retries to Pi's native `autoRetry` loop (`settings.retry`, default 3 attempts).
+Communicates over Antigravity CLI's public stdio JSON-RPC Agent Client Protocol (`agy acp --dangerously-skip-permissions --process-per-session`).
 
 ## Architecture
 
-- `src/acp/` — Process-group cleanup, binary verification (`agy >= 1.5.0`), ACP JSON-RPC 2.0 client transport, protocol event normalization, model discovery & config planning, `/usage` quota fetching/formatting, and quota error classification.
-- `src/bridge/` — Localhost HTTP MCP server bridging Pi active tools & Pi-private skills (`pi__activate_skill`), plus `--agent` lifecycle helpers.
-- `src/provider/` — Extension settings (`~/.pi/agent/antigravity.json`), session-branch persistence, transcript prompt/system extraction (`getCurrentSystemMessage`), wave turn controller + replay store, runtime & first-response stall timeout, Pi `streamSimple` adapter, and TUI card rendering.
+![Architecture](./docs/architecture.png)
+
+- `src/acp/` — Shared type/abort helpers (`shared.ts`), process-group cleanup & detached one-shot CLI runner (`process-tree.ts`), binary verification (`agy >= 1.5.0`), ACP JSON-RPC 2.0 client transport (per-RPC abort/stall timeouts & 3-stage `stdin EOF -> SIGTERM -> SIGKILL` disposal), protocol event normalization, model discovery & config planning, `/usage` quota fetching/formatting, and quota/stop-reason classification.
+- `src/bridge/` — Localhost HTTP MCP server bridging Pi active tools & Pi-private skills (`pi__activate_skill`), `--agent` lifecycle helpers, and automatic `HINDSIGHT_DISABLE_HOOKS=1` propagation when Pi's Hindsight extension is active (preventing duplicate prompt injection and double session write-back).
+- `src/provider/` — Extension settings (`~/.pi/agent/antigravity.json`), session-branch persistence, transcript prompt/system extraction (`getCurrentSystemMessage`), wave turn controller + replay store, runtime & first-response stall watchdog, Pi `streamSimple` adapter, and TUI card rendering.
 - `index.ts` — Thin Pi extension entrypoint registering provider `"antigravity"` (with `refreshModels` & `streamSimple`), flags, display-only `antigravity` wrapper tool, commands, and session hooks.
 
 ## Requirements
@@ -26,28 +28,19 @@ Add the package to `~/.pi/agent/settings.json`, then restart Pi or run `/reload`
 }
 ```
 
-Or install from a local checkout:
-
-```json
-{
-  "packages": ["/Volumes/Data/workspace/elvizlai/pi-antigravity"]
-}
-```
-
 ## Tool Modes & Settings
 
 Extension settings are stored independently in `~/.pi/agent/antigravity.json` (never modifying Pi's `settings.json`):
 
 - **`pi` (default)** — Status: `acp:pi · 25m:88% · 7d:96%`
-  Bridges Pi's active tools (`read`, `bash`, `edit`, `write`, `codemode`, MCP tools) and Pi-private skills (`pi__activate_skill`) into `agy acp` via `--agent pi-tools-<pid>` and a loopback HTTP MCP server.
+  Bridges Pi's active tools (`read`, `bash`, `edit`, `write`, `codemode`, `subagent`, MCP tools) and Pi-private skills (`pi__activate_skill`) into `agy acp` via `--agent pi-tools-<pid>` and a loopback HTTP MCP server.
 - **`agy`** — Status: `acp:agy · 25m:88% · 7d:96%`
-  Lets `agy` execute its own built-in tools directly.
+  Lets `agy` execute its own built-in tools and workflows directly (`/swarm`, `/boost`, `/teamwork`, `/grill-me`, `/learn`, `/plan`, `run_workflow`). Multi-agent background pipelines (`/swarm`, `/boost`, `/teamwork`) require a persistent session (interactive TUI or `pi --mode rpc`) across turns; Pi's built-in `/compact` (and extension commands such as `/goal` if installed) take precedence locally before prompts reach `agy acp`.
 
-## Retries & Timeouts
+## Timeouts & Failure Handling
 
-- **Transient RPC/transport errors**: surface directly to Pi's built-in `autoRetry` (`settings.retry`, default `maxRetries: 3`, exponential backoff, cancellable with `Esc`).
-- **First-event watchdog (`60s` default)**: applies **only before the first ACP event** (`session/update` or bridged tool call) and clears immediately once any thinking, text, or tool/subagent activity begins — so subagents and long-running tasks have no time limit. If `agy acp` produces zero initial events for 60 seconds, the runtime sends `session/cancel`, disposes the stalled worker, and stops cleanly without stacking extra 60s retries.
-- **Explicit quota exhaustion**: fails fast with `Antigravity quota exceeded` (`0` retries).
+- **First-event watchdog (`60s` default)**: covers both handshake/session setup (`initialize`, `newSession` / `resumeSession`, `setConfigOption`) and pre-first-event `session/prompt`, clearing immediately once any thinking, text, or tool/subagent activity begins — so subagents and long-running tasks have no time limit. If `agy acp` stalls for 60 seconds before emitting an initial event, the runtime cancels and disposes the stalled worker cleanly.
+- **Explicit quota & terminal stop reasons**: quota exhaustion (`Antigravity quota exceeded`), `max_turn_requests`, and `refusal` fail fast without retries.
 
 ## Commands & Flags
 
