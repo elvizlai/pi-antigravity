@@ -1861,3 +1861,478 @@ test("host Hindsight detection injects HINDSIGHT_DISABLE_HOOKS=1 into warmed and
     await runtime.dispose();
   }
 });
+
+test("mid-turn steering in acp:pi flushes executed tool results, cancels superseded prompt, and sends steered prompt", async () => {
+  const agentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-steer-pi-"));
+  const bridge = new AgyPiBridge("pi-steer-test");
+  bridge.setToolSource(() => [
+    { name: "bash", description: "run bash", parameters: {} },
+    { name: "edit", description: "edit file", parameters: {} },
+  ]);
+  bridge.refreshTools();
+  await bridge.start();
+
+  const events: string[] = [];
+  const seenPrompts: Array<{ sessionId: string; text: string }> = [];
+  let activePromptCalls = 0;
+  let maxConcurrentPrompts = 0;
+  let bashResult: { isError?: boolean; text?: string } | undefined;
+  let editResult: { isError?: boolean; text?: string } | undefined;
+  let cancelResolve: (() => void) | undefined;
+
+  const persistedStates: AgyConversationState[] = [];
+  const trackedRuntime = new AgyRuntime({
+    cwd: "/work",
+    agentsDir,
+    bridge,
+    bridgeToken: "tok-steer",
+    getToolMode: () => "pi",
+    ensureBridge: async () => true,
+    checkBinary: async () => ({ binary: "agy", version: "1.5.14" }),
+    onPersistedState: (s) => persistedStates.push(s),
+    createClient: () => ({
+      isAlive: true,
+      async initialize() {
+        return { protocolVersion: 1 };
+      },
+      async newSession() {
+        return { sessionId: "steer-sess-1" };
+      },
+      async resumeSession() {
+        return { sessionId: "steer-sess-1" };
+      },
+      async setConfigOption() {
+        return {};
+      },
+      cancelSession() {
+        events.push("cancelSession");
+        cancelResolve?.();
+      },
+      async prompt(sid, blocks, opts) {
+        activePromptCalls += 1;
+        maxConcurrentPrompts = Math.max(maxConcurrentPrompts, activePromptCalls);
+        const text = blocks.map((b) => (b.type === "text" ? b.text : "")).join("\n");
+        seenPrompts.push({ sessionId: sid, text });
+        const callNumber = seenPrompts.length;
+
+        try {
+          if (callNumber === 1) {
+            opts?.signal?.addEventListener(
+              "abort",
+              () => {
+                events.push("cancelSession");
+                cancelResolve?.();
+              },
+              { once: true },
+            );
+            opts?.onUpdate?.({
+              sessionUpdate: "tool_call",
+              toolCallId: "tc-bash-1",
+              name: "pi__bash",
+              title: "pi__bash",
+              status: "in_progress",
+            });
+            const bashPromise = fetch(bridge.url!, {
+              method: "POST",
+              headers: {
+                "content-type": "application/json",
+                "x-pi-bridge-token": "tok-steer",
+              },
+              body: JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                method: "tools/call",
+                params: { name: "pi__bash", arguments: { command: "echo ok" } },
+              }),
+            }).then(async (res) => {
+              const json = (await res.json()) as {
+                result: { isError?: boolean; content: Array<{ text?: string }> };
+              };
+              bashResult = {
+                isError: json.result.isError,
+                text: json.result.content[0]?.text,
+              };
+              events.push("bash_http_resolved");
+              opts?.onUpdate?.({
+                sessionUpdate: "tool_call_update",
+                toolCallId: "tc-bash-1",
+                status: "completed",
+              });
+              events.push("bash_acp_ack");
+            });
+
+            const editPromise = fetch(bridge.url!, {
+              method: "POST",
+              headers: {
+                "content-type": "application/json",
+                "x-pi-bridge-token": "tok-steer",
+              },
+              body: JSON.stringify({
+                jsonrpc: "2.0",
+                id: 2,
+                method: "tools/call",
+                params: { name: "pi__edit", arguments: { path: "a.txt" } },
+              }),
+            }).then(async (res) => {
+              const json = (await res.json()) as {
+                result: { isError?: boolean; content: Array<{ text?: string }> };
+              };
+              editResult = {
+                isError: json.result.isError,
+                text: json.result.content[0]?.text,
+              };
+              events.push("edit_http_resolved");
+            });
+
+            await Promise.all([
+              bashPromise,
+              editPromise,
+              new Promise<void>((resolve) => {
+                cancelResolve = resolve;
+              }),
+            ]);
+            events.push("prompt1_settled");
+            return { stopReason: "cancelled" };
+          }
+
+          events.push("prompt2_started");
+          opts?.onUpdate?.({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "参数优化建议如下" },
+          });
+          return {
+            stopReason: "end_turn",
+            usage: { inputTokens: 50, outputTokens: 20, totalTokens: 70 },
+          };
+        } finally {
+          activePromptCalls -= 1;
+        }
+      },
+      async dispose() {},
+    }),
+  });
+
+  const streamSimple = createAntigravityStreamSimple({
+    getRuntime: () => trackedRuntime,
+    getSessionId: () => "01a2019e-22eb-778f-8fc3-8c477c907c01",
+    getBranchEntries: () => [],
+    replayStore: new AgyReplayStore(),
+  });
+
+  try {
+    const turn1Messages: unknown[] = [
+      {
+        role: "system",
+        content: "",
+        sections: { customNote: "CUSTOM_SYS_NOTE" },
+        timestamp: 0,
+      },
+      { role: "user", content: "取消硬限，改用权重隔离", timestamp: 1 },
+    ];
+    const wave1 = streamSimple(testModel(), makeTranscript(turn1Messages));
+    const msg1 = await wave1.result();
+    assert.equal(msg1.stopReason, "toolUse");
+    const toolCalls = msg1.content.filter((b) => b.type === "toolCall");
+    const bashCall = toolCalls.find((c) => c.name === "bash");
+    assert.ok(bashCall);
+    while (bridge.pendingCount < 2) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+
+    // Only bash was executed before user steered with a new message.
+    const steeredMessages: unknown[] = [
+      ...turn1Messages,
+      msg1,
+      {
+        role: "toolResult",
+        toolCallId: bashCall.id,
+        toolName: "bash",
+        content: [{ type: "text", text: "检查通过" }],
+        isError: false,
+        timestamp: 2,
+      },
+      { role: "user", content: "参数上还有什么值得优化的吗？", timestamp: 3 },
+    ];
+
+    const turn2 = streamSimple(testModel(), makeTranscript(steeredMessages));
+    const msg2 = await turn2.result();
+    assert.equal(msg2.stopReason, "stop");
+    assert.deepEqual(msg2.content, [{ type: "text", text: "参数优化建议如下" }]);
+
+    assert.equal(maxConcurrentPrompts, 1);
+    assert.deepEqual(bashResult, { isError: false, text: "检查通过" });
+    assert.equal(editResult?.isError, true);
+
+    assert.ok(events.indexOf("bash_acp_ack") >= 0);
+    assert.ok(events.indexOf("bash_acp_ack") < events.indexOf("cancelSession"));
+    assert.ok(events.indexOf("prompt1_settled") < events.indexOf("prompt2_started"));
+
+    assert.equal(seenPrompts.length, 2);
+    assert.equal(seenPrompts[0]?.sessionId, "steer-sess-1");
+    assert.match(seenPrompts[0]?.text ?? "", /CUSTOM_SYS_NOTE/);
+    assert.match(seenPrompts[0]?.text ?? "", /取消硬限，改用权重隔离/);
+    assert.equal(seenPrompts[1]?.sessionId, "steer-sess-1");
+    assert.equal(seenPrompts[1]?.text, "参数上还有什么值得优化的吗？");
+    assert.equal(seenPrompts[1]?.text.includes("CUSTOM_SYS_NOTE"), false);
+    assert.equal(persistedStates.length, 2);
+    assert.equal(persistedStates[0]?.turns, 1);
+    assert.equal(persistedStates[1]?.turns, 2);
+  } finally {
+    await trackedRuntime.dispose();
+    await bridge.close();
+    fs.rmSync(agentsDir, { recursive: true, force: true });
+  }
+});
+
+test("mid-turn steering in acp:agy (native) interrupts in-flight and settled waves and sends steered prompt", async () => {
+  for (const mode of ["inflight", "settled"] as const) {
+    let promptCount = 0;
+    let cancelCount = 0;
+    let releasePrompt1: (() => void) | undefined;
+    const seenTexts: string[] = [];
+
+    const runtime = new AgyRuntime({
+      cwd: "/work",
+      getToolMode: () => "native",
+      cancelGraceMs: 100,
+      checkBinary: async () => ({ binary: "agy", version: "1.5.14" }),
+      createClient: () => ({
+        isAlive: true,
+        async initialize() {
+          return { protocolVersion: 1 };
+        },
+        async newSession() {
+          return { sessionId: `native-steer-${mode}` };
+        },
+        async resumeSession() {
+          return { sessionId: `native-steer-${mode}` };
+        },
+        async setConfigOption() {
+          return {};
+        },
+        cancelSession() {
+          cancelCount += 1;
+          releasePrompt1?.();
+        },
+        async prompt(_sid, blocks, opts) {
+          promptCount += 1;
+          const text = blocks.map((b) => (b.type === "text" ? b.text : "")).join("\n");
+          seenTexts.push(text);
+          if (promptCount === 1) {
+            opts?.onUpdate?.({
+              sessionUpdate: "tool_call",
+              toolCallId: "n1",
+              title: "Run check",
+              kind: "execute",
+              status: "in_progress",
+            });
+            opts?.onUpdate?.({
+              sessionUpdate: "tool_call_update",
+              toolCallId: "n1",
+              status: "completed",
+              content: [{ type: "content", content: { type: "text", text: "done" } }],
+            });
+            opts?.onUpdate?.({
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "stale-turn-1-reply" },
+            });
+            if (mode === "inflight") {
+              await new Promise<void>((resolve) => {
+                releasePrompt1 = resolve;
+                opts?.signal?.addEventListener(
+                  "abort",
+                  () => {
+                    cancelCount += 1;
+                    resolve();
+                  },
+                  { once: true },
+                );
+              });
+              return { stopReason: "cancelled" };
+            }
+            return { stopReason: "end_turn" };
+          }
+
+          opts?.onUpdate?.({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "fresh-steered-reply" },
+          });
+          return { stopReason: "end_turn" };
+        },
+        async dispose() {},
+      }),
+    });
+
+    const streamSimple = createAntigravityStreamSimple({
+      getRuntime: () => runtime,
+      getSessionId: () => `pi-native-steer-${mode}`,
+      getBranchEntries: () => [],
+      replayStore: new AgyReplayStore(),
+    });
+
+    try {
+      const m0: unknown[] = [{ role: "user", content: "first", timestamp: 1 }];
+      const wave1 = streamSimple(testModel(), makeTranscript(m0));
+      const msg1 = await wave1.result();
+      assert.equal(msg1.stopReason, "toolUse");
+      const wrapperCall = msg1.content.find((b) => b.type === "toolCall");
+      assert.ok(wrapperCall);
+
+      if (mode === "settled") {
+        // Give prompt #1 a microtask to settle before Wave 2 arrives with a steered user message.
+        await new Promise((r) => setTimeout(r, 10));
+      }
+
+      const steered = [
+        ...m0,
+        msg1,
+        {
+          role: "toolResult",
+          toolCallId: wrapperCall.id,
+          toolName: "antigravity",
+          content: [{ type: "text", text: "done" }],
+          isError: false,
+          timestamp: 2,
+        },
+        { role: "user", content: "参数上还有什么值得优化的吗？", timestamp: 3 },
+      ];
+      const wave2 = streamSimple(testModel(), makeTranscript(steered));
+      const msg2 = await wave2.result();
+      assert.equal(msg2.stopReason, "stop");
+      assert.deepEqual(msg2.content, [{ type: "text", text: "fresh-steered-reply" }]);
+      assert.equal(promptCount, 2);
+      assert.deepEqual(seenTexts, ["first", "参数上还有什么值得优化的吗？"]);
+      assert.equal(cancelCount, mode === "inflight" ? 1 : 0);
+    } finally {
+      await runtime.dispose();
+    }
+  }
+});
+
+test("settleAfterAgentEnd cancels unsettled turn and pending bridge calls, persists state, and unblocks next turn", async () => {
+  const agentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-agent-end-"));
+  const bridge = new AgyPiBridge("pi-agent-end-test");
+  bridge.setToolSource(() => [{ name: "bash", description: "run bash", parameters: {} }]);
+  bridge.refreshTools();
+  await bridge.start();
+
+  let promptCount = 0;
+  let cancelCount = 0;
+  let releasePrompt1: (() => void) | undefined;
+  let pendingCallResult: { isError?: boolean } | undefined;
+  const persisted: AgyConversationState[] = [];
+
+  const runtime = new AgyRuntime({
+    cwd: "/work",
+    agentsDir,
+    bridge,
+    bridgeToken: "tok-end",
+    getToolMode: () => "pi",
+    ensureBridge: async () => true,
+    onPersistedState: (s) => persisted.push(s),
+    checkBinary: async () => ({ binary: "agy", version: "1.5.14" }),
+    createClient: () => ({
+      isAlive: true,
+      async initialize() {
+        return { protocolVersion: 1 };
+      },
+      async newSession() {
+        return { sessionId: "agent-end-sess" };
+      },
+      async resumeSession() {
+        return { sessionId: "agent-end-sess" };
+      },
+      async setConfigOption() {
+        return {};
+      },
+      cancelSession() {
+        cancelCount += 1;
+        releasePrompt1?.();
+      },
+      async prompt(_sid, blocks, opts) {
+        promptCount += 1;
+        if (promptCount === 1) {
+          let aborted = false;
+          opts?.signal?.addEventListener(
+            "abort",
+            () => {
+              aborted = true;
+              cancelCount += 1;
+              releasePrompt1?.();
+            },
+            { once: true },
+          );
+          opts?.onUpdate?.({
+            sessionUpdate: "agent_thought_chunk",
+            content: { type: "text", text: "thinking" },
+          });
+          const callRes = await fetch(bridge.url!, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-pi-bridge-token": "tok-end",
+            },
+            body: JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              method: "tools/call",
+              params: { name: "pi__bash", arguments: { command: "echo blocked" } },
+            }),
+          });
+          const json = (await callRes.json()) as { result: { isError?: boolean } };
+          pendingCallResult = json.result;
+          if (!aborted) {
+            await new Promise<void>((resolve) => {
+              releasePrompt1 = resolve;
+            });
+          }
+          return { stopReason: "cancelled" };
+        }
+        const text = blocks.map((b) => (b.type === "text" ? b.text : "")).join("");
+        opts?.onUpdate?.({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: `reply:${text}` },
+        });
+        return { stopReason: "end_turn" };
+      },
+      async dispose() {},
+    }),
+  });
+
+  const streamSimple = createAntigravityStreamSimple({
+    getRuntime: () => runtime,
+    getSessionId: () => "pi-agent-end",
+    getBranchEntries: () => [],
+    replayStore: new AgyReplayStore(),
+  });
+
+  try {
+    const wave1 = streamSimple(
+      testModel(),
+      makeTranscript([{ role: "user", content: "run blocked", timestamp: 1 }]),
+    );
+    const msg1 = await wave1.result();
+    assert.equal(msg1.stopReason, "toolUse");
+    assert.equal(bridge.pendingCount, 1);
+
+    // Simulate Pi terminating the agent run early (e.g. beforeToolCall terminate: true) -> agent_end fires.
+    await runtime.settleAfterAgentEnd();
+    assert.equal(bridge.pendingCount, 0);
+    assert.equal(pendingCallResult?.isError, true);
+    assert.equal(cancelCount, 1);
+    assert.equal(persisted.length, 1);
+    assert.equal(persisted[0]?.turns, 1);
+
+    const wave2 = streamSimple(
+      testModel(),
+      makeTranscript([{ role: "user", content: "next turn", timestamp: 2 }]),
+    );
+    const msg2 = await wave2.result();
+    assert.equal(msg2.stopReason, "stop");
+    assert.deepEqual(msg2.content, [{ type: "text", text: "reply:next turn" }]);
+  } finally {
+    await runtime.dispose();
+    await bridge.close();
+    fs.rmSync(agentsDir, { recursive: true, force: true });
+  }
+});

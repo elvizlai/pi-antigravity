@@ -94,6 +94,7 @@ type PendingCall = BridgeCall & {
   rpcId?: number | string | null;
   resolve: (result: BridgeCallResult) => void;
   timer: NodeJS.Timeout;
+  responseFlushed: Promise<void>;
 };
 
 /** A dynamically-refreshed virtual tool (one per bridged pi skill). */
@@ -136,6 +137,7 @@ export class AgyPiBridge {
   #port = 0;
   #seq = 0;
   #pending = new Map<string, PendingCall>();
+  #flushing = new Set<Promise<void>>();
   #defaultSessionId: string = randomUUID();
   /** Shared secret agy must send on every request; unset = no auth (tests). */
   #token: string | undefined;
@@ -259,6 +261,13 @@ export class AgyPiBridge {
     });
   }
 
+  #trackFlush(promise: Promise<void>): void {
+    this.#flushing.add(promise);
+    void promise.finally(() => {
+      this.#flushing.delete(promise);
+    });
+  }
+
   /** Fail all pending calls and stop listening. */
   close(): Promise<void> {
     const server = this.#server;
@@ -267,6 +276,7 @@ export class AgyPiBridge {
     this.#port = 0;
     for (const pending of this.#pending.values()) {
       clearTimeout(pending.timer);
+      this.#trackFlush(pending.responseFlushed);
       pending.resolve({
         content: "antigravity: pi session shut down while the tool call was pending.",
         isError: true,
@@ -285,8 +295,26 @@ export class AgyPiBridge {
     if (!pending) return false;
     this.#pending.delete(callId);
     clearTimeout(pending.timer);
+    this.#trackFlush(pending.responseFlushed);
     pending.resolve(result);
     return true;
+  }
+
+  /** Resolve any still-pending bridged tool calls with an error so waiting agy turns unblock. */
+  cancelPendingCalls(reason = "antigravity: turn ended while the tool call was pending."): number {
+    let cancelled = 0;
+    for (const id of [...this.#pending.keys()]) {
+      if (this.resolveCall(id, { content: reason, isError: true })) {
+        cancelled += 1;
+      }
+    }
+    return cancelled;
+  }
+
+  /** Wait until all HTTP responses for resolved/cancelled bridge calls have been flushed. */
+  flushResponses(): Promise<void> {
+    if (this.#flushing.size === 0) return Promise.resolve();
+    return Promise.all([...this.#flushing]).then(() => {});
   }
 
   // --- HTTP / JSON-RPC -----------------------------------------------------
@@ -332,26 +360,38 @@ export class AgyPiBridge {
       const rawHeader = req.headers["mcp-session-id"];
       const headerSession =
         (Array.isArray(rawHeader) ? rawHeader[0] : rawHeader)?.trim() || undefined;
-      void this.#handleRpc(rpc, disconnect.signal, headerSession).then(
+      let markResponseFlushed!: () => void;
+      const responseFlushed = new Promise<void>((resolve) => {
+        markResponseFlushed = resolve;
+      });
+      res.once("close", markResponseFlushed);
+      void this.#handleRpc(rpc, disconnect.signal, headerSession, responseFlushed).then(
         ({ response, sessionId }) => {
-          if (res.writableEnded || res.destroyed) return;
+          if (res.writableEnded || res.destroyed) {
+            markResponseFlushed();
+            return;
+          }
           if (!response) {
             // Notification: no body per the streamable HTTP spec.
             res.writeHead(202);
-            res.end();
+            res.end(markResponseFlushed);
             return;
           }
           res.writeHead(200, {
             "content-type": "application/json",
             "mcp-session-id": sessionId,
           });
-          res.end(JSON.stringify(response));
+          res.end(JSON.stringify(response), markResponseFlushed);
         },
         () => {
-          if (res.writableEnded || res.destroyed) return;
+          if (res.writableEnded || res.destroyed) {
+            markResponseFlushed();
+            return;
+          }
           res.writeHead(500, { "content-type": "application/json" });
           res.end(
             JSON.stringify({ jsonrpc: "2.0", error: { code: -32603, message: "Internal error" } }),
+            markResponseFlushed,
           );
         },
       );
@@ -362,6 +402,7 @@ export class AgyPiBridge {
     rpc: JsonRpcRequest,
     signal?: AbortSignal,
     headerSession?: string,
+    responseFlushed?: Promise<void>,
   ): Promise<{ response?: Record<string, unknown>; sessionId: string }> {
     const base = { jsonrpc: "2.0", id: rpc.id ?? null };
     if (rpc.method === "initialize") {
@@ -388,6 +429,7 @@ export class AgyPiBridge {
             if (pending.mcpSession === sessionId && pending.rpcId === requestId) {
               this.#pending.delete(id);
               clearTimeout(pending.timer);
+              this.#trackFlush(pending.responseFlushed);
               pending.resolve({
                 content: `antigravity: client cancelled pi tool "${pending.tool}" while pending.`,
                 isError: true,
@@ -411,7 +453,14 @@ export class AgyPiBridge {
       case "tools/call": {
         const name = rpc.params?.name ?? "";
         const args = rpc.params?.arguments ?? {};
-        const result = await this.#routeCall(name, args, signal, rpc.id, sessionId);
+        const result = await this.#routeCall(
+          name,
+          args,
+          signal,
+          rpc.id,
+          sessionId,
+          responseFlushed,
+        );
         return {
           sessionId,
           response: {
@@ -448,6 +497,7 @@ export class AgyPiBridge {
     signal?: AbortSignal,
     rpcId?: number | string | null,
     mcpSession = this.#defaultSessionId,
+    responseFlushed?: Promise<void>,
   ): Promise<BridgeCallResult> {
     if (!mcpName.startsWith(BRIDGE_TOOL_PREFIX)) {
       return {
@@ -459,7 +509,7 @@ export class AgyPiBridge {
     const dynamic = this.#dynamic.get(tool);
     if (dynamic) return dynamic.handler(args);
     if (this.#tools.some((def) => def.name === tool)) {
-      return this.#routeToPiTool(tool, args, signal, rpcId, mcpSession);
+      return this.#routeToPiTool(tool, args, signal, rpcId, mcpSession, responseFlushed);
     }
     return { content: `antigravity: tool "${tool}" is not currently active in pi.`, isError: true };
   }
@@ -470,6 +520,7 @@ export class AgyPiBridge {
     signal?: AbortSignal,
     rpcId?: number | string | null,
     mcpSession = this.#defaultSessionId,
+    responseFlushed: Promise<void> = Promise.resolve(),
   ): Promise<BridgeCallResult> {
     if (signal?.aborted) {
       return {
@@ -490,6 +541,7 @@ export class AgyPiBridge {
         if (!current) return;
         this.#pending.delete(id);
         clearTimeout(current.timer);
+        this.#trackFlush(current.responseFlushed);
         resolve({
           content: `antigravity: client disconnected while pi tool "${tool}" was pending.`,
           isError: true,
@@ -501,6 +553,7 @@ export class AgyPiBridge {
         rpcId,
         tool,
         args,
+        responseFlushed,
         resolve: (result) => {
           signal?.removeEventListener("abort", onDisconnect);
           resolve(result);
@@ -508,6 +561,7 @@ export class AgyPiBridge {
         timer: setTimeout(() => {
           this.#pending.delete(id);
           signal?.removeEventListener("abort", onDisconnect);
+          this.#trackFlush(responseFlushed);
           resolve({
             content: `antigravity: pi tool "${tool}" did not return within ${Math.round(this.#callTimeoutMs / 1000)}s.`,
             isError: true,

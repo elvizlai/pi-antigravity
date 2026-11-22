@@ -137,6 +137,30 @@ test("AgyPiBridge enforces token header, exposes tools/list + activate_skill, an
     const callRes = await callPromise;
     const callJson = (await callRes.json()) as { result: { content: Array<{ text: string }> } };
     assert.equal(callJson.result.content[0]?.text, "file body");
+
+    // cancelPendingCalls resolves in-flight HTTP calls with isError: true and flushResponses awaits delivery.
+    seenCalls.length = 0;
+    const cancelledCallPromise = fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-pi-bridge-token": "secret-token" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 5,
+        method: "tools/call",
+        params: { name: "pi__read", arguments: { path: "bar.txt" } },
+      }),
+    });
+    while (seenCalls.length === 0) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    assert.equal(bridge.cancelPendingCalls("interrupted by test"), 1);
+    await bridge.flushResponses();
+    const cancelledRes = await cancelledCallPromise;
+    const cancelledJson = (await cancelledRes.json()) as {
+      result: { isError: boolean; content: Array<{ text: string }> };
+    };
+    assert.equal(cancelledJson.result.isError, true);
+    assert.equal(cancelledJson.result.content[0]?.text, "interrupted by test");
   } finally {
     await bridge.close();
     fs.rmSync(skillDir, { recursive: true, force: true });

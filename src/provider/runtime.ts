@@ -33,7 +33,11 @@ import {
   resolveAgyChildEnv,
 } from "../bridge/agent-files.ts";
 import type { AgyPiBridge, BridgeCall } from "../bridge/server.ts";
-import { BACKGROUND_ACP_TOOL_MESSAGE, collectTurnToolResults } from "./prompt.ts";
+import {
+  BACKGROUND_ACP_TOOL_MESSAGE,
+  collectTurnToolResults,
+  isContinuationAfterToolUse,
+} from "./prompt.ts";
 import { AgyWorkingStatusTracker } from "./render.ts";
 import type { AgyToolMode } from "./settings.ts";
 import {
@@ -44,6 +48,8 @@ import {
 import { type AgyReplayStore, AgyTurnController } from "./turn.ts";
 
 export const DEFAULT_FIRST_RESPONSE_TIMEOUT_MS = 60_000;
+const DEFAULT_CANCEL_GRACE_MS = 5_000;
+const DEFAULT_BRIDGED_TOOL_ACK_TIMEOUT_MS = 250;
 
 /**
  * Quota exhaustion error (`"quota exceeded"` matches `@earendil-works/pi-ai`
@@ -129,6 +135,8 @@ export interface AgyRuntimeDeps {
   binaryPath?: string;
   agentsDir?: string;
   firstResponseTimeoutMs?: number;
+  cancelGraceMs?: number;
+  bridgedToolAckTimeoutMs?: number;
   ensureBridge?: () => Promise<boolean>;
   checkBinary?: (
     binaryPath?: string,
@@ -164,6 +172,7 @@ export interface TurnSessionHandle {
 
 interface ActiveTurn {
   controller: AgyTurnController;
+  client: AgyAcpClientLike;
   sessionId: string;
   modelId: string;
   piSessionId: string;
@@ -173,6 +182,8 @@ interface ActiveTurn {
   isFirstResponseSeen?: () => boolean;
   noteBridgeCall: () => void;
   requestAbort: () => void;
+  done: Promise<void>;
+  waitForBridgedToolsAck: (timeoutMs: number, signal?: AbortSignal) => Promise<void>;
 }
 
 /**
@@ -214,15 +225,6 @@ function isFatalSessionSetupError(
     err instanceof AcpRequestStallError ||
     !client.isAlive
   );
-}
-
-function isContinuationAfterToolUse(messages: TranscriptContext["messages"]): boolean {
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    const role = messages[i]?.role;
-    if (role === "toolResult") return true;
-    if (role === "assistant") return false;
-  }
-  return false;
 }
 
 /**
@@ -817,6 +819,7 @@ export class AgyRuntime {
     cleanupActive: (dropTurn?: boolean) => void;
     dropIfConsumed: () => void;
     setWorkingStatus: (next: string | undefined) => void;
+    notifyAckWaiters: () => void;
   }): Promise<void> {
     const {
       client,
@@ -836,7 +839,24 @@ export class AgyRuntime {
       cleanupActive,
       dropIfConsumed,
       setWorkingStatus,
+      notifyAckWaiters,
     } = ctx;
+
+    let turnRecorded = false;
+    const recordTurnState = (requireFirstResponse: boolean) => {
+      if (turnRecorded) return;
+      if (requireFirstResponse && !ctx.activeTurn.isFirstResponseSeen?.()) return;
+      turnRecorded = true;
+      this.#turns += 1;
+      this.#deps.onPersistedState?.({
+        version: 1,
+        kind: "conversation",
+        sessionId: piSessionId,
+        conversationId: sessionId,
+        cwd: this.#deps.cwd,
+        turns: this.#turns,
+      });
+    };
 
     const flushBackgroundNativeTools = () => {
       for (const [callId, tool] of acpTools.entries()) {
@@ -901,12 +921,14 @@ export class AgyRuntime {
 
           if (isBridgedMcpTool(activity, bridgeServerName)) {
             quotaTracker.noteToolActivity();
+            notifyAckWaiters();
             return;
           }
 
           quotaTracker.noteToolActivity();
           setWorkingStatus(workingTracker.onActivity(activity));
           controller.pushActivity(activity);
+          notifyAckWaiters();
         },
       });
 
@@ -932,6 +954,7 @@ export class AgyRuntime {
       }
 
       if (promptResult.stopReason === "cancelled") {
+        recordTurnState(true);
         controller.finish({ status: "aborted", stopReason: "aborted" });
         dropIfConsumed();
         return;
@@ -947,16 +970,8 @@ export class AgyRuntime {
       // Materialize background native tool steps before settling so Pi renders their non-error state.
       flushBackgroundNativeTools();
 
-      this.#turns += 1;
       this.#lastQuotaError = undefined;
-      this.#deps.onPersistedState?.({
-        version: 1,
-        kind: "conversation",
-        sessionId: piSessionId,
-        conversationId: sessionId,
-        cwd: this.#deps.cwd,
-        turns: this.#turns,
-      });
+      recordTurnState(false);
 
       controller.finish({
         status: "completed",
@@ -970,6 +985,7 @@ export class AgyRuntime {
       cleanupActive(false);
 
       if (promptAbort.signal.aborted || isAbortError(err)) {
+        recordTurnState(true);
         controller.finish({ status: "aborted", stopReason: "aborted" });
         dropIfConsumed();
         return;
@@ -989,18 +1005,126 @@ export class AgyRuntime {
       }
       controller.fail(error);
       dropIfConsumed();
+    } finally {
+      notifyAckWaiters();
     }
+  }
+
+  async #interruptActiveTurn(
+    active: ActiveTurn,
+    options?: {
+      messages?: TranscriptContext["messages"];
+      samePiSession?: boolean;
+      signal?: AbortSignal;
+    },
+  ): Promise<void> {
+    if (this.#activeTurn === active) {
+      this.#activeTurn = undefined;
+    }
+
+    const bridge = this.#deps.bridge;
+    const resolvedCount =
+      options?.samePiSession && options.messages
+        ? this.resolveBridgeResultsFromMessages(options.messages)
+        : 0;
+    const cancelledCount =
+      bridge?.cancelPendingCalls("antigravity: turn interrupted before tool call ran.") ?? 0;
+
+    if ((resolvedCount > 0 || cancelledCount > 0) && bridge) {
+      await bridge.flushResponses();
+    }
+
+    if (resolvedCount > 0 && !active.controller.isSettled) {
+      const ackTimeoutMs =
+        this.#deps.bridgedToolAckTimeoutMs ?? DEFAULT_BRIDGED_TOOL_ACK_TIMEOUT_MS;
+      await active.waitForBridgedToolsAck(ackTimeoutMs, options?.signal);
+    }
+
+    if (!active.controller.isSettled) {
+      active.requestAbort();
+    }
+
+    if (active.controller.isSettled && !active.client.isAlive) {
+      return;
+    }
+
+    const graceMs = this.#deps.cancelGraceMs ?? DEFAULT_CANCEL_GRACE_MS;
+    let graceTimer: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
+    let timedOutOrAborted = false;
+
+    const racePromises: Array<Promise<"done" | "stop">> = [active.done.then(() => "done" as const)];
+    if (graceMs > 0) {
+      racePromises.push(
+        new Promise<"stop">((resolve) => {
+          graceTimer = setTimeout(() => {
+            timedOutOrAborted = true;
+            resolve("stop");
+          }, graceMs);
+          graceTimer.unref?.();
+        }),
+      );
+    }
+    if (options?.signal) {
+      if (options.signal.aborted) {
+        timedOutOrAborted = true;
+      } else {
+        racePromises.push(
+          new Promise<"stop">((resolve) => {
+            onAbort = () => {
+              timedOutOrAborted = true;
+              resolve("stop");
+            };
+            options.signal?.addEventListener("abort", onAbort, { once: true });
+          }),
+        );
+      }
+    }
+
+    try {
+      const outcome = timedOutOrAborted ? "stop" : await Promise.race(racePromises);
+      if (outcome === "stop" || timedOutOrAborted) {
+        await this.#disposeClient(50);
+      }
+    } finally {
+      if (graceTimer) clearTimeout(graceTimer);
+      if (onAbort) options?.signal?.removeEventListener("abort", onAbort);
+    }
+  }
+
+  /**
+   * Settle any active turn and pending bridge calls when Pi's agent loop finishes
+   * (`agent_end`), e.g. when a tool batch terminates early or aborts mid-turn.
+   */
+  async settleAfterAgentEnd(): Promise<void> {
+    const active = this.#activeTurn;
+    if (!active) {
+      const cancelled = this.#deps.bridge?.cancelPendingCalls() ?? 0;
+      if (cancelled > 0) {
+        await this.#deps.bridge?.flushResponses();
+      }
+      return;
+    }
+    if (active.controller.isSettled) {
+      this.#activeTurn = undefined;
+      const cancelled = this.#deps.bridge?.cancelPendingCalls() ?? 0;
+      if (cancelled > 0) {
+        await this.#deps.bridge?.flushResponses();
+      }
+      return;
+    }
+    await this.#interruptActiveTurn(active);
   }
 
   async startOrContinueTurn(params: StartTurnParams): Promise<TurnSessionHandle> {
     const active = this.#activeTurn;
 
-    // 1. Continuation wave: attach to an active or settled-but-unconsumed turn after tool results.
+    // 1. Continuation wave: attach to an active or settled-but-unconsumed turn ONLY when trailing messages are tool results.
     if (active) {
       const canContinue =
         active.piSessionId === params.sessionId &&
         !active.controller.isConsumed &&
-        (!active.controller.isSettled || isContinuationAfterToolUse(params.messages));
+        isContinuationAfterToolUse(params.messages);
       if (canContinue) {
         this.resolveBridgeResultsFromMessages(params.messages);
         return {
@@ -1010,10 +1134,11 @@ export class AgyRuntime {
           signalTurnAbort: () => active.requestAbort(),
         };
       }
-      if (!active.controller.isSettled) {
-        active.requestAbort();
-      }
-      this.#activeTurn = undefined;
+      await this.#interruptActiveTurn(active, {
+        messages: params.messages,
+        samePiSession: active.piSessionId === params.sessionId,
+        signal: params.signal,
+      });
     }
 
     if (params.signal?.aborted) {
@@ -1062,8 +1187,56 @@ export class AgyRuntime {
       clearTimeoutTimer();
     };
 
+    const ackWaiters = new Set<() => void>();
+    const notifyAckWaiters = () => {
+      for (const wake of ackWaiters) {
+        wake();
+      }
+    };
+    const hasInProgressBridgedTools = () => {
+      for (const tool of acpTools.values()) {
+        if (
+          tool.status === "in_progress" &&
+          !tool.finishedEmitted &&
+          isBridgedMcpTool(tool, bridgeServerName)
+        ) {
+          return true;
+        }
+      }
+      return false;
+    };
+    const waitForBridgedToolsAck = (timeoutMs: number, signal?: AbortSignal): Promise<void> => {
+      if (
+        controller.isSettled ||
+        !hasInProgressBridgedTools() ||
+        signal?.aborted ||
+        timeoutMs <= 0
+      ) {
+        return Promise.resolve();
+      }
+      return new Promise<void>((resolve) => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const finish = () => {
+          ackWaiters.delete(onUpdate);
+          if (timer) clearTimeout(timer);
+          signal?.removeEventListener("abort", finish);
+          resolve();
+        };
+        const onUpdate = () => {
+          if (controller.isSettled || !hasInProgressBridgedTools()) {
+            finish();
+          }
+        };
+        ackWaiters.add(onUpdate);
+        timer = setTimeout(finish, timeoutMs);
+        timer.unref?.();
+        signal?.addEventListener("abort", finish, { once: true });
+      });
+    };
+
     const activeTurn: ActiveTurn = {
       controller,
+      client,
       sessionId,
       modelId: params.modelId,
       piSessionId: params.sessionId,
@@ -1076,6 +1249,8 @@ export class AgyRuntime {
         clearTimeoutTimer();
         promptAbort.abort();
       },
+      done: Promise.resolve(),
+      waitForBridgedToolsAck,
     };
     this.#activeTurn = activeTurn;
 
@@ -1136,7 +1311,7 @@ export class AgyRuntime {
     }
 
     // Fire `session/prompt` asynchronously while `streamSimple` consumes `controller.drainWave()`.
-    void this.#drivePromptTurn({
+    activeTurn.done = this.#drivePromptTurn({
       client,
       sessionId,
       piSessionId: params.sessionId,
@@ -1155,6 +1330,7 @@ export class AgyRuntime {
       cleanupActive,
       dropIfConsumed,
       setWorkingStatus,
+      notifyAckWaiters,
     });
 
     return {

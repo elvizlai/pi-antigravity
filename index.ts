@@ -674,15 +674,15 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       });
   });
 
-  pi.on("agent_end", () => {
+  pi.on("agent_end", async () => {
     if (activeCtx?.hasUI) {
       activeCtx.ui.setWorkingMessage(undefined);
     }
+    await runtime?.settleAfterAgentEnd();
     if (pendingState) {
       pi.appendEntry(AGY_STATE_ENTRY_TYPE, pendingState);
       pendingState = undefined;
     }
-    runtime?.clearSettledTurn();
     replayStore.clear();
     if (activeCtx?.model?.provider === PROVIDER_ID) {
       void refreshUsageSummary(activeCtx, Boolean(runtime?.lastQuotaError));

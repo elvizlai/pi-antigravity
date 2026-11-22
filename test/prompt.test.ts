@@ -5,6 +5,7 @@ import {
   collectTurnToolResults,
   extractSystemPromptAppend,
   extractTrailingUserPrompt,
+  isContinuationAfterToolUse,
 } from "../src/provider/prompt.ts";
 import {
   AGY_STATE_ENTRY_TYPE,
@@ -198,4 +199,105 @@ test("findActiveAgyConversation enforces session ownership and invalidation mark
     ]),
     undefined,
   );
+});
+
+test("isContinuationAfterToolUse distinguishes pure tool continuations from steered user turns", () => {
+  const assistantTurn = {
+    role: "assistant" as const,
+    content: [
+      { type: "toolCall" as const, id: "c1", name: "bash", arguments: {} },
+      { type: "toolCall" as const, id: "c2", name: "edit", arguments: {} },
+    ],
+    api: "a",
+    provider: "antigravity",
+    model: "m",
+    usage: {} as never,
+    stopReason: "toolUse" as const,
+    timestamp: 1,
+  };
+  const toolResult1 = {
+    role: "toolResult" as const,
+    toolCallId: "c1",
+    toolName: "bash",
+    content: [{ type: "text" as const, text: "ok1" }],
+    isError: false,
+    timestamp: 2,
+  };
+  const toolResult2 = {
+    role: "toolResult" as const,
+    toolCallId: "c2",
+    toolName: "edit",
+    content: [{ type: "text" as const, text: "ok2" }],
+    isError: false,
+    timestamp: 3,
+  };
+
+  assert.equal(
+    isContinuationAfterToolUse(asTranscript([{ role: "user", content: "hi", timestamp: 0 }])),
+    false,
+  );
+  assert.equal(isContinuationAfterToolUse(asTranscript([assistantTurn, toolResult1])), true);
+  assert.equal(
+    isContinuationAfterToolUse(
+      asTranscript([assistantTurn, toolResult1, { role: "system", content: "note", timestamp: 4 }]),
+    ),
+    true,
+  );
+  assert.equal(
+    isContinuationAfterToolUse(
+      asTranscript([
+        assistantTurn,
+        toolResult1,
+        { role: "user", content: "参数上还有什么值得优化的吗？", timestamp: 4 },
+      ]),
+    ),
+    false,
+  );
+  assert.equal(
+    isContinuationAfterToolUse(
+      asTranscript([
+        assistantTurn,
+        toolResult1,
+        { role: "user", content: "参数上还有什么值得优化的吗？", timestamp: 4 },
+        { role: "system", content: "trailing system", timestamp: 5 },
+      ]),
+    ),
+    false,
+  );
+  assert.equal(
+    isContinuationAfterToolUse(
+      asTranscript([
+        assistantTurn,
+        toolResult1,
+        {
+          role: "user",
+          content: [{ type: "image", data: "Zm9v", mimeType: "image/png" }],
+          timestamp: 4,
+        },
+      ]),
+    ),
+    false,
+  );
+  assert.equal(
+    isContinuationAfterToolUse(
+      asTranscript([assistantTurn, toolResult1, { role: "user", content: "   \n ", timestamp: 4 }]),
+    ),
+    true,
+  );
+
+  const steeredTranscript = asTranscript([
+    assistantTurn,
+    toolResult1,
+    toolResult2,
+    { role: "system", content: "ignored", timestamp: 4 },
+    { role: "user", content: "参数上还有什么值得优化的吗？", timestamp: 5 },
+  ]);
+  assert.equal(isContinuationAfterToolUse(steeredTranscript), false);
+  assert.deepEqual(
+    collectTurnToolResults(steeredTranscript, new Set(["c1", "c2"])).map((r) => r.callId),
+    ["c1", "c2"],
+  );
+  assert.deepEqual(extractTrailingUserPrompt(steeredTranscript), [
+    { type: "text", text: "参数上还有什么值得优化的吗？" },
+  ]);
 });

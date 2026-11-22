@@ -158,6 +158,42 @@ export interface CollectedToolResult {
   isError: boolean;
 }
 
+function hasMeaningfulUserContent(
+  msg: Extract<TranscriptContext["messages"][number], { role: "user" }>,
+): boolean {
+  if (typeof msg.content === "string") {
+    return msg.content.trim().length > 0;
+  }
+  for (const part of msg.content) {
+    if (part.type === "text" && part.text.trim().length > 0) return true;
+    if (part.type === "image") return true;
+  }
+  return false;
+}
+
+/**
+ * True only when the trailing non-system messages since the last assistant
+ * turn are `toolResult`s with no subsequent meaningful `user` message (such as
+ * a mid-turn steering prompt).
+ */
+export function isContinuationAfterToolUse(messages: TranscriptContext["messages"]): boolean {
+  let sawToolResult = false;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const msg = messages[i];
+    if (!msg || msg.role === "system") continue;
+    if (msg.role === "user") {
+      if (hasMeaningfulUserContent(msg)) return false;
+      continue;
+    }
+    if (msg.role === "toolResult") {
+      sawToolResult = true;
+      continue;
+    }
+    if (msg.role === "assistant") return sawToolResult;
+  }
+  return sawToolResult;
+}
+
 /**
  * Collect matching trailing `toolResult` messages (skipping `system` entries)
  * since the last assistant turn so pending bridged MCP calls can resolve cleanly.
