@@ -1,3 +1,5 @@
+import { asRecord } from "../acp/shared.ts";
+
 export const AGY_STATE_ENTRY_TYPE = "antigravity-state";
 
 export interface AgyConversationState {
@@ -40,8 +42,8 @@ function isBoundedString(value: unknown, maxLen: number): value is string {
 
 /** Narrow unknown custom entry data to a valid state record, ignoring foreign or corrupt shapes. */
 export function parseAgyStateEntry(data: unknown): AgyPersistedState | undefined {
-  if (!data || typeof data !== "object" || Array.isArray(data)) return undefined;
-  const record = data as Record<string, unknown>;
+  const record = asRecord(data);
+  if (!record) return undefined;
   if (record.version !== 1) return undefined;
   if (!isBoundedString(record.sessionId, 256) || !isBoundedString(record.cwd, 4096)) {
     return undefined;

@@ -115,18 +115,4 @@ export class AgyQuotaTurnTracker {
     }
     return banner;
   }
-
-  /**
-   * Returns the detected quota notice when `session/prompt` ends cleanly but
-   * exhibits agy's fake-`end_turn` quota-exhaustion signature.
-   */
-  detectTurnQuotaExhaustion(promptUsage?: {
-    totalTokens?: number;
-    outputTokens?: number;
-  }): AgyQuotaNotice | undefined {
-    const banner = this.detectTurnErrorBanner(promptUsage);
-    return banner?.kind === "quota"
-      ? { message: banner.message, resetsIn: banner.resetsIn }
-      : undefined;
-  }
 }

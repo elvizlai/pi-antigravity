@@ -1,25 +1,19 @@
-import { spawn } from "node:child_process";
 import { promises as fs, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { gte, valid } from "semver";
 import which from "which";
-import {
-  killProcessTree,
-  registerProcessGroupDeathHooks,
-  trackProcessGroup,
-  untrackProcessGroup,
-} from "./process-tree.ts";
+import { execAgyCommand } from "./process-tree.ts";
 
 /** Minimum `agy` CLI version required for `agy acp` (`--process-per-session`, `session/resume`). */
-export const MIN_AGY_VERSION = "1.5.0";
+const MIN_AGY_VERSION = "1.5.0";
 
-export const AGY_INSTALL_HINT =
+const AGY_INSTALL_HINT =
   "Install Antigravity CLI >= 1.5.0 (`npm i -g @google/antigravity` or official installer) and ensure `agy` is on PATH.";
 
 const AGY_PROBE_TIMEOUT_MS = 10_000;
 
-export function isRegularFileSync(filePath: string): boolean {
+function isRegularFileSync(filePath: string): boolean {
   try {
     return statSync(filePath).isFile();
   } catch {
@@ -93,65 +87,19 @@ export function resetAgyBinaryCache(): void {
   verifiedCache.clear();
 }
 
-function defaultVersionRunner(binary: string, signal?: AbortSignal): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(binary, ["--version"], {
-      stdio: ["ignore", "pipe", "pipe"],
-      detached: process.platform !== "win32",
-    });
-    registerProcessGroupDeathHooks();
-    trackProcessGroup(child.pid);
-
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-
-    const finish = (err?: Error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      signal?.removeEventListener("abort", onAbort);
-      untrackProcessGroup(child.pid);
-      if (err) reject(err);
-      else resolve(`${stdout}\n${stderr}`.trim());
-    };
-
-    const onAbort = () => {
-      killProcessTree(child.pid);
-      const err = new Error("Antigravity version probe aborted.");
-      err.name = "AbortError";
-      finish(err);
-    };
-
-    if (signal?.aborted) {
-      onAbort();
-      return;
-    }
-    signal?.addEventListener("abort", onAbort, { once: true });
-
-    const timeout = setTimeout(() => {
-      killProcessTree(child.pid);
-      finish(
-        new Error(`Timed out waiting for \`${binary} --version\` after ${AGY_PROBE_TIMEOUT_MS}ms.`),
-      );
-    }, AGY_PROBE_TIMEOUT_MS);
-    timeout.unref?.();
-
-    child.stdout?.on("data", (chunk) => {
-      stdout += String(chunk);
-    });
-    child.stderr?.on("data", (chunk) => {
-      stderr += String(chunk);
-    });
-    child.once("error", (err) => finish(err));
-    child.once("close", (code) => {
-      if (code !== 0) {
-        finish(new Error(stderr.trim() || stdout.trim() || `\`agy --version\` exited ${code}.`));
-        return;
-      }
-      finish();
-    });
+async function defaultVersionRunner(binary: string, signal?: AbortSignal): Promise<string> {
+  const res = await execAgyCommand(binary, ["--version"], {
+    signal,
+    timeoutMs: AGY_PROBE_TIMEOUT_MS,
+    abortMessage: "Antigravity version probe aborted.",
+    timeoutMessage: `Timed out waiting for \`${binary} --version\` after ${AGY_PROBE_TIMEOUT_MS}ms.`,
   });
+  if (res.code !== 0) {
+    throw new Error(
+      res.stderr.trim() || res.stdout.trim() || `\`agy --version\` exited ${res.code}.`,
+    );
+  }
+  return `${res.stdout}\n${res.stderr}`.trim();
 }
 
 async function binaryFingerprint(binary: string): Promise<string> {

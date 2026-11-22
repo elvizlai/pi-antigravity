@@ -16,6 +16,7 @@ import {
 import type { AcpContentBlock } from "../acp/client.ts";
 import type { AgyUsage } from "../acp/events.ts";
 import type { AgyExecutionMode } from "../acp/models.ts";
+import { isAbortError } from "../acp/shared.ts";
 import { WRAPPER_TOOL_NAME } from "../bridge/server.ts";
 import { extractSystemPromptAppend, extractTrailingUserPrompt } from "./prompt.ts";
 import type { AgyRuntime } from "./runtime.ts";
@@ -393,8 +394,7 @@ export function createAntigravityStreamSimple(
       } catch (err) {
         detachAbort?.();
         closeActiveBlock();
-        const isAbort =
-          Boolean(options?.signal?.aborted) || (err instanceof Error && err.name === "AbortError");
+        const isAbort = Boolean(options?.signal?.aborted) || isAbortError(err);
         partial.stopReason = isAbort ? "aborted" : "error";
         partial.errorMessage = err instanceof Error ? err.message : String(err);
         stream.push({

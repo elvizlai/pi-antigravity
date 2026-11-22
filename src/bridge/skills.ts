@@ -65,7 +65,7 @@ export function piPrivateSkills(skills: SkillLite[], sessionCwd: string | undefi
 }
 
 /** Unique skills with a file path; first name wins (same as pi collisions). */
-export function usableSkillCatalog(skills: SkillLite[]): SkillLite[] {
+function usableSkillCatalog(skills: SkillLite[]): SkillLite[] {
   const seen = new Set<string>();
   const out: SkillLite[] = [];
   for (const skill of skills) {
@@ -76,7 +76,7 @@ export function usableSkillCatalog(skills: SkillLite[]): SkillLite[] {
   return out;
 }
 
-export function findSkillByName(skills: SkillLite[], name: string): SkillLite | undefined {
+function findSkillByName(skills: SkillLite[], name: string): SkillLite | undefined {
   const trimmed = name.trim();
   return usableSkillCatalog(skills).find((skill) => skill.name === trimmed);
 }
@@ -140,7 +140,7 @@ export async function handleActivateSkill(
  * bundled resources (relative references in SKILL.md are useless to agy —
  * they resolve against the skill directory, not the agy workspace).
  */
-export async function readSkillBundle(skill: SkillLite): Promise<{
+async function readSkillBundle(skill: SkillLite): Promise<{
   content: string;
   isError: boolean;
 }> {

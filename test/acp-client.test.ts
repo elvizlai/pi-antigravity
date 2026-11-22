@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import test from "node:test";
 import { getAgyBinary } from "../src/acp/binary.ts";
-import { AgyAcpClient, MissingAgyConversationError } from "../src/acp/client.ts";
+import {
+  AcpRequestStallError,
+  AgyAcpClient,
+  MissingAgyConversationError,
+} from "../src/acp/client.ts";
 
 type SpawnProcessFn = NonNullable<ConstructorParameters<typeof AgyAcpClient>[0]["spawnProcess"]>;
 
@@ -206,4 +210,112 @@ test("Live agy acp initialize handshake (non-LLM smoke test when agy CLI >= 1.5.
   } finally {
     await client.dispose(300);
   }
+});
+
+test("AgyAcpClient initialize and newSession honor AbortSignal and timeoutMs", async () => {
+  const hangInitScript = `
+    const readline = require("node:readline");
+    const rl = readline.createInterface({ input: process.stdin });
+    rl.on("line", () => {});
+  `;
+  const client1 = new AgyAcpClient({
+    binary: process.execPath,
+    cwd: process.cwd(),
+    spawnProcess: ((binary: string, args: string[], options: Parameters<typeof spawn>[2]) =>
+      spawnMockAcpProcess(hangInitScript, binary, args, options)) as unknown as SpawnProcessFn,
+  });
+  try {
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), 20);
+    await assert.rejects(
+      () => client1.initialize({ signal: abort.signal }),
+      (err: unknown) => err instanceof Error && err.name === "AbortError",
+    );
+    clearTimeout(timer);
+  } finally {
+    await client1.dispose(50);
+  }
+
+  const hangNewSessionScript = `
+    const readline = require("node:readline");
+    const rl = readline.createInterface({ input: process.stdin });
+    rl.on("line", (line) => {
+      if (!line.trim()) return;
+      const msg = JSON.parse(line);
+      if (msg.method === "initialize") {
+        process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1 } }) + "\\n");
+      }
+    });
+  `;
+  const client2 = new AgyAcpClient({
+    binary: process.execPath,
+    cwd: process.cwd(),
+    spawnProcess: ((binary: string, args: string[], options: Parameters<typeof spawn>[2]) =>
+      spawnMockAcpProcess(
+        hangNewSessionScript,
+        binary,
+        args,
+        options,
+      )) as unknown as SpawnProcessFn,
+  });
+  try {
+    await client2.initialize({ timeoutMs: 500 });
+    await assert.rejects(
+      () => client2.newSession({ cwd: process.cwd(), timeoutMs: 30 }),
+      (err: unknown) =>
+        err instanceof AcpRequestStallError &&
+        err.method === "session/new" &&
+        !/timed?\s*out/i.test(err.message),
+    );
+  } finally {
+    await client2.dispose(50);
+  }
+});
+
+test("AgyAcpClient.dispose sends SIGTERM after stdin EOF grace and escalates to SIGKILL when ignored", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("POSIX SIGTERM/SIGKILL escalation test");
+    return;
+  }
+
+  const trapSigtermScript = `
+    const readline = require("node:readline");
+    const rl = readline.createInterface({ input: process.stdin });
+    rl.on("line", () => {});
+    process.stdin.on("end", () => {
+      // Ignore stdin EOF so dispose must escalate to SIGTERM.
+    });
+    process.on("SIGTERM", () => {
+      process.stderr.write("saw-sigterm\\n");
+      process.exit(0);
+    });
+    setInterval(() => {}, 1000);
+  `;
+  const client1 = new AgyAcpClient({
+    binary: process.execPath,
+    cwd: process.cwd(),
+    spawnProcess: ((binary: string, args: string[], options: Parameters<typeof spawn>[2]) =>
+      spawnMockAcpProcess(trapSigtermScript, binary, args, options)) as unknown as SpawnProcessFn,
+  });
+  await new Promise((r) => setTimeout(r, 30));
+  await client1.dispose(30);
+  assert.equal(client1.isAlive, false);
+  assert.match(client1.stderrTail, /saw-sigterm/);
+
+  const ignoreSigtermScript = `
+    const readline = require("node:readline");
+    const rl = readline.createInterface({ input: process.stdin });
+    rl.on("line", () => {});
+    process.on("SIGTERM", () => {});
+    setInterval(() => {}, 1000);
+  `;
+  const client2 = new AgyAcpClient({
+    binary: process.execPath,
+    cwd: process.cwd(),
+    spawnProcess: ((binary: string, args: string[], options: Parameters<typeof spawn>[2]) =>
+      spawnMockAcpProcess(ignoreSigtermScript, binary, args, options)) as unknown as SpawnProcessFn,
+  });
+  await new Promise((r) => setTimeout(r, 30));
+  await client2.dispose(30);
+  assert.equal(client2.isAlive, false);
 });

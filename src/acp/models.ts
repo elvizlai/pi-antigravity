@@ -1,25 +1,12 @@
-import { spawn } from "node:child_process";
 import type { Model } from "@earendil-works/pi-ai";
 import { getAgyBinary } from "./binary.ts";
-import {
-  killProcessTree,
-  registerProcessGroupDeathHooks,
-  trackProcessGroup,
-  untrackProcessGroup,
-} from "./process-tree.ts";
+import { execAgyCommand } from "./process-tree.ts";
 
 export type AgyExecutionMode = "default" | "plan";
 
 export type AgyEffort = "low" | "medium" | "high" | "extra" | "xhigh" | "max";
 
-export const AGY_EFFORT_ORDER: readonly AgyEffort[] = [
-  "low",
-  "medium",
-  "high",
-  "extra",
-  "xhigh",
-  "max",
-];
+const AGY_EFFORT_ORDER: readonly AgyEffort[] = ["low", "medium", "high", "extra", "xhigh", "max"];
 
 export interface AgyAcpSelectOption {
   value: string;
@@ -284,63 +271,16 @@ export async function probeAgyModels(options?: {
 }): Promise<Model<string>[]> {
   const binary = getAgyBinary(options?.binaryPath);
   const timeoutMs = options?.timeoutMs ?? 15_000;
-
-  return new Promise((resolve, reject) => {
-    const child = spawn(binary, ["models"], {
-      stdio: ["ignore", "pipe", "pipe"],
-      detached: process.platform !== "win32",
-      env: process.env,
-    });
-    registerProcessGroupDeathHooks();
-    trackProcessGroup(child.pid);
-
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-
-    const finish = (err?: Error, models?: Model<string>[]) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      options?.signal?.removeEventListener("abort", onAbort);
-      untrackProcessGroup(child.pid);
-      if (err) reject(err);
-      else resolve(models ?? []);
-    };
-
-    const onAbort = () => {
-      killProcessTree(child.pid);
-      const err = new Error("Model probe aborted.");
-      err.name = "AbortError";
-      finish(err);
-    };
-    if (options?.signal?.aborted) {
-      onAbort();
-      return;
-    }
-    options?.signal?.addEventListener("abort", onAbort, { once: true });
-
-    const timer = setTimeout(() => {
-      killProcessTree(child.pid);
-      finish(new Error(`Timed out waiting for \`agy models\` after ${timeoutMs}ms.`));
-    }, timeoutMs);
-    timer.unref?.();
-
-    child.stdout?.on("data", (chunk) => {
-      stdout += String(chunk);
-    });
-    child.stderr?.on("data", (chunk) => {
-      stderr += String(chunk);
-    });
-    child.once("error", (err) => finish(err));
-    child.once("close", (code) => {
-      if (code !== 0) {
-        finish(new Error(stderr.trim() || `\`agy models\` exited ${code}.`));
-        return;
-      }
-      finish(undefined, parseAgyModelsOutput(stdout));
-    });
+  const res = await execAgyCommand(binary, ["models"], {
+    signal: options?.signal,
+    timeoutMs,
+    abortMessage: "Model probe aborted.",
+    timeoutMessage: `Timed out waiting for \`agy models\` after ${timeoutMs}ms.`,
   });
+  if (res.code !== 0) {
+    throw new Error(res.stderr.trim() || `\`agy models\` exited ${res.code}.`);
+  }
+  return parseAgyModelsOutput(res.stdout);
 }
 
 export function extractAcpConfigOption(
@@ -426,7 +366,7 @@ export function resolveAcpExecutionMode(
 const LIVE_CACHE_TTL_MS = 60 * 60 * 1000;
 const FALLBACK_CACHE_TTL_MS = 5 * 60 * 1000;
 
-export function modelCacheTtlMs(source: "live" | "fallback" | undefined): number {
+function modelCacheTtlMs(source: "live" | "fallback" | undefined): number {
   return source === "live" ? LIVE_CACHE_TTL_MS : FALLBACK_CACHE_TTL_MS;
 }
 

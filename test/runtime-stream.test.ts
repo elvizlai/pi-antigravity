@@ -11,9 +11,14 @@ import {
   type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import antigravityExtension from "../index.ts";
-import type { AcpHttpMcpServer } from "../src/acp/client.ts";
+import { type AcpHttpMcpServer, AcpRequestStallError } from "../src/acp/client.ts";
+import {
+  HINDSIGHT_DISABLE_HOOKS_ENV,
+  hasHostHindsightTools,
+  resolveAgyChildEnv,
+} from "../src/bridge/agent-files.ts";
 import { AgyPiBridge } from "../src/bridge/server.ts";
-import { INCOMPLETE_ACP_TOOL_MESSAGE } from "../src/provider/prompt.ts";
+import { BACKGROUND_ACP_TOOL_MESSAGE } from "../src/provider/prompt.ts";
 import {
   type AgyAcpClientLike,
   AgyFirstResponseTimeoutError,
@@ -768,7 +773,7 @@ test("upstream ⚠ error banners after tool waves fail with stopReason error (40
   }
 });
 
-test("native wrapper tool replay store preserves output and incomplete tool errors accurately", async () => {
+test("native wrapper tool replay store preserves output, explicit failures, and background tool status", async () => {
   const replayStore = new AgyReplayStore();
   const workingStatuses: Array<string | undefined> = [];
   let promptCalls = 0;
@@ -811,6 +816,20 @@ test("native wrapper tool replay store preserves output and incomplete tool erro
         });
         opts?.onUpdate?.({
           sessionUpdate: "tool_call",
+          toolCallId: "f1",
+          title: "Run bad-cmd",
+          kind: "execute",
+          status: "in_progress",
+          rawInput: { cmd: "bad-cmd" },
+        });
+        opts?.onUpdate?.({
+          sessionUpdate: "tool_call_update",
+          toolCallId: "f1",
+          status: "failed",
+          rawOutput: { error: "exit code 1" },
+        });
+        opts?.onUpdate?.({
+          sessionUpdate: "tool_call",
           toolCallId: "d1",
           title: "Run sleep 10",
           kind: "execute",
@@ -845,9 +864,12 @@ test("native wrapper tool replay store preserves output and incomplete tool erro
     false,
   );
   const calls = msg1.content.filter((b) => b.type === "toolCall");
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 3);
   assert.equal(replayStore.take(calls[0].id)?.output, "line1");
-  assert.equal(replayStore.take(calls[1].id)?.error, INCOMPLETE_ACP_TOOL_MESSAGE);
+  assert.equal(replayStore.take(calls[1].id)?.error, "exit code 1");
+  const bgRecorded = replayStore.take(calls[2].id);
+  assert.equal(bgRecorded?.output, BACKGROUND_ACP_TOOL_MESSAGE);
+  assert.equal(bgRecorded?.error, undefined);
   assert.equal(workingStatuses[0], "Read a.txt…");
   assert.ok(workingStatuses.includes("Run sleep 10…"));
   assert.equal(workingStatuses.at(-1), undefined);
@@ -859,7 +881,12 @@ test("native wrapper tool replay store preserves output and incomplete tool erro
       role: "toolResult",
       toolCallId: call.id,
       toolName: "antigravity",
-      content: [{ type: "text", text: idx === 0 ? "line1" : INCOMPLETE_ACP_TOOL_MESSAGE }],
+      content: [
+        {
+          type: "text",
+          text: idx === 0 ? "line1" : idx === 1 ? "exit code 1" : BACKGROUND_ACP_TOOL_MESSAGE,
+        },
+      ],
       isError: idx === 1,
       timestamp: 2 + idx,
     })),
@@ -873,6 +900,224 @@ test("native wrapper tool replay store preserves output and incomplete tool erro
   assert.equal(msg2.stopReason, "stop");
   assert.deepEqual(msg2.content, []);
   assert.equal(msg2.usage.totalTokens, 120);
+  await runtime.dispose();
+});
+
+test("pending ACP tools settle naturally across turns while background tools flush before text and preserve same-turn completion", async () => {
+  const replayStore = new AgyReplayStore();
+  let promptCalls = 0;
+  const runtime = new AgyRuntime({
+    cwd: "/work",
+    getToolMode: () => "native",
+    checkBinary: async () => ({ binary: "agy", version: "1.5.14" }),
+    createClient: () => ({
+      isAlive: true,
+      async initialize() {
+        return { protocolVersion: 1 };
+      },
+      async newSession() {
+        return { sessionId: "native-deferred-1" };
+      },
+      async resumeSession() {
+        return { sessionId: "native-deferred-1" };
+      },
+      async setConfigOption() {
+        return {};
+      },
+      cancelSession() {},
+      async prompt(_sid, _blocks, opts) {
+        promptCalls += 1;
+        if (promptCalls === 1) {
+          // Part A Turn 1: pending tool (ask_question) awaits follow-up user input.
+          opts?.onUpdate?.({
+            sessionUpdate: "tool_call",
+            toolCallId: "q1",
+            title: "Run ask_question",
+            kind: "other",
+            status: "in_progress",
+            rawInput: { questions: [{ question: "Storage?" }] },
+          });
+          opts?.onUpdate?.({
+            sessionUpdate: "tool_call_update",
+            toolCallId: "q1",
+            status: "pending",
+          });
+          opts?.onUpdate?.({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "Question text?" },
+          });
+          return {
+            stopReason: "end_turn",
+            usage: { inputTokens: 100, outputTokens: 25, totalTokens: 125 },
+          };
+        }
+
+        if (promptCalls === 2) {
+          // Part A Turn 2: real completed update arrives for q1 when user answers.
+          opts?.onUpdate?.({
+            sessionUpdate: "tool_call_update",
+            toolCallId: "q1",
+            title: "Run ask_question",
+            kind: "other",
+            status: "completed",
+          });
+          opts?.onUpdate?.({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "Agreed answer." },
+          });
+          return {
+            stopReason: "end_turn",
+            usage: { inputTokens: 120, outputTokens: 30, totalTokens: 150 },
+          };
+        }
+
+        // Part B Turn 3: in_progress background tool flushes before interim text, then completes in the SAME turn.
+        opts?.onUpdate?.({
+          sessionUpdate: "tool_call",
+          toolCallId: "bg1",
+          title: "Run run_workflow",
+          kind: "other",
+          status: "in_progress",
+          rawInput: { Description: "bg job" },
+        });
+        opts?.onUpdate?.({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Started in background." },
+        });
+        opts?.onUpdate?.({
+          sessionUpdate: "tool_call_update",
+          toolCallId: "bg1",
+          title: "Run run_workflow",
+          kind: "other",
+          status: "completed",
+          content: [{ type: "content", content: { type: "text", text: "workflow result: 42" } }],
+        });
+        opts?.onUpdate?.({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Final: 42." },
+        });
+        return {
+          stopReason: "end_turn",
+          usage: { inputTokens: 140, outputTokens: 35, totalTokens: 175 },
+        };
+      },
+      async dispose() {},
+    }),
+  });
+
+  const streamSimple = createAntigravityStreamSimple({
+    getRuntime: () => runtime,
+    getSessionId: () => "pi-deferred-1",
+    getBranchEntries: () => [],
+    replayStore,
+  });
+
+  // Part A Turn 1: pending ask_question is NOT materialized early; question text completes in 1 wave.
+  const turn1Messages: unknown[] = [{ role: "user", content: "/grill-me", timestamp: 1 }];
+  const t1 = streamSimple(testModel(), makeTranscript(turn1Messages));
+  for await (const _ of t1) {
+  }
+  const msg1 = await t1.result();
+  assert.equal(msg1.stopReason, "stop");
+  assert.deepEqual(msg1.content, [{ type: "text", text: "Question text?" }]);
+  assert.equal(msg1.usage.totalTokens, 125);
+
+  // Part A Turn 2: real completed event for ask_question renders once in Wave 1, reply in Wave 2.
+  const turn2Messages: unknown[] = [
+    ...turn1Messages,
+    msg1,
+    { role: "user", content: "1", timestamp: 2 },
+  ];
+  const t2w1 = streamSimple(testModel(), makeTranscript(turn2Messages));
+  for await (const _ of t2w1) {
+  }
+  const msg2w1 = await t2w1.result();
+  assert.equal(msg2w1.stopReason, "toolUse");
+  const t2Calls = msg2w1.content.filter((b) => b.type === "toolCall");
+  assert.equal(t2Calls.length, 1);
+  assert.equal(t2Calls[0].arguments.tool, "Run ask_question");
+
+  const t2Follow = [
+    ...turn2Messages,
+    msg2w1,
+    {
+      role: "toolResult",
+      toolCallId: t2Calls[0].id,
+      toolName: "antigravity",
+      content: [{ type: "text", text: "" }],
+      isError: false,
+      timestamp: 3,
+    },
+  ];
+  const t2w2 = streamSimple(testModel(), makeTranscript(t2Follow));
+  for await (const _ of t2w2) {
+  }
+  const msg2w2 = await t2w2.result();
+  assert.equal(msg2w2.stopReason, "stop");
+  assert.deepEqual(msg2w2.content, [{ type: "text", text: "Agreed answer." }]);
+
+  // Part B Turn 3: background tool flushes before interim text, and real same-turn completion is NOT dropped.
+  const turn3Messages: unknown[] = [
+    ...t2Follow,
+    msg2w2,
+    { role: "user", content: "run bg", timestamp: 4 },
+  ];
+  const t3w1 = streamSimple(testModel(), makeTranscript(turn3Messages));
+  for await (const _ of t3w1) {
+  }
+  const msg3w1 = await t3w1.result();
+  assert.equal(msg3w1.stopReason, "toolUse");
+  const t3w1Calls = msg3w1.content.filter((b) => b.type === "toolCall");
+  assert.equal(t3w1Calls.length, 1);
+  assert.equal(replayStore.take(t3w1Calls[0].id)?.output, BACKGROUND_ACP_TOOL_MESSAGE);
+
+  const t3Follow1 = [
+    ...turn3Messages,
+    msg3w1,
+    {
+      role: "toolResult",
+      toolCallId: t3w1Calls[0].id,
+      toolName: "antigravity",
+      content: [{ type: "text", text: BACKGROUND_ACP_TOOL_MESSAGE }],
+      isError: false,
+      timestamp: 5,
+    },
+  ];
+  const t3w2 = streamSimple(testModel(), makeTranscript(t3Follow1));
+  for await (const _ of t3w2) {
+  }
+  const msg3w2 = await t3w2.result();
+  assert.equal(msg3w2.stopReason, "toolUse");
+  assert.equal(
+    msg3w2.content
+      .filter((b) => b.type === "text")
+      .map((b) => b.text)
+      .join(""),
+    "Started in background.",
+  );
+  const t3w2Calls = msg3w2.content.filter((b) => b.type === "toolCall");
+  assert.equal(t3w2Calls.length, 1);
+  assert.equal(replayStore.take(t3w2Calls[0].id)?.output, "workflow result: 42");
+
+  const t3Follow2 = [
+    ...t3Follow1,
+    msg3w2,
+    {
+      role: "toolResult",
+      toolCallId: t3w2Calls[0].id,
+      toolName: "antigravity",
+      content: [{ type: "text", text: "workflow result: 42" }],
+      isError: false,
+      timestamp: 6,
+    },
+  ];
+  const t3w3 = streamSimple(testModel(), makeTranscript(t3Follow2));
+  for await (const _ of t3w3) {
+  }
+  const msg3w3 = await t3w3.result();
+  assert.equal(msg3w3.stopReason, "stop");
+  assert.deepEqual(msg3w3.content, [{ type: "text", text: "Final: 42." }]);
+  assert.equal(promptCalls, 3);
   await runtime.dispose();
 });
 
@@ -1330,5 +1575,289 @@ test("antigravityExtension defers CLI flag reads until after Pi populates flag v
     for (const handler of handlers.get("session_shutdown") ?? []) {
       await handler({}, mockCtx);
     }
+  }
+});
+
+test("setup stall and abort during resumeSession dispose client without wiping stored conversationId", async () => {
+  let disposeCount = 0;
+  let newSessionCalls = 0;
+  const resumedIds: string[] = [];
+  let mode: "hang_init" | "hang_resume" | "ok" = "hang_init";
+
+  const runtime = new AgyRuntime({
+    cwd: "/work",
+    getToolMode: () => "native",
+    firstResponseTimeoutMs: 40,
+    checkBinary: async () => ({ binary: "agy", version: "1.5.14" }),
+    createClient: () => {
+      let alive = true;
+      return {
+        get isAlive() {
+          return alive;
+        },
+        async initialize(opts) {
+          if (mode === "hang_init") {
+            return new Promise((_, reject) => {
+              const t = setTimeout(
+                () => reject(new AcpRequestStallError("initialize", opts?.timeoutMs ?? 40)),
+                opts?.timeoutMs ?? 40,
+              );
+              t.unref?.();
+            });
+          }
+          return { protocolVersion: 1 };
+        },
+        async newSession() {
+          newSessionCalls += 1;
+          return { sessionId: "fresh-should-not-happen" };
+        },
+        async resumeSession(opts) {
+          resumedIds.push(opts.sessionId);
+          if (mode === "hang_resume") {
+            return new Promise((_resolve, reject) => {
+              opts.signal?.addEventListener(
+                "abort",
+                () => {
+                  const err = new Error("aborted");
+                  err.name = "AbortError";
+                  reject(err);
+                },
+                { once: true },
+              );
+            });
+          }
+          return { sessionId: opts.sessionId };
+        },
+        async setConfigOption() {
+          return {};
+        },
+        cancelSession() {},
+        async prompt(_sid, _blocks, opts) {
+          opts?.onUpdate?.({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "resumed-ok" },
+          });
+          return { stopReason: "end_turn" };
+        },
+        async dispose() {
+          alive = false;
+          disposeCount += 1;
+        },
+      };
+    },
+  });
+
+  // 1. Stall during initialize surfaces non-retryable AgyFirstResponseTimeoutError and disposes client.
+  const branchEntries = [
+    {
+      type: "custom",
+      customType: AGY_STATE_ENTRY_TYPE,
+      data: {
+        version: 1,
+        kind: "conversation",
+        sessionId: "pi-setup-1",
+        conversationId: "stored-conv-1",
+        cwd: "/work",
+        turns: 2,
+      },
+    },
+  ];
+  const streamSimple = createAntigravityStreamSimple({
+    getRuntime: () => runtime,
+    getSessionId: () => "pi-setup-1",
+    getBranchEntries: () => branchEntries,
+    replayStore: new AgyReplayStore(),
+  });
+
+  const stalledMsg = await streamSimple(
+    testModel(),
+    makeTranscript([{ role: "user", content: "hi", timestamp: 0 }]),
+  ).result();
+  assert.equal(stalledMsg.stopReason, "error");
+  assert.match(stalledMsg.errorMessage ?? "", /within .*s — cancelled stalled turn/);
+  assert.equal(isRetryableAssistantError(stalledMsg), false);
+  assert.equal(disposeCount, 1);
+
+  // 2. Abort during resumeSession disposes client without wiping stored conversationId or calling newSession.
+  mode = "hang_resume";
+
+  const abort = new AbortController();
+  setTimeout(() => abort.abort(), 20);
+  const abortedMsg = await streamSimple(
+    testModel(),
+    makeTranscript([{ role: "user", content: "hi", timestamp: 1 }]),
+    { signal: abort.signal },
+  ).result();
+  assert.equal(abortedMsg.stopReason, "aborted");
+  assert.equal(newSessionCalls, 0);
+  assert.equal(disposeCount, 2);
+  assert.deepEqual(resumedIds, ["stored-conv-1"]);
+
+  // Subsequent turn still resumes the same stored-conv-1 cleanly.
+  mode = "ok";
+  const okMsg = await streamSimple(
+    testModel(),
+    makeTranscript([{ role: "user", content: "hi again", timestamp: 2 }]),
+  ).result();
+  assert.equal(okMsg.stopReason, "stop");
+  assert.equal(newSessionCalls, 0);
+  assert.deepEqual(resumedIds, ["stored-conv-1", "stored-conv-1"]);
+  await runtime.dispose();
+});
+
+test("stopReason max_turn_requests and refusal fail fast without retries while max_tokens maps to length", async () => {
+  const stopReasons = ["max_turn_requests", "refusal", "max_tokens"] as const;
+  let index = 0;
+
+  const runtime = new AgyRuntime({
+    cwd: "/work",
+    getToolMode: () => "native",
+    checkBinary: async () => ({ binary: "agy", version: "1.5.14" }),
+    createClient: () => ({
+      isAlive: true,
+      async initialize() {
+        return { protocolVersion: 1 };
+      },
+      async newSession() {
+        return { sessionId: "stop-reason-sess" };
+      },
+      async resumeSession() {
+        return { sessionId: "stop-reason-sess" };
+      },
+      async setConfigOption() {
+        return {};
+      },
+      cancelSession() {},
+      async prompt(_sid, _blocks, opts) {
+        const stopReason = stopReasons[index++] ?? "end_turn";
+        opts?.onUpdate?.({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: `partial:${stopReason}` },
+        });
+        return { stopReason };
+      },
+      async dispose() {},
+    }),
+  });
+
+  const streamSimple = createAntigravityStreamSimple({
+    getRuntime: () => runtime,
+    getSessionId: () => "pi-stop-reasons",
+    getBranchEntries: () => [],
+    replayStore: new AgyReplayStore(),
+  });
+
+  try {
+    const msg1 = await streamSimple(
+      testModel(),
+      makeTranscript([{ role: "user", content: "1", timestamp: 1 }]),
+    ).result();
+    assert.equal(msg1.stopReason, "error");
+    assert.match(msg1.errorMessage ?? "", /max_turn_requests/);
+    assert.equal(isRetryableAssistantError(msg1), false);
+    assert.deepEqual(msg1.content, [{ type: "text", text: "partial:max_turn_requests" }]);
+
+    const msg2 = await streamSimple(
+      testModel(),
+      makeTranscript([{ role: "user", content: "2", timestamp: 2 }]),
+    ).result();
+    assert.equal(msg2.stopReason, "error");
+    assert.match(msg2.errorMessage ?? "", /refusal/);
+    assert.equal(isRetryableAssistantError(msg2), false);
+    assert.deepEqual(msg2.content, [{ type: "text", text: "partial:refusal" }]);
+
+    const msg3 = await streamSimple(
+      testModel(),
+      makeTranscript([{ role: "user", content: "3", timestamp: 3 }]),
+    ).result();
+    assert.equal(msg3.stopReason, "length");
+    assert.deepEqual(msg3.content, [{ type: "text", text: "partial:max_tokens" }]);
+  } finally {
+    await runtime.dispose();
+  }
+});
+
+test("host Hindsight detection injects HINDSIGHT_DISABLE_HOOKS=1 into warmed and active agy acp env", async () => {
+  assert.equal(hasHostHindsightTools([{ name: "read" }, { name: "bash" }]), false);
+  assert.equal(hasHostHindsightTools([{ name: "read" }, { name: "hindsight_search_pages" }]), true);
+
+  assert.equal(resolveAgyChildEnv({ hostHindsightActive: false }), undefined);
+  assert.deepEqual(resolveAgyChildEnv({ hostHindsightActive: false, env: { CUSTOM: "1" } }), {
+    CUSTOM: "1",
+  });
+  assert.deepEqual(resolveAgyChildEnv({ hostHindsightActive: true, ambientEnv: {} }), {
+    [HINDSIGHT_DISABLE_HOOKS_ENV]: "1",
+  });
+  assert.deepEqual(
+    resolveAgyChildEnv({
+      hostHindsightActive: true,
+      env: { [HINDSIGHT_DISABLE_HOOKS_ENV]: "" },
+      ambientEnv: {},
+    }),
+    { [HINDSIGHT_DISABLE_HOOKS_ENV]: "" },
+  );
+  assert.deepEqual(
+    resolveAgyChildEnv({
+      hostHindsightActive: true,
+      env: { CUSTOM: "1" },
+      ambientEnv: { [HINDSIGHT_DISABLE_HOOKS_ENV]: "0" },
+    }),
+    { CUSTOM: "1" },
+  );
+
+  let spawnCount = 0;
+  const seenEnvs: Array<NodeJS.ProcessEnv | undefined> = [];
+  const runtime = new AgyRuntime({
+    cwd: "/work",
+    getToolMode: () => "native",
+    isHostHindsightActive: () => true,
+    checkBinary: async () => ({ binary: "agy", version: "1.5.14" }),
+    createClient: (opts) => {
+      spawnCount += 1;
+      seenEnvs.push(opts.env);
+      return {
+        isAlive: true,
+        async initialize() {
+          return { protocolVersion: 1 };
+        },
+        async newSession() {
+          return { sessionId: "hindsight-dedupe-sess" };
+        },
+        async resumeSession() {
+          return { sessionId: "hindsight-dedupe-sess" };
+        },
+        async setConfigOption() {
+          return {};
+        },
+        cancelSession() {},
+        async prompt(_sid, _blocks, opts) {
+          opts?.onUpdate?.({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "ok" },
+          });
+          return { stopReason: "end_turn" };
+        },
+        async dispose() {},
+      };
+    },
+  });
+
+  try {
+    await runtime.warmupClient();
+    const streamSimple = createAntigravityStreamSimple({
+      getRuntime: () => runtime,
+      getSessionId: () => "pi-hs-1",
+      getBranchEntries: () => [],
+      replayStore: new AgyReplayStore(),
+    });
+    const msg = await streamSimple(
+      testModel(),
+      makeTranscript([{ role: "user", content: "hello", timestamp: 1 }]),
+    ).result();
+    assert.equal(msg.stopReason, "stop");
+    assert.equal(spawnCount, 1);
+    assert.deepEqual(seenEnvs, [{ [HINDSIGHT_DISABLE_HOOKS_ENV]: "1" }]);
+  } finally {
+    await runtime.dispose();
   }
 });

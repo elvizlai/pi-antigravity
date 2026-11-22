@@ -20,16 +20,15 @@ export const BRIDGE_PENDING_TOOL_MESSAGE =
   "Started and still running at tool handoff. Unfinished commands may be cancelled when " +
   "the agy turn ends.";
 
-/** Fallback error recorded when an ACP tool call has not reported completion at turn end. */
-export const INCOMPLETE_ACP_TOOL_MESSAGE =
-  "ACP tool call did not report completion before the turn ended.";
+/** Status recorded when a native ACP tool continues running in the background after the turn ends. */
+export const BACKGROUND_ACP_TOOL_MESSAGE = "Started and continuing in the background.";
 
 /** Maximum UTF-8 byte budget allocated to text blocks in a single `session/prompt`. */
-export const MAX_AGY_PROMPT_BYTES = 185_000;
+const MAX_AGY_PROMPT_BYTES = 185_000;
 
 const OMITTED_SYSTEM_SECTIONS = new Set(["preamble", "tools", "rules", "docs", "skills", "cwd"]);
 
-export function omittedImagesPrompt(images: number): string {
+function omittedImagesPrompt(images: number): string {
   return `(${images} image(s) omitted — this agy request is text-only)`;
 }
 

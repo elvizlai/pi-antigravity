@@ -3,11 +3,12 @@ import fs from "node:fs";
 import path from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { AgyExecutionMode } from "../acp/models.ts";
+import { asRecord } from "../acp/shared.ts";
 import type { AgyToolMode } from "../bridge/server.ts";
 
 export type { AgyExecutionMode, AgyToolMode };
 
-export const DEFAULT_AGY_TOOL_MODE: AgyToolMode = "pi";
+const DEFAULT_AGY_TOOL_MODE: AgyToolMode = "pi";
 
 export interface AgyCachedModelEntry {
   id: string;
@@ -31,7 +32,7 @@ export type AgyPlanCommandAction =
   | { kind: "set"; enabled: boolean }
   | { kind: "invalid"; raw: string };
 
-export function isAgyToolMode(value: unknown): value is AgyToolMode {
+function isAgyToolMode(value: unknown): value is AgyToolMode {
   return value === "pi" || value === "native";
 }
 
@@ -94,8 +95,8 @@ export function agySettingsPath(agentDir: string = getAgentDir()): string {
 }
 
 function sanitizeSettings(raw: unknown): AgySettings {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
-  const obj = raw as Record<string, unknown>;
+  const obj = asRecord(raw);
+  if (!obj) return {};
   const settings: AgySettings = {};
   if (isAgyToolMode(obj.toolMode)) {
     settings.toolMode = obj.toolMode;
@@ -110,9 +111,8 @@ function sanitizeSettings(raw: unknown): AgySettings {
   if (Array.isArray(obj.cachedModels)) {
     const cached: AgyCachedModelEntry[] = [];
     for (const entry of obj.cachedModels.slice(0, 100)) {
-      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
-      const rec = entry as Record<string, unknown>;
-      if (typeof rec.id !== "string" || !rec.id.trim()) continue;
+      const rec = asRecord(entry);
+      if (!rec || typeof rec.id !== "string" || !rec.id.trim()) continue;
       const id = rec.id.trim();
       const name = typeof rec.name === "string" && rec.name.trim() ? rec.name.trim() : id;
       cached.push({ id, name });

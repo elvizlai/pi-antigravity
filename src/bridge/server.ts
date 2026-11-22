@@ -24,10 +24,10 @@ import type { ImageContent, JsonObject, TextContent } from "@earendil-works/pi-a
 export const WRAPPER_TOOL_NAME = "antigravity";
 export type AgyToolMode = "pi" | "native";
 
-export const BRIDGE_SERVER_NAME = "pi-bridge";
-export const BRIDGE_TOOL_PREFIX = "pi__";
+const BRIDGE_SERVER_NAME = "pi-bridge";
+const BRIDGE_TOOL_PREFIX = "pi__";
 /** Safety ceiling for one bridged Pi tool call; HTTP disconnect and agent_settled end dead calls immediately. */
-export const BRIDGE_CALL_TIMEOUT_MS = 1_800_000;
+const BRIDGE_CALL_TIMEOUT_MS = 1_800_000;
 
 export interface BridgeToolDef {
   /** Real pi tool name (without the `pi__` prefix). */
@@ -126,7 +126,7 @@ function canonicalValue(value: unknown): unknown {
   );
 }
 
-export function canonicalJson(value: unknown): string {
+function canonicalJson(value: unknown): string {
   return JSON.stringify(canonicalValue(value));
 }
 
@@ -136,7 +136,6 @@ export class AgyPiBridge {
   #port = 0;
   #seq = 0;
   #pending = new Map<string, PendingCall>();
-  #disconnected = new Set<string>();
   #defaultSessionId: string = randomUUID();
   /** Shared secret agy must send on every request; unset = no auth (tests). */
   #token: string | undefined;
@@ -197,8 +196,8 @@ export class AgyPiBridge {
     this.#updateCatalogRevision();
   }
 
-  #updateCatalogRevision(): boolean {
-    const catalog = [
+  #buildMcpToolList(): Array<{ name: string; description: string; inputSchema: unknown }> {
+    return [
       ...this.#tools
         .filter((tool) => !this.#dynamic.has(tool.name))
         .map((tool) => ({
@@ -212,7 +211,11 @@ export class AgyPiBridge {
         description: definition.description,
         inputSchema: definition.parameters,
       })),
-    ].sort((a, b) => a.name.localeCompare(b.name));
+    ];
+  }
+
+  #updateCatalogRevision(): boolean {
+    const catalog = this.#buildMcpToolList().sort((a, b) => a.name.localeCompare(b.name));
     const digest = createHash("sha256").update(canonicalJson(catalog)).digest("hex");
     if (digest === this.#catalogDigest) return false;
     this.#catalogDigest = digest;
@@ -270,34 +273,10 @@ export class AgyPiBridge {
       });
     }
     this.#pending.clear();
-    this.#disconnected.clear();
     return new Promise((resolve) => {
       server.close(() => resolve());
       server.closeIdleConnections?.();
     });
-  }
-
-  #recordDisconnected(id: string): void {
-    if (this.#disconnected.size >= 256) {
-      const oldest = this.#disconnected.values().next().value;
-      if (oldest !== undefined) this.#disconnected.delete(oldest);
-    }
-    this.#disconnected.add(id);
-  }
-
-  /** True if the MCP caller cancelled or disconnected while this call was pending. */
-  wasDisconnected(callId: string): boolean {
-    return this.#disconnected.has(callId);
-  }
-
-  /** Clear and return whether this call was previously cancelled/disconnected. */
-  acknowledgeDisconnected(callId: string): boolean {
-    return this.#disconnected.delete(callId);
-  }
-
-  /** True when the provider is still waiting for pi to execute this call. */
-  isAwaiting(callId: string): boolean {
-    return this.#pending.has(callId);
   }
 
   /** Hand the executed pi tool result back to the waiting agy MCP call. */
@@ -409,7 +388,6 @@ export class AgyPiBridge {
             if (pending.mcpSession === sessionId && pending.rpcId === requestId) {
               this.#pending.delete(id);
               clearTimeout(pending.timer);
-              this.#recordDisconnected(id);
               pending.resolve({
                 content: `antigravity: client cancelled pi tool "${pending.tool}" while pending.`,
                 isError: true,
@@ -425,22 +403,7 @@ export class AgyPiBridge {
           response: {
             ...base,
             result: {
-              tools: [
-                ...this.#tools
-                  .filter((tool) => !this.#dynamic.has(tool.name))
-                  .map((tool) => ({
-                    name: `${BRIDGE_TOOL_PREFIX}${tool.name}`,
-                    description:
-                      tool.description ||
-                      `pi tool "${tool.name}" bridged into agy by ${BRIDGE_SERVER_NAME}.`,
-                    inputSchema: tool.parameters,
-                  })),
-                ...[...this.#dynamic].map(([name, definition]) => ({
-                  name: `${BRIDGE_TOOL_PREFIX}${name}`,
-                  description: definition.description,
-                  inputSchema: definition.parameters,
-                })),
-              ],
+              tools: this.#buildMcpToolList(),
             },
           },
         };
@@ -527,7 +490,6 @@ export class AgyPiBridge {
         if (!current) return;
         this.#pending.delete(id);
         clearTimeout(current.timer);
-        this.#recordDisconnected(id);
         resolve({
           content: `antigravity: client disconnected while pi tool "${tool}" was pending.`,
           isError: true,

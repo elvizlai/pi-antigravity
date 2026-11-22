@@ -4,9 +4,11 @@ import type { AgyAcpConfigOption } from "./models.ts";
 import {
   killProcessTree,
   registerProcessGroupDeathHooks,
+  terminateProcessTree,
   trackProcessGroup,
   untrackProcessGroup,
 } from "./process-tree.ts";
+import { asRecord, makeAbortError } from "./shared.ts";
 
 export type AcpContentBlock =
   | { type: "text"; text: string }
@@ -57,6 +59,24 @@ export interface AcpPermissionRequest {
   options?: AcpPermissionOption[];
 }
 
+export interface AcpRpcCallOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}
+
+export class AcpRequestStallError extends Error {
+  readonly method: string;
+  readonly timeoutMs: number;
+
+  constructor(method: string, timeoutMs: number) {
+    const seconds = Math.max(1, Math.round(timeoutMs / 1000));
+    super(`antigravity: ACP ${method} did not respond within ${seconds}s`);
+    this.name = "AcpRequestStallError";
+    this.method = method;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
 export class MissingAgyConversationError extends Error {
   readonly requestedSessionId: string;
   readonly actualSessionId?: string;
@@ -89,6 +109,7 @@ export interface AgyAcpClientOptions {
       env: NodeJS.ProcessEnv;
       stdio: ["pipe", "pipe", "pipe"];
       detached: boolean;
+      windowsHide?: boolean;
     },
   ) => ChildProcessWithoutNullStreams;
   onPermissionRequest?: (
@@ -106,7 +127,7 @@ interface PendingRpc {
 const MAX_STDERR_BYTES = 8_192;
 const DEFAULT_CANCEL_GRACE_MS = 5_000;
 
-export function selectPermissionOptionId(
+function selectPermissionOptionId(
   options: readonly AcpPermissionOption[] | undefined,
 ): string | undefined {
   if (!options || options.length === 0) return undefined;
@@ -121,12 +142,6 @@ export function selectPermissionOptionId(
     pick((o) => o.kind === "allow_once" || o.optionId === "allow_once" || o.id === "allow_once") ??
     pick((o) => (o.kind ?? o.optionId ?? "").startsWith("allow"))
   );
-}
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
 }
 
 function formatRpcError(errObj: Record<string, unknown>, method: string): Error {
@@ -184,6 +199,7 @@ export class AgyAcpClient {
       env: options.env ? { ...process.env, ...options.env } : process.env,
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
+      windowsHide: true,
     });
     registerProcessGroupDeathHooks();
     trackProcessGroup(this.#child.pid);
@@ -252,21 +268,60 @@ export class AgyAcpClient {
     this.#child.stdin.write(`${JSON.stringify(payload)}\n`);
   }
 
-  #request<T>(method: string, params: Record<string, unknown>): Promise<T> {
+  #request<T>(
+    method: string,
+    params: Record<string, unknown>,
+    options?: AcpRpcCallOptions,
+  ): Promise<T> {
     if (!this.isAlive) {
       return Promise.reject(this.#exitError ?? new Error(`agy acp is closed (${method}).`));
     }
+    if (options?.signal?.aborted) {
+      return Promise.reject(makeAbortError(`Aborted before ACP ${method}.`));
+    }
     const id = this.#nextId++;
     return new Promise<T>((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const cleanup = () => {
+        if (timer) {
+          clearTimeout(timer);
+          timer = undefined;
+        }
+        options?.signal?.removeEventListener("abort", onAbort);
+      };
+      const onAbort = () => {
+        if (!this.#pending.delete(id)) return;
+        cleanup();
+        reject(makeAbortError(`ACP ${method} aborted.`));
+      };
+
+      if (typeof options?.timeoutMs === "number" && options.timeoutMs > 0) {
+        const timeoutMs = options.timeoutMs;
+        timer = setTimeout(() => {
+          if (!this.#pending.delete(id)) return;
+          cleanup();
+          reject(new AcpRequestStallError(method, timeoutMs));
+        }, timeoutMs);
+        timer.unref?.();
+      }
+      options?.signal?.addEventListener("abort", onAbort, { once: true });
+
       this.#pending.set(id, {
         method,
-        resolve: resolve as (value: unknown) => void,
-        reject,
+        resolve: (value) => {
+          cleanup();
+          resolve(value as T);
+        },
+        reject: (err) => {
+          cleanup();
+          reject(err);
+        },
       });
       try {
         this.#writeMessage({ jsonrpc: "2.0", id, method, params });
       } catch (err) {
         this.#pending.delete(id);
+        cleanup();
         reject(err instanceof Error ? err : new Error(String(err)));
       }
     });
@@ -386,34 +441,46 @@ export class AgyAcpClient {
     }
   }
 
-  async initialize(): Promise<AcpInitializeResult> {
-    return this.#request<AcpInitializeResult>("initialize", {
-      protocolVersion: 1,
-      clientCapabilities: {
-        fs: { readTextFile: false, writeTextFile: false },
-        terminal: false,
+  async initialize(options?: AcpRpcCallOptions): Promise<AcpInitializeResult> {
+    return this.#request<AcpInitializeResult>(
+      "initialize",
+      {
+        protocolVersion: 1,
+        clientCapabilities: {
+          fs: { readTextFile: false, writeTextFile: false },
+          terminal: false,
+        },
+        clientInfo: {
+          name: "@elvizlai/pi-antigravity",
+          version: "0.1.0",
+        },
       },
-      clientInfo: {
-        name: "@sdrzlyz/pi-antigravity",
-        version: "0.1.0",
-      },
-    });
+      options,
+    );
   }
 
   async newSession(options: {
     cwd: string;
     mcpServers?: readonly AcpHttpMcpServer[];
+    signal?: AbortSignal;
+    timeoutMs?: number;
   }): Promise<AcpSessionResult> {
-    return this.#request<AcpSessionResult>("session/new", {
-      cwd: options.cwd,
-      mcpServers: options.mcpServers ?? [],
-    });
+    return this.#request<AcpSessionResult>(
+      "session/new",
+      {
+        cwd: options.cwd,
+        mcpServers: options.mcpServers ?? [],
+      },
+      { signal: options.signal, timeoutMs: options.timeoutMs },
+    );
   }
 
   async resumeSession(options: {
     sessionId: string;
     cwd: string;
     mcpServers?: readonly AcpHttpMcpServer[];
+    signal?: AbortSignal;
+    timeoutMs?: number;
   }): Promise<AcpSessionResult> {
     const params: Record<string, unknown> = {
       sessionId: options.sessionId,
@@ -422,7 +489,10 @@ export class AgyAcpClient {
     };
     let result: AcpSessionResult;
     try {
-      result = await this.#request<AcpSessionResult>("session/resume", params);
+      result = await this.#request<AcpSessionResult>("session/resume", params, {
+        signal: options.signal,
+        timeoutMs: options.timeoutMs,
+      });
     } catch (err) {
       if (err instanceof Error && looksLikeMissingSessionError(err)) {
         throw new MissingAgyConversationError(options.sessionId);
@@ -442,12 +512,17 @@ export class AgyAcpClient {
     sessionId: string,
     configId: string,
     value: string,
+    options?: AcpRpcCallOptions,
   ): Promise<{ configOptions?: AgyAcpConfigOption[] }> {
-    return this.#request<{ configOptions?: AgyAcpConfigOption[] }>("session/set_config_option", {
-      sessionId,
-      configId,
-      value,
-    });
+    return this.#request<{ configOptions?: AgyAcpConfigOption[] }>(
+      "session/set_config_option",
+      {
+        sessionId,
+        configId,
+        value,
+      },
+      options,
+    );
   }
 
   cancelSession(sessionId: string): void {
@@ -455,9 +530,9 @@ export class AgyAcpClient {
     this.#notify("session/cancel", { sessionId });
   }
 
-  async closeSession(sessionId: string): Promise<void> {
+  async closeSession(sessionId: string, options?: AcpRpcCallOptions): Promise<void> {
     if (!this.isAlive) return;
-    await this.#request("session/close", { sessionId });
+    await this.#request("session/close", { sessionId }, options);
   }
 
   async prompt(
@@ -470,9 +545,7 @@ export class AgyAcpClient {
     },
   ): Promise<AcpPromptResult> {
     if (options?.signal?.aborted) {
-      const abort = new Error("Aborted before sending ACP prompt.");
-      abort.name = "AbortError";
-      throw abort;
+      throw makeAbortError("Aborted before sending ACP prompt.");
     }
 
     const listener = options?.onUpdate;
@@ -516,21 +589,28 @@ export class AgyAcpClient {
         prompt: blocks,
       });
       if (aborted || result.stopReason === "cancelled") {
-        const abort = new Error("Antigravity turn cancelled.");
-        abort.name = "AbortError";
-        throw abort;
+        throw makeAbortError("Antigravity turn cancelled.");
       }
       return result;
     } catch (err) {
       if (aborted) {
-        const abort = new Error("Antigravity turn aborted.");
-        abort.name = "AbortError";
-        throw abort;
+        throw makeAbortError("Antigravity turn aborted.");
       }
       throw err;
     } finally {
       cleanup();
     }
+  }
+
+  #waitForExitWithin(ms: number): Promise<boolean> {
+    if (this.#exited) return Promise.resolve(true);
+    return Promise.race([
+      this.#exitPromise.then(() => true),
+      new Promise<boolean>((resolve) => {
+        const t = setTimeout(() => resolve(false), ms);
+        t.unref?.();
+      }),
+    ]);
   }
 
   async dispose(graceMs = 400): Promise<void> {
@@ -544,22 +624,15 @@ export class AgyAcpClient {
     } catch {
       // Ignore already-ended stdin.
     }
-    const exitedEarly = await Promise.race([
-      this.#exitPromise.then(() => true),
-      new Promise<boolean>((resolve) => {
-        const t = setTimeout(() => resolve(false), graceMs);
-        t.unref?.();
-      }),
-    ]);
-    if (!exitedEarly && !this.#exited) {
+    const exitedOnEof = await this.#waitForExitWithin(graceMs);
+    if (!exitedOnEof && !this.#exited) {
+      if (terminateProcessTree(this.#child.pid)) {
+        await this.#waitForExitWithin(Math.max(20, Math.min(graceMs, 400)));
+      }
+    }
+    if (!this.#exited) {
       killProcessTree(this.#child.pid);
-      const exitedAfterKill = await Promise.race([
-        this.#exitPromise.then(() => true),
-        new Promise<boolean>((resolve) => {
-          const t = setTimeout(() => resolve(false), 200);
-          t.unref?.();
-        }),
-      ]);
+      const exitedAfterKill = await this.#waitForExitWithin(200);
       if (!exitedAfterKill && !this.#exited) {
         this.#child.stdin.destroy();
         this.#child.stdout.destroy();

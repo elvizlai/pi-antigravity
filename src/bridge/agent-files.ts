@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import type { PiToolInfo } from "./server.ts";
 
-export const PI_TOOLS_AGENT_DESCRIPTION =
+const PI_TOOLS_AGENT_DESCRIPTION =
   "Complete Pi requests using the current Pi session tools through its MCP bridge.";
 
 export const MCP_ADAPTER_UNSUPPORTED_WARNING =
@@ -13,7 +13,7 @@ export const MCP_ADAPTER_UNSUPPORTED_WARNING =
   'move your servers to ~/.pi/agent/mcp.json (or .pi/mcp.json) with "exposure": "direct", ' +
   "then run /reload.";
 
-export function piToolsAgentPrompt(serverName: string): string {
+function piToolsAgentPrompt(serverName: string): string {
   return [
     "# System Prompt",
     "You are the agent for the current Pi coding session. Complete the user request using Pi tools.",
@@ -136,4 +136,37 @@ export function hasUnsupportedMcpAdapter(
   return resources.some(({ sourceInfo }) =>
     [sourceInfo?.source, sourceInfo?.path].some((value) => MCP_ADAPTER_SOURCE.test(value ?? "")),
   );
+}
+
+export const HINDSIGHT_DISABLE_HOOKS_ENV = "HINDSIGHT_DISABLE_HOOKS";
+
+const HOST_HINDSIGHT_TOOL_NAMES = new Set([
+  "hindsight_search_pages",
+  "hindsight_reflect",
+  "hindsight_diagnose",
+]);
+
+/** True when the outer Pi host has already registered Hindsight memory tools. */
+export function hasHostHindsightTools(tools: readonly Pick<PiToolInfo, "name">[]): boolean {
+  return tools.some((tool) => HOST_HINDSIGHT_TOOL_NAMES.has(tool.name));
+}
+
+/**
+ * Suppress `agy`'s own Hindsight `PreInvocation`/`Stop` hooks when outer Pi already
+ * runs Hindsight, preventing duplicate prompt injection and double transcript retention.
+ */
+export function resolveAgyChildEnv(options: {
+  hostHindsightActive?: boolean;
+  env?: Record<string, string>;
+  ambientEnv?: NodeJS.ProcessEnv;
+}): Record<string, string> | undefined {
+  if (!options.hostHindsightActive) return options.env;
+  const ambient = options.ambientEnv ?? process.env;
+  if (
+    options.env?.[HINDSIGHT_DISABLE_HOOKS_ENV] !== undefined ||
+    ambient[HINDSIGHT_DISABLE_HOOKS_ENV] !== undefined
+  ) {
+    return options.env;
+  }
+  return { [HINDSIGHT_DISABLE_HOOKS_ENV]: "1", ...options.env };
 }

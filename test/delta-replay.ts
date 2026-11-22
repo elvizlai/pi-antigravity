@@ -27,7 +27,7 @@ type Block =
 /**
  * Rebuild message content from deltas only. Throws on any protocol violation.
  */
-export function replayDeltas(events: readonly any[]): Block[] {
+function replayDeltas(events: readonly any[]): Block[] {
   const content: Block[] = [];
 
   const claim = (index: number, block: Block, kind: string): void => {

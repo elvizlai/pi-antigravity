@@ -12,6 +12,7 @@ import {
   type Theme,
 } from "@earendil-works/pi-coding-agent";
 import type { AgyActivity } from "../acp/events.ts";
+import { asRecord, isAbortError } from "../acp/shared.ts";
 import { type AgyUsageReport, formatAgyUsageReport } from "../acp/usage.ts";
 
 const STANDARD_ACP_KINDS = new Set([
@@ -46,12 +47,6 @@ function shortenPath(filePath: string): string {
   const home = os.homedir();
   if (home && filePath.startsWith(home)) return `~${filePath.slice(home.length)}`;
   return filePath;
-}
-
-function asRecord(input: unknown): Record<string, unknown> {
-  return typeof input === "object" && input !== null && !Array.isArray(input)
-    ? (input as Record<string, unknown>)
-    : {};
 }
 
 function formatGenericArgs(input: Record<string, unknown>, theme: Theme): string {
@@ -116,7 +111,7 @@ export function formatAgyCall(call: AcpCallRenderInput, theme: Theme): string {
   if (locText) {
     parts.push(locText);
   } else if (!call.locations || call.locations.length === 0) {
-    const generic = formatGenericArgs(asRecord(call.input), theme);
+    const generic = formatGenericArgs(asRecord(call.input) ?? {}, theme);
     if (generic) parts.push(generic);
   }
 
@@ -208,10 +203,6 @@ const USAGE_REFRESH_ACTION = "Refresh";
 const USAGE_CLOSE_ACTION = "Close";
 
 type UsageLoaderResult = { ok: true; value: AgyUsageReport } | { ok: false; error: unknown } | null;
-
-function isAbortError(error: unknown): boolean {
-  return error instanceof Error && error.name === "AbortError";
-}
 
 async function loadQuotaWithOverlay(
   ctx: ExtensionCommandContext,

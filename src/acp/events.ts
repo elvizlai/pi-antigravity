@@ -1,4 +1,5 @@
 import type { JsonObject } from "@earendil-works/pi-ai";
+import { asRecord } from "./shared.ts";
 
 export type AcpToolLocation = {
   path: string;
@@ -28,6 +29,7 @@ export interface AgyToolView {
   output?: string;
   startedAtMs: number;
   startedEmitted: boolean;
+  deferredEmitted: boolean;
   finishedEmitted: boolean;
 }
 
@@ -75,12 +77,6 @@ export type AgyActivity =
       message: string;
       durationSeconds?: number;
     };
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
 
 function nonEmptyString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
@@ -185,7 +181,7 @@ function readDurationSeconds(startedAtMs: number, now: number): number | undefin
 }
 
 /** Merge a standard ACP `tool_call` or `tool_call_update` payload into the tracked map. */
-export function mergeAgyAcpTool(
+function mergeAgyAcpTool(
   tools: Map<string, AgyToolView>,
   update: Record<string, unknown>,
   now = Date.now(),
@@ -216,6 +212,7 @@ export function mergeAgyAcpTool(
     output,
     startedAtMs: existing?.startedAtMs ?? now,
     startedEmitted: existing?.startedEmitted ?? false,
+    deferredEmitted: existing?.deferredEmitted ?? false,
     finishedEmitted: existing?.finishedEmitted ?? false,
   };
   tools.set(toolCallId, view);
@@ -370,18 +367,4 @@ export function isBridgedMcpTool(
     }
   }
   return false;
-}
-
-/** Key identifying an ACP tool step in a turn. */
-export function agyToolStepKey(activity: { callId: string }): string {
-  return `call:${activity.callId}`;
-}
-
-/** Track active tool calls in the current turn by ACP `callId`. */
-export function trackActiveToolStep(active: Set<string>, activity: AgyActivity): void {
-  if (activity.type === "tool_start") {
-    active.add(agyToolStepKey(activity));
-  } else if (activity.type === "tool_done" || activity.type === "tool_error") {
-    active.delete(agyToolStepKey(activity));
-  }
 }

@@ -1,14 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  type AgyActivity,
   type AgyToolView,
   acpUpdateToActivity,
-  agyToolStepKey,
   extractAcpToolOutput,
   isBridgedMcpTool,
   normalizeAcpPromptUsage,
-  trackActiveToolStep,
 } from "../src/acp/events.ts";
 import {
   AgyQuotaTurnTracker,
@@ -128,25 +125,6 @@ test("normalizeAcpPromptUsage and isBridgedMcpTool work across standard ACP shap
   assert.equal(isBridgedMcpTool({ title: "Run command" }, "pi-1234"), false);
 });
 
-test("trackActiveToolStep tracks active ACP tool steps by callId", () => {
-  const active = new Set<string>();
-
-  const stepStart: AgyActivity = {
-    type: "tool_start",
-    callId: "c1",
-    title: "Run dev server",
-    kind: "execute",
-    rawInput: { command: "npm run dev" },
-  };
-  assert.equal(agyToolStepKey(stepStart), "call:c1");
-
-  trackActiveToolStep(active, stepStart);
-  assert.equal(active.has("call:c1"), true);
-
-  trackActiveToolStep(active, { type: "tool_done", callId: "c1", title: "Run dev server" });
-  assert.equal(active.size, 0);
-});
-
 test("quota detection catches fake end_turn quota banners while avoiding prose false positives", () => {
   const banner = parseAgyQuotaNotice(
     "⚠ Individual quota reached for gemini-pro. Resets in 2h 15m.",
@@ -159,15 +137,14 @@ test("quota detection catches fake end_turn quota banners while avoiding prose f
 
   const tracker = new AgyQuotaTurnTracker();
   tracker.noteText("⚠ Individual quota reached. Resets in 10m.");
-  assert.equal(
-    tracker.detectTurnQuotaExhaustion({ totalTokens: 0, outputTokens: 0 })?.resetsIn,
-    "10m",
-  );
+  const quotaNotice = tracker.detectTurnErrorBanner({ totalTokens: 0, outputTokens: 0 });
+  assert.equal(quotaNotice?.kind, "quota");
+  assert.equal(quotaNotice?.kind === "quota" ? quotaNotice.resetsIn : undefined, "10m");
 
   const realTurn = new AgyQuotaTurnTracker();
   realTurn.noteThought();
   realTurn.noteText("⚠ Individual quota reached is what agy prints.");
-  assert.equal(realTurn.detectTurnQuotaExhaustion({ totalTokens: 0, outputTokens: 0 }), undefined);
+  assert.equal(realTurn.detectTurnErrorBanner({ totalTokens: 0, outputTokens: 0 }), undefined);
 
   assert.equal(
     parseAgyErrorBanner("⚠ FAILED_PRECONDITION (code 400): User location is not supported.")?.kind,

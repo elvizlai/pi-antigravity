@@ -1,11 +1,7 @@
-import { spawn } from "node:child_process";
+import type { spawn } from "node:child_process";
 import { getAgyBinary } from "./binary.ts";
-import {
-  killProcessTree,
-  registerProcessGroupDeathHooks,
-  trackProcessGroup,
-  untrackProcessGroup,
-} from "./process-tree.ts";
+import { execAgyCommand } from "./process-tree.ts";
+import { asRecord } from "./shared.ts";
 
 /**
  * Neither ACP nor `agy` CLI subcommands expose a dedicated quota endpoint, so `/agy-usage`
@@ -13,7 +9,7 @@ import {
  * and reads the structured `command.data.groups` JSON envelope written to `stdout` (0 LLM tokens).
  */
 
-export const USAGE_TIMEOUT_MS = 30_000;
+const USAGE_TIMEOUT_MS = 30_000;
 
 const USAGE_MAX_BUFFER_BYTES = 1024 * 1024;
 const BAR_SEGMENTS = 20;
@@ -45,12 +41,6 @@ export interface FetchAgyUsageOptions {
   timeoutMs?: number;
   signal?: AbortSignal;
   spawnOverride?: typeof spawn;
-}
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
 }
 
 function asString(value: unknown): string | undefined {
@@ -249,102 +239,21 @@ export function buildAgyUsageArgs(timeoutMs = USAGE_TIMEOUT_MS): string[] {
   return ["--print", "/usage", "--output-format", "json", "--print-timeout", `${timeout}s`];
 }
 
-function makeAbortError(message = "Antigravity quota check aborted."): Error {
-  const err = new Error(message);
-  err.name = "AbortError";
-  return err;
-}
-
 /** Run `agy --print /usage --output-format json` and parse the structured quota report. */
 export async function fetchAgyUsage(options: FetchAgyUsageOptions = {}): Promise<AgyUsageReport> {
-  if (options.signal?.aborted) {
-    throw makeAbortError();
-  }
-
   const binary = options.binary ?? getAgyBinary();
   const timeoutMs = options.timeoutMs ?? USAGE_TIMEOUT_MS;
-  const doSpawn = options.spawnOverride ?? spawn;
-
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let out = "";
-    let errOut = "";
-
-    const child = doSpawn(binary, buildAgyUsageArgs(timeoutMs), {
-      env: process.env,
-      stdio: ["ignore", "pipe", "pipe"],
-      detached: process.platform !== "win32",
-      windowsHide: true,
-    });
-
-    registerProcessGroupDeathHooks();
-    trackProcessGroup(child.pid);
-
-    const cleanup = () => {
-      if (timer) {
-        clearTimeout(timer);
-        timer = undefined;
-      }
-      options.signal?.removeEventListener("abort", onAbort);
-      untrackProcessGroup(child.pid);
-    };
-
-    const fail = (err: Error) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      reject(err);
-    };
-
-    const onAbort = () => {
-      killProcessTree(child.pid);
-      fail(makeAbortError());
-    };
-
-    options.signal?.addEventListener("abort", onAbort, { once: true });
-
-    timer = setTimeout(() => {
-      killProcessTree(child.pid);
-      fail(new Error(`agy-usage: timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
-    timer.unref?.();
-
-    child.stdout?.setEncoding("utf8");
-    child.stdout?.on("data", (chunk: string) => {
-      out += chunk;
-      if (Buffer.byteLength(out, "utf-8") > USAGE_MAX_BUFFER_BYTES) {
-        killProcessTree(child.pid);
-        fail(new Error("agy-usage: stdout maxBuffer exceeded"));
-      }
-    });
-
-    child.stderr?.setEncoding("utf8");
-    child.stderr?.on("data", (chunk: string) => {
-      errOut = (errOut + chunk).slice(-8_192);
-    });
-
-    child.once("error", (error) => {
-      fail(error);
-    });
-
-    child.once("close", (code) => {
-      if (settled) return;
-      if (options.signal?.aborted) {
-        fail(makeAbortError());
-        return;
-      }
-      settled = true;
-      cleanup();
-      if (code !== 0) {
-        reject(new Error(errOut.trim() || `${binary} exited with code ${code ?? "signal"}`));
-        return;
-      }
-      try {
-        resolve(parseAgyUsageJson(out));
-      } catch (parseError) {
-        reject(parseError);
-      }
-    });
+  const res = await execAgyCommand(binary, buildAgyUsageArgs(timeoutMs), {
+    signal: options.signal,
+    timeoutMs,
+    maxBufferBytes: USAGE_MAX_BUFFER_BYTES,
+    spawnProcess: options.spawnOverride,
+    abortMessage: "Antigravity quota check aborted.",
+    timeoutMessage: `agy-usage: timed out after ${timeoutMs}ms`,
+    maxBufferMessage: "agy-usage: stdout maxBuffer exceeded",
   });
+  if (res.code !== 0) {
+    throw new Error(res.stderr.trim() || `${binary} exited with code ${res.code ?? "signal"}`);
+  }
+  return parseAgyUsageJson(res.stdout);
 }

@@ -18,6 +18,7 @@ import {
 } from "./src/acp/models.ts";
 import { type AgyUsageReport, fetchAgyUsage, formatAgyUsageShort } from "./src/acp/usage.ts";
 import {
+  hasHostHindsightTools,
   hasUnsupportedMcpAdapter,
   MCP_ADAPTER_UNSUPPORTED_WARNING,
   sweepDeadPiToolsAgents,
@@ -263,6 +264,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       bridgeToken,
       getToolMode: () => toolMode,
       getExecutionMode: () => executionMode,
+      isHostHindsightActive: () => hasHostHindsightTools(pi.getAllTools()),
       sandbox,
       extraDirs,
       firstResponseTimeoutMs: savedSettings.firstResponseTimeoutMs,
@@ -569,6 +571,9 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   const triggerBackgroundWarmup = (ctx: ExtensionContext) => {
     if (!ctx.hasUI || ctx.model?.provider !== PROVIDER_ID) return;
     void (async () => {
+      // Yield a microtask so other extensions' synchronous session_start hooks
+      // (e.g. Hindsight) finish registering tools before warmupClient reads them.
+      await Promise.resolve();
       if (toolMode === "pi") {
         await ensureBridgeStarted();
       }
