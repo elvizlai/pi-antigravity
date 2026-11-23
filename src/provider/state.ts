@@ -27,8 +27,15 @@ export interface SessionEntryLike {
   message?: { role?: string };
 }
 
+export type AgyBranchResolution =
+  | { status: "active"; state: AgyConversationState }
+  | { status: "reset" }
+  | { status: "invalidated" }
+  | { status: "none" };
+
 /** Entries after a marker that do not alter what the agy conversation holds. */
 const NON_CONTEXT_ENTRY_TYPES = new Set([
+  "session",
   "custom",
   "label",
   "session_info",
@@ -71,35 +78,84 @@ export function parseAgyStateEntry(data: unknown): AgyPersistedState | undefined
   };
 }
 
+function hasAdvancedConversationTurn(
+  allEntries: readonly SessionEntryLike[],
+  sessionId: string,
+  conversationId: string,
+  turns: number,
+): boolean {
+  for (const entry of allEntries) {
+    if (entry.type !== "custom" || entry.customType !== AGY_STATE_ENTRY_TYPE) continue;
+    const state = parseAgyStateEntry(entry.data);
+    if (
+      state?.kind === "conversation" &&
+      state.sessionId === sessionId &&
+      state.conversationId === conversationId &&
+      state.turns > turns
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
- * Find the active agy conversation owned by the current Pi session branch.
+ * Resolve the ACP conversation state for the current Pi session branch.
  *
- * Forked sessions get a new `sessionId`, and tree rewinds/compactions add
- * context-mutating entries after our state marker; either invalidates resume
- * using pure session branch state (no internal agy DB inspection).
+ * Forked sessions get a new `sessionId`, tree rewinds/compactions add
+ * context-mutating entries or rewind past an already-advanced ACP turn,
+ * and `/agy-reset` appends an explicit `reset` marker.
  */
-export function findActiveAgyConversation(
+export function resolveAgyBranchState(
   sessionId: string,
   cwd: string,
   branchEntries: readonly SessionEntryLike[],
-): AgyConversationState | undefined {
+  allEntries?: readonly SessionEntryLike[],
+): AgyBranchResolution {
   for (let i = branchEntries.length - 1; i >= 0; i -= 1) {
     const entry = branchEntries[i];
     if (entry.type === "custom" && entry.customType === AGY_STATE_ENTRY_TYPE) {
       const state = parseAgyStateEntry(entry.data);
       if (!state) continue;
-      if (state.sessionId !== sessionId || state.cwd !== cwd) return undefined;
-      return state.kind === "conversation" ? state : undefined;
+      if (state.sessionId !== sessionId || state.cwd !== cwd) {
+        return { status: "invalidated" };
+      }
+      if (state.kind === "reset") {
+        return { status: "reset" };
+      }
+      if (
+        allEntries &&
+        hasAdvancedConversationTurn(allEntries, sessionId, state.conversationId, state.turns)
+      ) {
+        return { status: "invalidated" };
+      }
+      return { status: "active", state };
     }
 
+    if (entry.type === "custom_message") continue;
     if (entry.type === "message") {
       const role = entry.message?.role;
-      if (role === "custom" || role === "system" || role === "user") continue;
-      return undefined;
+      if (role === "custom" || role === "system" || role === "user" || role === "bashExecution") {
+        continue;
+      }
+      return { status: "invalidated" };
     }
     if (!NON_CONTEXT_ENTRY_TYPES.has(entry.type)) {
-      return undefined;
+      return { status: "invalidated" };
     }
   }
-  return undefined;
+  return { status: "none" };
+}
+
+/**
+ * Find the active agy conversation owned by the current Pi session branch.
+ */
+export function findActiveAgyConversation(
+  sessionId: string,
+  cwd: string,
+  branchEntries: readonly SessionEntryLike[],
+  allEntries?: readonly SessionEntryLike[],
+): AgyConversationState | undefined {
+  const resolved = resolveAgyBranchState(sessionId, cwd, branchEntries, allEntries);
+  return resolved.status === "active" ? resolved.state : undefined;
 }

@@ -25,6 +25,15 @@ export const BACKGROUND_ACP_TOOL_MESSAGE = "Started and continuing in the backgr
 
 /** Maximum UTF-8 byte budget allocated to text blocks in a single `session/prompt`. */
 const MAX_AGY_PROMPT_BYTES = 185_000;
+const SEEDED_TOOL_RESULT_MAX_CHARS = 2_000;
+const SEEDED_TOOL_ARGS_MAX_CHARS = 500;
+const COMPACTION_CHECKPOINT_PREFIX =
+  "The conversation history before this point was compacted into the following summary:";
+const BRANCH_CHECKPOINT_PREFIX =
+  "The following is a summary of a branch that this conversation came back from:";
+const SEEDED_HISTORY_HEADER =
+  "The following <conversation_history> is the prior context of this Pi session. Use it as background context and respond to the user message that follows it.\n\n<conversation_history>\n";
+const SEEDED_HISTORY_FOOTER = "\n</conversation_history>";
 
 const OMITTED_SYSTEM_SECTIONS = new Set(["preamble", "tools", "rules", "docs", "skills", "cwd"]);
 
@@ -142,6 +151,246 @@ export function extractTrailingUserPrompt(
   const maxBytes = options?.maxBytes ?? MAX_AGY_PROMPT_BYTES;
   const joined = textParts.join("\n\n");
   const boundedText = joined ? truncateUtf8Tail(joined, maxBytes) : "";
+
+  const result: AcpContentBlock[] = [];
+  if (boundedText) {
+    result.push({ type: "text", text: boundedText });
+  }
+  result.push(...imageBlocks);
+  return result;
+}
+
+function truncateHeadChars(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars)}\n...[truncated]`;
+}
+
+function extractUserMessageTextAndImages(
+  msg: Extract<TranscriptContext["messages"][number], { role: "user" }>,
+): { text: string; imageCount: number } {
+  if (typeof msg.content === "string") {
+    return { text: msg.content.trim(), imageCount: 0 };
+  }
+  const textParts: string[] = [];
+  let imageCount = 0;
+  for (const part of msg.content) {
+    if (part.type === "text") {
+      if (part.text.trim()) textParts.push(part.text);
+    } else if (part.type === "image") {
+      imageCount += 1;
+    }
+  }
+  return { text: textParts.join("\n\n").trim(), imageCount };
+}
+
+function serializePriorMessage(msg: TranscriptContext["messages"][number]): string[] {
+  if (msg.role === "user") {
+    const { text, imageCount } = extractUserMessageTextAndImages(msg);
+    const parts = [text, imageCount > 0 ? `[${imageCount} image(s) in prior turn]` : ""]
+      .filter(Boolean)
+      .join("\n\n");
+    return parts ? [`[User]:\n${parts}`] : [];
+  }
+
+  if (msg.role === "assistant") {
+    const hasTextOrTool = msg.content.some(
+      (b) => (b.type === "text" && b.text.trim().length > 0) || b.type === "toolCall",
+    );
+    if (msg.stopReason === "aborted" || (msg.stopReason === "error" && !hasTextOrTool)) {
+      return [];
+    }
+    const items: string[] = [];
+    const textParts: string[] = [];
+    const toolCalls: string[] = [];
+    for (const block of msg.content) {
+      if (block.type === "text" && block.text.trim()) {
+        textParts.push(block.text);
+      } else if (block.type === "toolCall") {
+        let serializedArgs = "{}";
+        try {
+          serializedArgs = JSON.stringify(block.arguments ?? {});
+        } catch {
+          serializedArgs = "{}";
+        }
+        toolCalls.push(
+          `${block.name}(${truncateHeadChars(serializedArgs, SEEDED_TOOL_ARGS_MAX_CHARS)})`,
+        );
+      }
+    }
+    if (textParts.length > 0) {
+      items.push(`[Assistant]:\n${textParts.join("\n\n")}`);
+    }
+    if (toolCalls.length > 0) {
+      items.push(`[Assistant tool calls]: ${toolCalls.join("; ")}`);
+    }
+    return items;
+  }
+
+  if (msg.role === "toolResult") {
+    const textParts: string[] = [];
+    let imageCount = 0;
+    for (const part of msg.content) {
+      if (part.type === "text" && part.text.trim()) {
+        textParts.push(part.text);
+      } else if (part.type === "image") {
+        imageCount += 1;
+      }
+    }
+    const body = [
+      textParts.join("\n"),
+      imageCount > 0 ? `[${imageCount} image(s) in prior tool result]` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+    if (!body) return [];
+    const bounded = truncateHeadChars(body, SEEDED_TOOL_RESULT_MAX_CHARS);
+    const status = msg.isError ? ", error" : "";
+    return [`[Tool result (${msg.toolName}${status})]:\n${bounded}`];
+  }
+
+  return [];
+}
+
+/**
+ * Build an ACP `session/prompt` payload for a fresh ACP session that must inherit
+ * prior projected transcript context (e.g., after `/compact`, `/fork`, `/tree`, or
+ * cross-provider switch), keeping the live trailing user prompt and images intact.
+ */
+export function buildSeededSessionPrompt(
+  messages: TranscriptContext["messages"],
+  options?: { maxBytes?: number; allowImages?: boolean; customSystemContext?: string },
+): AcpContentBlock[] {
+  let trailingStart = messages.length;
+  const trailingUsers: Extract<TranscriptContext["messages"][number], { role: "user" }>[] = [];
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const msg = messages[i];
+    if (msg.role === "system") continue;
+    if (msg.role !== "user") break;
+    trailingUsers.unshift(msg);
+    trailingStart = i;
+  }
+
+  const priorMessages = messages.slice(0, trailingStart).filter((msg) => msg.role !== "system");
+  if (priorMessages.length === 0) {
+    return extractTrailingUserPrompt(messages, options);
+  }
+
+  let checkpointSummary: string | undefined;
+  let historyStart = 0;
+  const firstPrior = priorMessages[0];
+  if (firstPrior?.role === "user") {
+    const { text } = extractUserMessageTextAndImages(firstPrior);
+    if (
+      text.startsWith(COMPACTION_CHECKPOINT_PREFIX) ||
+      text.startsWith(BRANCH_CHECKPOINT_PREFIX)
+    ) {
+      checkpointSummary = text;
+      historyStart = 1;
+    }
+  }
+
+  const historyItems: string[] = [];
+  for (let i = historyStart; i < priorMessages.length; i += 1) {
+    historyItems.push(...serializePriorMessage(priorMessages[i]));
+  }
+
+  if (!checkpointSummary && historyItems.length === 0) {
+    return extractTrailingUserPrompt(messages, options);
+  }
+
+  const liveParts: string[] = [];
+  const imageBlocks: AcpContentBlock[] = [];
+  let omittedImages = 0;
+  const allowImages = options?.allowImages ?? true;
+  for (const msg of trailingUsers) {
+    if (typeof msg.content === "string") {
+      if (msg.content.trim()) liveParts.push(msg.content);
+      continue;
+    }
+    for (const part of msg.content) {
+      if (part.type === "text") {
+        if (part.text.trim()) liveParts.push(part.text);
+      } else if (part.type === "image") {
+        if (allowImages) {
+          imageBlocks.push({ type: "image", data: part.data, mimeType: part.mimeType });
+        } else {
+          omittedImages += 1;
+        }
+      }
+    }
+  }
+  if (omittedImages > 0) {
+    liveParts.push(omittedImagesPrompt(omittedImages));
+  }
+
+  const customSys = options?.customSystemContext?.trim();
+  const liveText = liveParts.join("\n\n");
+  const maxBytes = options?.maxBytes ?? MAX_AGY_PROMPT_BYTES;
+
+  const fixedSegments = [customSys, liveText].filter((s): s is string => Boolean(s));
+  const fixedBytes =
+    Buffer.byteLength(fixedSegments.join("\n\n"), "utf8") + (fixedSegments.length > 0 ? 4 : 0);
+  const wrapperBytes = Buffer.byteLength(
+    `${SEEDED_HISTORY_HEADER}${SEEDED_HISTORY_FOOTER}`,
+    "utf8",
+  );
+  const historyBudget = maxBytes - fixedBytes - wrapperBytes;
+  if (historyBudget <= 64) {
+    return extractTrailingUserPrompt(messages, options);
+  }
+
+  let remainingBudget = historyBudget;
+  let boundedCheckpoint: string | undefined;
+  if (checkpointSummary) {
+    const checkpointLimit =
+      historyItems.length > 0 ? Math.max(64, Math.floor(historyBudget * 0.6)) : historyBudget;
+    boundedCheckpoint = truncateUtf8Tail(checkpointSummary, checkpointLimit);
+    remainingBudget -=
+      Buffer.byteLength(boundedCheckpoint, "utf8") + (historyItems.length > 0 ? 2 : 0);
+  }
+
+  const keptHistory: string[] = [];
+  let omittedHistory = false;
+  const omissionMarker = "[...earlier turns omitted...]";
+  const omissionBytes = Buffer.byteLength(omissionMarker, "utf8") + 2;
+
+  for (let i = historyItems.length - 1; i >= 0; i -= 1) {
+    const item = historyItems[i];
+    const itemBytes = Buffer.byteLength(item, "utf8") + (keptHistory.length > 0 ? 2 : 0);
+    const reserveOmission = i > 0 ? omissionBytes : 0;
+    if (itemBytes + reserveOmission <= remainingBudget) {
+      keptHistory.unshift(item);
+      remainingBudget -= itemBytes;
+    } else {
+      omittedHistory = true;
+      break;
+    }
+  }
+
+  if (
+    omittedHistory &&
+    keptHistory.length === 0 &&
+    !boundedCheckpoint &&
+    remainingBudget > omissionBytes + 32
+  ) {
+    const lastItem = historyItems.at(-1);
+    if (lastItem) {
+      keptHistory.push(truncateUtf8Tail(lastItem, remainingBudget - omissionBytes));
+    }
+  }
+
+  const historySections: string[] = [];
+  if (boundedCheckpoint) historySections.push(boundedCheckpoint);
+  if (omittedHistory) historySections.push(omissionMarker);
+  historySections.push(...keptHistory);
+
+  if (historySections.length === 0) {
+    return extractTrailingUserPrompt(messages, options);
+  }
+
+  const historyBlock = `${SEEDED_HISTORY_HEADER}${historySections.join("\n\n")}${SEEDED_HISTORY_FOOTER}`;
+  const assembled = [customSys, historyBlock, liveText].filter(Boolean).join("\n\n");
+  const boundedText = truncateUtf8Tail(assembled, maxBytes);
 
   const result: AcpContentBlock[] = [];
   if (boundedText) {

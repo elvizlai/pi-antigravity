@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import {
   createPiToolsAgent,
+  createToollessAgent,
   hasUnsupportedMcpAdapter,
   sweepDeadPiToolsAgents,
 } from "../src/bridge/agent-files.ts";
@@ -199,13 +200,30 @@ test("pi-tools agent files, adapter guard, and dead agent sweeping stay clean", 
     fs.mkdirSync(deadAgent, { recursive: true });
     fs.writeFileSync(path.join(deadAgent, "agent.md"), "stale");
 
+    const ephemeralAgent = createToollessAgent({ agentsDir });
+    await ephemeralAgent.write();
+    const ephemeralContent = fs.readFileSync(ephemeralAgent.agentFile, "utf-8");
+    const ephMatch = /^---\n([\s\S]*?)\n---/.exec(ephemeralContent);
+    assert.ok(ephMatch);
+    const ephFrontmatter = JSON.parse(ephMatch[1]) as Record<string, unknown>;
+    assert.deepEqual(ephFrontmatter.tools, []);
+    assert.equal(ephemeralContent.includes("MCP server"), false);
+    assert.match(ephemeralContent, /Do not attempt to invoke tools/);
+
+    const deadEphemeralAgent = path.join(agentsDir, "pi-ephemeral-999999-22222222");
+    fs.mkdirSync(deadEphemeralAgent, { recursive: true });
+    fs.writeFileSync(path.join(deadEphemeralAgent, "agent.md"), "stale");
+
     await sweepDeadPiToolsAgents({
       agentsRoot: agentsDir,
       isPidDead: (pid) => pid === 999999,
     });
     assert.equal(fs.existsSync(deadAgent), false);
+    assert.equal(fs.existsSync(deadEphemeralAgent), false);
     assert.equal(fs.existsSync(liveAgent.agentDir), true);
+    assert.equal(fs.existsSync(ephemeralAgent.agentDir), true);
     await liveAgent.remove();
+    await ephemeralAgent.remove();
 
     assert.equal(
       hasUnsupportedMcpAdapter([{ sourceInfo: { source: "npm:pi-mcp-adapter" } }]),

@@ -326,6 +326,8 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       getRuntime,
       getSessionId: () => activeCtx?.sessionManager.getSessionId() ?? "default",
       getBranchEntries: () => activeCtx?.sessionManager.getBranch() ?? [],
+      getAllEntries: () => activeCtx?.sessionManager.getEntries?.() ?? [],
+      requireMatchingSessionId: () => activeCtx !== undefined,
       getExecutionMode: () => executionMode,
       replayStore,
     }),
@@ -624,6 +626,13 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     updateStatus(ctx);
   });
 
+  pi.on("session_compact", async (_event, ctx) => {
+    activeCtx = ctx;
+    pendingState = undefined;
+    await runtime?.invalidateConversation();
+    updateStatus(ctx);
+  });
+
   pi.on("before_agent_start", async (event, ctx) => {
     applyCliFlagsOnce();
     activeCtx = ctx;
@@ -667,6 +676,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         executionMode,
         sessionId: ctx.sessionManager.getSessionId(),
         branchEntries: ctx.sessionManager.getBranch(),
+        allEntries: ctx.sessionManager.getEntries?.() ?? [],
         signal: ctx.signal,
       })
       .catch(() => {

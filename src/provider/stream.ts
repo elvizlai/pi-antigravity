@@ -18,7 +18,11 @@ import type { AgyUsage } from "../acp/events.ts";
 import type { AgyExecutionMode } from "../acp/models.ts";
 import { isAbortError } from "../acp/shared.ts";
 import { WRAPPER_TOOL_NAME } from "../bridge/server.ts";
-import { extractSystemPromptAppend, extractTrailingUserPrompt } from "./prompt.ts";
+import {
+  buildSeededSessionPrompt,
+  extractSystemPromptAppend,
+  extractTrailingUserPrompt,
+} from "./prompt.ts";
 import type { AgyRuntime } from "./runtime.ts";
 import type { SessionEntryLike } from "./state.ts";
 import type { AgyReplayStore } from "./turn.ts";
@@ -35,6 +39,8 @@ export interface AgyStreamDeps {
   getRuntime: () => AgyRuntime;
   getSessionId: () => string;
   getBranchEntries: () => readonly SessionEntryLike[];
+  getAllEntries?: () => readonly SessionEntryLike[];
+  requireMatchingSessionId?: () => boolean;
   getExecutionMode?: () => AgyExecutionMode;
   replayStore: AgyReplayStore;
   now?: () => number;
@@ -195,11 +201,22 @@ export function createAntigravityStreamSimple(
         stream.push({ type: "start", partial });
 
         const allowImages = model.input.includes("image");
+        const mainSessionId = deps.getSessionId();
+        const isEphemeral =
+          options?.disableContinuation === true ||
+          options?.cacheRetention === "none" ||
+          options?.toolChoice === "none" ||
+          (options?.sessionId !== undefined
+            ? options.sessionId !== mainSessionId
+            : Boolean(deps.requireMatchingSessionId?.()));
+
         const initialPayload: AgyStreamPayload = {
           modelId: model.id,
           effort: options?.reasoning,
-          executionMode: deps.getExecutionMode?.(),
-          prompt: extractTrailingUserPrompt(context.messages, { allowImages }),
+          executionMode: isEphemeral ? "default" : deps.getExecutionMode?.(),
+          prompt: isEphemeral
+            ? buildSeededSessionPrompt(context.messages, { allowImages })
+            : extractTrailingUserPrompt(context.messages, { allowImages }),
           systemPromptAppend: extractSystemPromptAppend(context.messages),
         };
 
@@ -220,22 +237,35 @@ export function createAntigravityStreamSimple(
             };
           }
         }
+        const promptReplaced = payload.prompt !== initialPayload.prompt;
 
-        const turn = await deps.getRuntime().startOrContinueTurn({
-          modelId: payload.modelId,
-          effort: payload.effort,
-          executionMode: payload.executionMode,
-          prompt: payload.prompt,
-          allowImages,
-          systemPromptAppend: payload.systemPromptAppend,
-          messages: context.messages,
-          sessionId: deps.getSessionId(),
-          branchEntries: deps.getBranchEntries(),
-          env: options?.env,
-          timeoutMs: options?.timeoutMs,
-          signal: options?.signal,
-          replayStore: deps.replayStore,
-        });
+        const turn = isEphemeral
+          ? await deps.getRuntime().startEphemeralTurn({
+              modelId: payload.modelId,
+              effort: payload.effort,
+              prompt: payload.prompt,
+              systemPromptAppend: payload.systemPromptAppend,
+              env: options?.env,
+              timeoutMs: options?.timeoutMs,
+              signal: options?.signal,
+            })
+          : await deps.getRuntime().startOrContinueTurn({
+              modelId: payload.modelId,
+              effort: payload.effort,
+              executionMode: payload.executionMode,
+              prompt: payload.prompt,
+              promptReplaced,
+              allowImages,
+              systemPromptAppend: payload.systemPromptAppend,
+              messages: context.messages,
+              sessionId: mainSessionId,
+              branchEntries: deps.getBranchEntries(),
+              allEntries: deps.getAllEntries?.(),
+              env: options?.env,
+              timeoutMs: options?.timeoutMs,
+              signal: options?.signal,
+              replayStore: deps.replayStore,
+            });
 
         if (options?.signal) {
           const onAbort = () => turn.signalTurnAbort();

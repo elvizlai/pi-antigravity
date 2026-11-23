@@ -2851,3 +2851,404 @@ test("text-only model omits bridged tool images over MCP without cancelling the 
     fs.rmSync(agentsDir, { recursive: true, force: true });
   }
 });
+
+test("compaction isolates summarization on ephemeral clients and resets main ACP session with seeded history", async () => {
+  const agentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-compact-agents-"));
+  const persisted: AgyConversationState[] = [];
+  const mainSessionPrompts: Array<{ sessionId: string; text: string }> = [];
+  const ephemeralClients: Array<{
+    agentName?: string;
+    mcpServersCount: number;
+    closed: boolean;
+    disposed: boolean;
+    promptText: string;
+  }> = [];
+  const closedMainSessions: string[] = [];
+  let mainSeq = 0;
+
+  const runtime = new AgyRuntime({
+    cwd: "/work",
+    agentsDir,
+    getToolMode: () => "native",
+    checkBinary: async () => ({ binary: "agy", version: "1.5.14" }),
+    onPersistedState: (s) => persisted.push(s),
+    createClient: (opts) => {
+      const isEphemeral = (opts.agentName ?? "").startsWith("pi-ephemeral-");
+      if (isEphemeral) {
+        const record = {
+          agentName: opts.agentName,
+          mcpServersCount: -1,
+          closed: false,
+          disposed: false,
+          promptText: "",
+        };
+        ephemeralClients.push(record);
+        let alive = true;
+        return {
+          get isAlive() {
+            return alive;
+          },
+          async initialize() {
+            return { protocolVersion: 1 };
+          },
+          async newSession(newOpts) {
+            record.mcpServersCount = newOpts.mcpServers?.length ?? 0;
+            return { sessionId: `eph-${ephemeralClients.length}` };
+          },
+          async resumeSession() {
+            throw new Error("ephemeral client must not resume");
+          },
+          async setConfigOption() {
+            return {};
+          },
+          cancelSession() {},
+          async closeSession() {
+            record.closed = true;
+          },
+          async prompt(_sid, blocks, promptOpts) {
+            record.promptText = blocks.map((b) => (b.type === "text" ? b.text : "")).join("\n");
+            promptOpts?.onUpdate?.({
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "## Goal\nCompacted summary" },
+            });
+            return {
+              stopReason: "end_turn",
+              usage: { inputTokens: 1200, outputTokens: 200, totalTokens: 1400 },
+            };
+          },
+          async dispose() {
+            alive = false;
+            record.disposed = true;
+          },
+        };
+      }
+
+      let alive = true;
+      return {
+        get isAlive() {
+          return alive;
+        },
+        async initialize() {
+          return { protocolVersion: 1 };
+        },
+        async newSession() {
+          mainSeq += 1;
+          return { sessionId: `acp-main-${mainSeq}` };
+        },
+        async resumeSession(rOpts) {
+          return { sessionId: rOpts.sessionId };
+        },
+        async setConfigOption() {
+          return {};
+        },
+        cancelSession() {},
+        async closeSession(sid) {
+          closedMainSessions.push(sid);
+        },
+        async prompt(sid, blocks, promptOpts) {
+          const text = blocks.map((b) => (b.type === "text" ? b.text : "")).join("\n");
+          mainSessionPrompts.push({ sessionId: sid, text });
+          const used = sid === "acp-main-1" ? 415_160 : 24_800;
+          promptOpts?.onUpdate?.({
+            sessionUpdate: "usage_update",
+            used,
+            size: 1_048_576,
+          });
+          promptOpts?.onUpdate?.({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: `reply from ${sid}` },
+          });
+          return {
+            stopReason: "end_turn",
+            usage: { inputTokens: used - 100, outputTokens: 100, totalTokens: used },
+          };
+        },
+        async dispose() {
+          alive = false;
+        },
+      };
+    },
+  });
+
+  const branchEntries: Array<Record<string, unknown>> = [];
+  const streamSimple = createAntigravityStreamSimple({
+    getRuntime: () => runtime,
+    getSessionId: () => "pi-01a2069c",
+    getBranchEntries: () => branchEntries as never,
+    getAllEntries: () => branchEntries as never,
+    requireMatchingSessionId: () => true,
+    replayStore: new AgyReplayStore(),
+  });
+
+  try {
+    // Turn 1 on main session acp-main-1 -> 415_160 tokens.
+    const t1 = await streamSimple(
+      testModel(),
+      makeTranscript([{ role: "user", content: "initial task", timestamp: 1 }]),
+      { sessionId: "pi-01a2069c" },
+    ).result();
+    assert.equal(t1.usage.totalTokens, 415_160);
+    assert.equal(persisted.length, 1);
+    assert.equal(persisted[0]?.conversationId, "acp-main-1");
+    branchEntries.push({
+      type: "custom",
+      customType: AGY_STATE_ENTRY_TYPE,
+      data: persisted[0],
+    });
+
+    // Compaction summarization calls (cacheRetention: "none", fresh sessionId) must run isolated.
+    const c1 = await streamSimple(
+      testModel(),
+      makeTranscript([{ role: "user", content: "summarize history", timestamp: 2 }]),
+      { cacheRetention: "none", sessionId: "compact-1" },
+    ).result();
+    const c2 = await streamSimple(
+      testModel(),
+      makeTranscript([{ role: "user", content: "summarize prefix", timestamp: 3 }]),
+      { cacheRetention: "none", sessionId: "compact-2" },
+    ).result();
+    assert.equal(c1.stopReason, "stop");
+    assert.equal(c2.stopReason, "stop");
+    assert.equal(ephemeralClients.length, 2);
+    assert.deepEqual(
+      ephemeralClients.map((c) => ({
+        mcp: c.mcpServersCount,
+        closed: c.closed,
+        disposed: c.disposed,
+      })),
+      [
+        { mcp: 0, closed: true, disposed: true },
+        { mcp: 0, closed: true, disposed: true },
+      ],
+    );
+    // Main session acp-main-1 was never polluted and persisted state stayed at 1.
+    assert.equal(mainSessionPrompts.length, 1);
+    assert.equal(persisted.length, 1);
+
+    // Append compaction entry (without calling session_compact hook to verify runtime branch check).
+    branchEntries.push({ type: "compaction", summary: "Compacted summary" });
+
+    // Warmup + Turn 2 after compaction must close acp-main-1, open acp-main-2, seed summary+kept, and report 24_800!
+    await runtime.warmupSession({
+      modelId: "gemini-4-hydrogen",
+      sessionId: "pi-01a2069c",
+      branchEntries: branchEntries as never,
+      allEntries: branchEntries as never,
+    });
+    assert.deepEqual(closedMainSessions, ["acp-main-1"]);
+
+    const t2 = await streamSimple(
+      testModel(),
+      makeTranscript([
+        { role: "system", content: "base", timestamp: 0 },
+        {
+          role: "user",
+          content:
+            "The conversation history before this point was compacted into the following summary:\n\n<summary>\nGoal: fix video pipeline\n</summary>",
+          timestamp: 1,
+        },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "Kept reply before compact" }],
+          api: "antigravity-acp",
+          provider: "antigravity",
+          model: "gemini-4-hydrogen",
+          usage: {} as never,
+          stopReason: "stop",
+          timestamp: 2,
+        },
+        { role: "user", content: "continue after compact", timestamp: 3 },
+      ]),
+      { sessionId: "pi-01a2069c" },
+    ).result();
+
+    assert.equal(t2.usage.totalTokens, 24_800);
+    assert.equal(mainSessionPrompts.length, 2);
+    assert.equal(mainSessionPrompts[1]?.sessionId, "acp-main-2");
+    assert.match(mainSessionPrompts[1]?.text ?? "", /<conversation_history>/);
+    assert.match(mainSessionPrompts[1]?.text ?? "", /Goal: fix video pipeline/);
+    assert.match(mainSessionPrompts[1]?.text ?? "", /Kept reply before compact/);
+    assert.match(mainSessionPrompts[1]?.text ?? "", /continue after compact$/);
+    assert.equal(persisted[1]?.conversationId, "acp-main-2");
+    assert.equal(persisted[1]?.turns, 1);
+  } finally {
+    await runtime.dispose();
+    fs.rmSync(agentsDir, { recursive: true, force: true });
+  }
+});
+
+test("side-thread isolation, /agy-reset skip-seed, and /tree rewind invalidation behave cleanly", async () => {
+  const agentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-iso-agents-"));
+  const mainPrompts: Array<{ sessionId: string; text: string }> = [];
+  const ephemeralPrompts: string[] = [];
+  const persisted: AgyConversationState[] = [];
+  let mainSeq = 0;
+
+  const runtime = new AgyRuntime({
+    cwd: "/work",
+    agentsDir,
+    getToolMode: () => "native",
+    checkBinary: async () => ({ binary: "agy", version: "1.5.14" }),
+    onPersistedState: (s) => persisted.push(s),
+    createClient: (opts) => {
+      const isEphemeral = (opts.agentName ?? "").startsWith("pi-ephemeral-");
+      let alive = true;
+      return {
+        get isAlive() {
+          return alive;
+        },
+        async initialize() {
+          return { protocolVersion: 1 };
+        },
+        async newSession() {
+          if (isEphemeral) return { sessionId: `eph-${ephemeralPrompts.length + 1}` };
+          mainSeq += 1;
+          return { sessionId: `main-${mainSeq}` };
+        },
+        async resumeSession(rOpts) {
+          return { sessionId: rOpts.sessionId };
+        },
+        async setConfigOption() {
+          return {};
+        },
+        cancelSession() {},
+        async closeSession() {},
+        async prompt(sid, blocks, promptOpts) {
+          const text = blocks.map((b) => (b.type === "text" ? b.text : "")).join("\n");
+          if (isEphemeral) {
+            ephemeralPrompts.push(text);
+          } else {
+            mainPrompts.push({ sessionId: sid, text });
+          }
+          promptOpts?.onUpdate?.({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "ok" },
+          });
+          return { stopReason: "end_turn", usage: { totalTokens: 100 } };
+        },
+        async dispose() {
+          alive = false;
+        },
+      };
+    },
+  });
+
+  let branchEntries: Array<Record<string, unknown>> = [];
+  let allEntries: Array<Record<string, unknown>> = [];
+  const streamSimple = createAntigravityStreamSimple({
+    getRuntime: () => runtime,
+    getSessionId: () => "pi-main",
+    getBranchEntries: () => branchEntries as never,
+    getAllEntries: () => allEntries as never,
+    requireMatchingSessionId: () => true,
+    replayStore: new AgyReplayStore(),
+  });
+
+  try {
+    // 1. Side threads (different sessionId, disableContinuation, or missing sessionId) route ephemerally.
+    await streamSimple(
+      testModel(),
+      makeTranscript([{ role: "user", content: "btw question", timestamp: 1 }]),
+      { sessionId: "pi-btw-1" },
+    ).result();
+    await streamSimple(
+      testModel(),
+      makeTranscript([{ role: "user", content: "cache warm", timestamp: 2 }]),
+      { sessionId: "pi-main", disableContinuation: true },
+    ).result();
+    await streamSimple(
+      testModel(),
+      makeTranscript([{ role: "user", content: "missing sessionId", timestamp: 3 }]),
+    ).result();
+    assert.equal(ephemeralPrompts.length, 3);
+    assert.equal(mainPrompts.length, 0);
+
+    // 2. /agy-reset starts a fresh main session WITHOUT seeding prior history.
+    branchEntries = [
+      {
+        type: "custom",
+        customType: AGY_STATE_ENTRY_TYPE,
+        data: {
+          version: 1,
+          kind: "reset",
+          sessionId: "pi-main",
+          cwd: "/work",
+        },
+      },
+    ];
+    allEntries = [...branchEntries];
+    await streamSimple(
+      testModel(),
+      makeTranscript([
+        { role: "user", content: "old turn", timestamp: 1 },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "old reply" }],
+          api: "antigravity-acp",
+          provider: "antigravity",
+          model: "gemini-4-hydrogen",
+          usage: {} as never,
+          stopReason: "stop",
+          timestamp: 2,
+        },
+        { role: "user", content: "fresh after reset", timestamp: 3 },
+      ]),
+      { sessionId: "pi-main" },
+    ).result();
+    assert.equal(mainPrompts.length, 1);
+    assert.equal(mainPrompts[0]?.text, "fresh after reset");
+
+    // 3. /tree rewind: branch has turns=1 for main-1 while allEntries already advanced main-1 to turns=3.
+    const markerT1 = {
+      type: "custom",
+      customType: AGY_STATE_ENTRY_TYPE,
+      data: {
+        version: 1,
+        kind: "conversation",
+        sessionId: "pi-main",
+        conversationId: "main-1",
+        cwd: "/work",
+        turns: 1,
+      },
+    };
+    const markerT3 = {
+      type: "custom",
+      customType: AGY_STATE_ENTRY_TYPE,
+      data: {
+        version: 1,
+        kind: "conversation",
+        sessionId: "pi-main",
+        conversationId: "main-1",
+        cwd: "/work",
+        turns: 3,
+      },
+    };
+    branchEntries = [markerT1];
+    allEntries = [markerT1, markerT3];
+    await streamSimple(
+      testModel(),
+      makeTranscript([
+        { role: "user", content: "kept before rewind", timestamp: 1 },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "reply at turn 1" }],
+          api: "antigravity-acp",
+          provider: "antigravity",
+          model: "gemini-4-hydrogen",
+          usage: {} as never,
+          stopReason: "stop",
+          timestamp: 2,
+        },
+        { role: "user", content: "new branch question", timestamp: 3 },
+      ]),
+      { sessionId: "pi-main" },
+    ).result();
+    assert.equal(mainPrompts.length, 2);
+    assert.equal(mainPrompts[1]?.sessionId, "main-2");
+    assert.match(mainPrompts[1]?.text ?? "", /reply at turn 1/);
+    assert.match(mainPrompts[1]?.text ?? "", /new branch question$/);
+  } finally {
+    await runtime.dispose();
+    fs.rmSync(agentsDir, { recursive: true, force: true });
+  }
+});

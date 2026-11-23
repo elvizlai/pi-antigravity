@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { TranscriptContext } from "@earendil-works/pi-ai";
 import {
+  buildSeededSessionPrompt,
   buildToolImageContinuationPrompt,
   collectTurnToolResults,
   extractSystemPromptAppend,
@@ -13,6 +14,7 @@ import {
   AGY_STATE_ENTRY_TYPE,
   findActiveAgyConversation,
   parseAgyStateEntry,
+  resolveAgyBranchState,
 } from "../src/provider/state.ts";
 
 function asTranscript(messages: TranscriptContext["messages"]): TranscriptContext["messages"] {
@@ -390,4 +392,173 @@ test("splitToolResultImages and buildToolImageContinuationPrompt handle text-onl
     { type: "image", data: "YmFy", mimeType: "image/png" },
     { type: "image", data: "dXNlcg==", mimeType: "image/webp" },
   ]);
+});
+
+test("resolveAgyBranchState distinguishes none, active, reset, compaction, and tree rewind", () => {
+  const markerT1 = {
+    type: "custom",
+    customType: AGY_STATE_ENTRY_TYPE,
+    data: {
+      version: 1,
+      kind: "conversation",
+      sessionId: "pi-1",
+      conversationId: "acp-1",
+      cwd: "/work",
+      turns: 1,
+    },
+  };
+  const markerT3 = {
+    type: "custom",
+    customType: AGY_STATE_ENTRY_TYPE,
+    data: {
+      version: 1,
+      kind: "conversation",
+      sessionId: "pi-1",
+      conversationId: "acp-1",
+      cwd: "/work",
+      turns: 3,
+    },
+  };
+
+  assert.equal(
+    resolveAgyBranchState("pi-1", "/work", [
+      { type: "session" },
+      { type: "model_change" },
+      { type: "message", message: { role: "user" } },
+    ]).status,
+    "none",
+  );
+  assert.deepEqual(
+    resolveAgyBranchState("pi-1", "/work", [
+      markerT1,
+      { type: "custom_message" },
+      { type: "message", message: { role: "bashExecution" } },
+      { type: "message", message: { role: "user" } },
+    ]),
+    {
+      status: "active",
+      state: markerT1.data,
+    },
+  );
+  assert.equal(
+    resolveAgyBranchState("pi-1", "/work", [
+      markerT1,
+      {
+        type: "custom",
+        customType: AGY_STATE_ENTRY_TYPE,
+        data: { version: 1, kind: "reset", sessionId: "pi-1", cwd: "/work" },
+      },
+    ]).status,
+    "reset",
+  );
+  for (const invalidType of ["compaction", "branch_summary", "context_edit"]) {
+    assert.equal(
+      resolveAgyBranchState("pi-1", "/work", [markerT1, { type: invalidType }]).status,
+      "invalidated",
+    );
+  }
+  // Tree rewind: branch ends at turns=1 while allEntries already advanced acp-1 to turns=3.
+  assert.equal(
+    resolveAgyBranchState("pi-1", "/work", [markerT1], [markerT1, markerT3]).status,
+    "invalidated",
+  );
+  assert.equal(
+    findActiveAgyConversation("pi-1", "/work", [markerT1], [markerT1, markerT3]),
+    undefined,
+  );
+});
+
+test("buildSeededSessionPrompt preserves single-turn fast path and seeds post-compaction history within byte budget", () => {
+  // 1. Single-turn [system, user] matches extractTrailingUserPrompt identically (no wrapper).
+  const singleTurn = asTranscript([
+    { role: "system", content: "sys", timestamp: 0 },
+    { role: "user", content: "Summarize this", timestamp: 1 },
+  ]);
+  assert.deepEqual(buildSeededSessionPrompt(singleTurn), extractTrailingUserPrompt(singleTurn));
+
+  // 2. Post-compaction [system, compactionSummary, kept turns, new user with image].
+  const postCompaction = asTranscript([
+    { role: "system", content: "sys", timestamp: 0 },
+    {
+      role: "user",
+      content:
+        "The conversation history before this point was compacted into the following summary:\n\n<summary>\nGoal: fix auth\n</summary>",
+      timestamp: 1,
+    },
+    { role: "user", content: "Check login.ts", timestamp: 2 },
+    {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "secret internal thought" },
+        { type: "text", text: "Reading login.ts now." },
+        { type: "toolCall", id: "c1", name: "read", arguments: { path: "login.ts" } },
+      ],
+      api: "antigravity-acp",
+      provider: "antigravity",
+      model: "m",
+      usage: {} as never,
+      stopReason: "toolUse",
+      timestamp: 3,
+    },
+    {
+      role: "toolResult",
+      toolCallId: "c1",
+      toolName: "read",
+      content: [{ type: "text", text: "export const ok = true;" }],
+      isError: false,
+      timestamp: 4,
+    },
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "Now inspect this screenshot" },
+        { type: "image", data: "aW1n", mimeType: "image/png" },
+      ],
+      timestamp: 5,
+    },
+  ]);
+
+  const seeded = buildSeededSessionPrompt(postCompaction, { allowImages: true });
+  assert.equal(seeded.length, 2);
+  const seededText = seeded[0]?.type === "text" ? seeded[0].text : "";
+  assert.match(seededText, /<conversation_history>/);
+  assert.match(seededText, /Goal: fix auth/);
+  assert.match(seededText, /\[User\]:\nCheck login\.ts/);
+  assert.match(seededText, /\[Assistant\]:\nReading login\.ts now\./);
+  assert.match(seededText, /\[Assistant tool calls\]: read\(\{"path":"login\.ts"\}\)/);
+  assert.match(seededText, /\[Tool result \(read\)\]:\nexport const ok = true;/);
+  assert.equal(seededText.includes("secret internal thought"), false);
+  assert.match(seededText, /Now inspect this screenshot$/);
+  assert.deepEqual(seeded[1], { type: "image", data: "aW1n", mimeType: "image/png" });
+
+  // 3. Byte-capped transcript preserves compaction <summary> and live prompt while dropping oldest middle turns.
+  const huge = asTranscript([
+    {
+      role: "user",
+      content:
+        "The conversation history before this point was compacted into the following summary:\n\n<summary>\nCHECKPOINT_KEEP\n</summary>",
+      timestamp: 1,
+    },
+    { role: "user", content: `OLD_TURN_DROP ${"x".repeat(400)}`, timestamp: 2 },
+    { role: "user", content: "NEWEST_KEPT_TURN", timestamp: 3 },
+    {
+      role: "assistant",
+      content: [{ type: "text", text: "LATEST_REPLY" }],
+      api: "a",
+      provider: "antigravity",
+      model: "m",
+      usage: {} as never,
+      stopReason: "stop",
+      timestamp: 4,
+    },
+    { role: "user", content: "LIVE_USER_QUESTION", timestamp: 5 },
+  ]);
+  const capped = buildSeededSessionPrompt(huge, { maxBytes: 700 });
+  const cappedText = capped[0]?.type === "text" ? capped[0].text : "";
+  assert.ok(Buffer.byteLength(cappedText, "utf8") <= 700);
+  assert.match(cappedText, /CHECKPOINT_KEEP/);
+  assert.match(cappedText, /\[\.\.\.earlier turns omitted\.\.\.\]/);
+  assert.match(cappedText, /LATEST_REPLY/);
+  assert.match(cappedText, /LIVE_USER_QUESTION/);
+  assert.equal(cappedText.includes("OLD_TURN_DROP"), false);
 });
