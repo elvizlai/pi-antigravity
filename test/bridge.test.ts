@@ -189,6 +189,7 @@ test("pi-tools agent files, adapter guard, and dead agent sweeping stay clean", 
     assert.equal(frontmatter.mainAgent, true);
     assert.equal(frontmatter.subagent, false);
     assert.deepEqual(frontmatter.tools, []);
+    assert.match(stdContent, /Image outputs from bridged Pi tools/);
     await stdAgent.remove();
 
     const liveAgent = createPiToolsAgent({ serverName: "pi-abc" }, { agentsDir });

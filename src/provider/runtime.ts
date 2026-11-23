@@ -1,4 +1,4 @@
-import type { TranscriptContext } from "@earendil-works/pi-ai";
+import type { JsonObject, TranscriptContext } from "@earendil-works/pi-ai";
 import { checkAgyBinary } from "../acp/binary.ts";
 import {
   type AcpContentBlock,
@@ -35,8 +35,11 @@ import {
 import type { AgyPiBridge, BridgeCall } from "../bridge/server.ts";
 import {
   BACKGROUND_ACP_TOOL_MESSAGE,
+  type BridgedToolImageBatch,
+  buildToolImageContinuationPrompt,
   collectTurnToolResults,
   isContinuationAfterToolUse,
+  splitToolResultImages,
 } from "./prompt.ts";
 import { AgyWorkingStatusTracker } from "./render.ts";
 import type { AgyToolMode } from "./settings.ts";
@@ -49,7 +52,7 @@ import { type AgyReplayStore, AgyTurnController } from "./turn.ts";
 
 export const DEFAULT_FIRST_RESPONSE_TIMEOUT_MS = 60_000;
 const DEFAULT_CANCEL_GRACE_MS = 5_000;
-const DEFAULT_BRIDGED_TOOL_ACK_TIMEOUT_MS = 250;
+const DEFAULT_BRIDGED_TOOL_ACK_TIMEOUT_MS = 500;
 
 /**
  * Quota exhaustion error (`"quota exceeded"` matches `@earendil-works/pi-ai`
@@ -153,6 +156,7 @@ export interface StartTurnParams {
   effort?: string;
   executionMode?: AgyExecutionMode;
   prompt: AcpContentBlock[];
+  allowImages?: boolean;
   systemPromptAppend?: string;
   messages: TranscriptContext["messages"];
   sessionId: string;
@@ -178,6 +182,8 @@ interface ActiveTurn {
   piSessionId: string;
   toolMode: AgyToolMode;
   bridgeServerName?: string;
+  bridgeCallLabels: Map<string, string>;
+  pendingToolImageBatches: BridgedToolImageBatch[];
   noteFirstResponse: () => void;
   isFirstResponseSeen?: () => boolean;
   noteBridgeCall: () => void;
@@ -212,6 +218,16 @@ function stableEnvFingerprint(env: Record<string, string> | undefined): string {
   if (!env) return "";
   const entries = Object.entries(env).sort(([a], [b]) => a.localeCompare(b));
   return JSON.stringify(entries);
+}
+
+function extractBridgeCallLabel(args: JsonObject): string | undefined {
+  for (const key of ["path", "file_path", "filePath", "url", "uri"]) {
+    const value = args[key];
+    if (typeof value === "string" && value.trim().length > 0) {
+      return value.trim();
+    }
+  }
+  return undefined;
 }
 
 function isFatalSessionSetupError(
@@ -404,6 +420,10 @@ export class AgyRuntime {
     if (!active || active.controller.isSettled) return false;
     active.noteFirstResponse();
     active.noteBridgeCall();
+    const label = extractBridgeCallLabel(call.args);
+    if (label) {
+      active.bridgeCallLabels.set(call.id, label);
+    }
     active.controller.pushActivity({
       type: "bridge_call",
       callId: call.id,
@@ -1015,6 +1035,8 @@ export class AgyRuntime {
     options?: {
       messages?: TranscriptContext["messages"];
       samePiSession?: boolean;
+      allowImages?: boolean;
+      outImageBatches?: BridgedToolImageBatch[];
       signal?: AbortSignal;
     },
   ): Promise<void> {
@@ -1025,7 +1047,11 @@ export class AgyRuntime {
     const bridge = this.#deps.bridge;
     const resolvedCount =
       options?.samePiSession && options.messages
-        ? this.resolveBridgeResultsFromMessages(options.messages)
+        ? this.resolveBridgeResultsFromMessages(options.messages, {
+            allowImages: options.allowImages,
+            labels: active.bridgeCallLabels,
+            outImageBatches: options.outImageBatches,
+          })
         : 0;
     const cancelledCount =
       bridge?.cancelPendingCalls("antigravity: turn interrupted before tool call ran.") ?? 0;
@@ -1118,27 +1144,76 @@ export class AgyRuntime {
 
   async startOrContinueTurn(params: StartTurnParams): Promise<TurnSessionHandle> {
     const active = this.#activeTurn;
+    const allowImages = params.allowImages ?? true;
+    let continuationImageBatches: BridgedToolImageBatch[] = [];
 
     // 1. Continuation wave: attach to an active or settled-but-unconsumed turn ONLY when trailing messages are tool results.
     if (active) {
+      const samePiSession = active.piSessionId === params.sessionId;
       const canContinue =
-        active.piSessionId === params.sessionId &&
+        samePiSession &&
         !active.controller.isConsumed &&
         isContinuationAfterToolUse(params.messages);
       if (canContinue) {
-        this.resolveBridgeResultsFromMessages(params.messages);
-        return {
-          controller: active.controller,
-          attachExisting: true,
-          bridgeServerName: active.bridgeServerName,
-          signalTurnAbort: () => active.requestAbort(),
-        };
+        this.resolveBridgeResultsFromMessages(params.messages, {
+          allowImages,
+          labels: active.bridgeCallLabels,
+          outImageBatches: active.pendingToolImageBatches,
+        });
+        if (active.pendingToolImageBatches.length === 0 || active.controller.isSettled) {
+          return {
+            controller: active.controller,
+            attachExisting: true,
+            bridgeServerName: active.bridgeServerName,
+            signalTurnAbort: () => active.requestAbort(),
+          };
+        }
+
+        const bridge = this.#deps.bridge;
+        if ((bridge?.pendingCount ?? 0) > 0) {
+          return {
+            controller: active.controller,
+            attachExisting: true,
+            bridgeServerName: active.bridgeServerName,
+            signalTurnAbort: () => active.requestAbort(),
+          };
+        }
+
+        await bridge?.flushResponses();
+        if (!active.controller.isSettled) {
+          const ackTimeoutMs =
+            this.#deps.bridgedToolAckTimeoutMs ?? DEFAULT_BRIDGED_TOOL_ACK_TIMEOUT_MS;
+          await active.waitForBridgedToolsAck(ackTimeoutMs, params.signal);
+        }
+
+        if ((bridge?.pendingCount ?? 0) > 0 && !active.controller.isSettled) {
+          return {
+            controller: active.controller,
+            attachExisting: true,
+            bridgeServerName: active.bridgeServerName,
+            signalTurnAbort: () => active.requestAbort(),
+          };
+        }
+
+        continuationImageBatches = active.pendingToolImageBatches.splice(0);
+        await this.#interruptActiveTurn(active, {
+          samePiSession: true,
+          signal: params.signal,
+        });
+      } else {
+        const steeredBatches = samePiSession ? [...active.pendingToolImageBatches] : [];
+        active.pendingToolImageBatches.length = 0;
+        await this.#interruptActiveTurn(active, {
+          messages: params.messages,
+          samePiSession,
+          allowImages,
+          outImageBatches: steeredBatches,
+          signal: params.signal,
+        });
+        if (samePiSession && steeredBatches.length > 0) {
+          continuationImageBatches = steeredBatches;
+        }
       }
-      await this.#interruptActiveTurn(active, {
-        messages: params.messages,
-        samePiSession: active.piSessionId === params.sessionId,
-        signal: params.signal,
-      });
     }
 
     if (params.signal?.aborted) {
@@ -1242,6 +1317,8 @@ export class AgyRuntime {
       piSessionId: params.sessionId,
       toolMode,
       bridgeServerName,
+      bridgeCallLabels: new Map(),
+      pendingToolImageBatches: [],
       noteFirstResponse,
       isFirstResponseSeen: () => sawFirstResponse,
       noteBridgeCall: () => quotaTracker.noteToolActivity(),
@@ -1296,9 +1373,13 @@ export class AgyRuntime {
       }
     }
 
-    const outboundPrompt = [...params.prompt];
+    const basePrompt =
+      continuationImageBatches.length > 0
+        ? buildToolImageContinuationPrompt(continuationImageBatches, params.prompt)
+        : params.prompt;
+    const outboundPrompt = [...basePrompt];
     const customSys = params.systemPromptAppend?.trim();
-    if (this.#turns === 0 && customSys) {
+    if (this.#turns === 0 && continuationImageBatches.length === 0 && customSys) {
       const firstTextIdx = outboundPrompt.findIndex((block) => block.type === "text");
       if (firstTextIdx >= 0 && outboundPrompt[firstTextIdx]?.type === "text") {
         outboundPrompt[firstTextIdx] = {
@@ -1342,20 +1423,34 @@ export class AgyRuntime {
   }
 
   /** Resolve pending bridged MCP calls from trailing `toolResult` messages in context. */
-  resolveBridgeResultsFromMessages(messages: Parameters<typeof collectTurnToolResults>[0]): number {
+  resolveBridgeResultsFromMessages(
+    messages: Parameters<typeof collectTurnToolResults>[0],
+    options?: {
+      allowImages?: boolean;
+      labels?: ReadonlyMap<string, string>;
+      outImageBatches?: BridgedToolImageBatch[];
+    },
+  ): number {
     const bridge = this.#deps.bridge;
     if (!bridge || bridge.pendingCount === 0) return 0;
     const pendingIds = new Set(bridge.pendingCallIds);
     const results = collectTurnToolResults(messages, pendingIds);
     let resolved = 0;
     for (const item of results) {
+      const { mcpContent, imageBatch } = splitToolResultImages(item, {
+        allowImages: options?.allowImages ?? true,
+        label: options?.labels?.get(item.callId),
+      });
       if (
         bridge.resolveCall(item.callId, {
-          content: item.content,
+          content: mcpContent,
           isError: item.isError,
         })
       ) {
         resolved += 1;
+        if (imageBatch) {
+          options?.outImageBatches?.push(imageBatch);
+        }
       }
     }
     return resolved;

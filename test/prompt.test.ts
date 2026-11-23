@@ -2,10 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { TranscriptContext } from "@earendil-works/pi-ai";
 import {
+  buildToolImageContinuationPrompt,
   collectTurnToolResults,
   extractSystemPromptAppend,
   extractTrailingUserPrompt,
   isContinuationAfterToolUse,
+  splitToolResultImages,
 } from "../src/provider/prompt.ts";
 import {
   AGY_STATE_ENTRY_TYPE,
@@ -299,5 +301,93 @@ test("isContinuationAfterToolUse distinguishes pure tool continuations from stee
   );
   assert.deepEqual(extractTrailingUserPrompt(steeredTranscript), [
     { type: "text", text: "参数上还有什么值得优化的吗？" },
+  ]);
+});
+
+test("splitToolResultImages and buildToolImageContinuationPrompt handle text-only, vision, and steered prompts", () => {
+  const textOnly = splitToolResultImages({
+    callId: "c-text",
+    name: "read",
+    content: [{ type: "text", text: "plain" }],
+    isError: false,
+  });
+  assert.equal(textOnly.imageBatch, undefined);
+  assert.deepEqual(textOnly.mcpContent, [{ type: "text", text: "plain" }]);
+
+  const vision = splitToolResultImages(
+    {
+      callId: "c-img",
+      name: "read",
+      content: [
+        { type: "text", text: "Read image file [image/jpeg]" },
+        { type: "image", data: "Zm9v", mimeType: "image/jpeg" },
+      ],
+      isError: false,
+    },
+    { allowImages: true, label: "s07/ep001/refs/suanian_face2.jpg" },
+  );
+  assert.equal(
+    vision.mcpContent.some((b) => b.type === "image"),
+    false,
+  );
+  assert.equal(vision.mcpContent.length, 2);
+  assert.match(
+    vision.mcpContent[1]?.type === "text" ? vision.mcpContent[1].text : "",
+    /delivered inline in the immediate continuation message/,
+  );
+  assert.deepEqual(vision.imageBatch, {
+    callId: "c-img",
+    name: "read",
+    label: "s07/ep001/refs/suanian_face2.jpg",
+    images: [{ type: "image", data: "Zm9v", mimeType: "image/jpeg" }],
+  });
+
+  const omitted = splitToolResultImages(
+    {
+      callId: "c-img",
+      name: "read",
+      content: [
+        { type: "text", text: "Read image file [image/jpeg]" },
+        { type: "image", data: "Zm9v", mimeType: "image/jpeg" },
+      ],
+      isError: false,
+    },
+    { allowImages: false },
+  );
+  assert.equal(omitted.imageBatch, undefined);
+  assert.deepEqual(omitted.mcpContent, [
+    { type: "text", text: "Read image file [image/jpeg]" },
+    { type: "text", text: "(1 image(s) omitted — this agy request is text-only)" },
+  ]);
+
+  const continuation = buildToolImageContinuationPrompt(
+    [
+      vision.imageBatch!,
+      {
+        callId: "c-img-2",
+        name: "read",
+        label: "grid.png",
+        images: [{ type: "image", data: "YmFy", mimeType: "image/png" }],
+      },
+    ],
+    [
+      { type: "text", text: "also check lighting" },
+      { type: "image", data: "dXNlcg==", mimeType: "image/webp" },
+    ],
+  );
+  assert.equal(continuation[0]?.type, "text");
+  assert.match(
+    continuation[0]?.type === "text" ? continuation[0].text : "",
+    /1\. read \("s07\/ep001\/refs\/suanian_face2\.jpg"\) — image\/jpeg/,
+  );
+  assert.match(
+    continuation[0]?.type === "text" ? continuation[0].text : "",
+    /2\. read \("grid\.png"\) — image\/png/,
+  );
+  assert.match(continuation[0]?.type === "text" ? continuation[0].text : "", /also check lighting/);
+  assert.deepEqual(continuation.slice(1), [
+    { type: "image", data: "Zm9v", mimeType: "image/jpeg" },
+    { type: "image", data: "YmFy", mimeType: "image/png" },
+    { type: "image", data: "dXNlcg==", mimeType: "image/webp" },
   ]);
 });

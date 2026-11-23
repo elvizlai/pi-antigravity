@@ -226,6 +226,7 @@ export function createAntigravityStreamSimple(
           effort: payload.effort,
           executionMode: payload.executionMode,
           prompt: payload.prompt,
+          allowImages,
           systemPromptAppend: payload.systemPromptAppend,
           messages: context.messages,
           sessionId: deps.getSessionId(),

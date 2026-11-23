@@ -158,6 +158,102 @@ export interface CollectedToolResult {
   isError: boolean;
 }
 
+export interface BridgedToolImageBatch {
+  callId: string;
+  name: string;
+  label?: string;
+  images: Array<{ type: "image"; data: string; mimeType: string }>;
+}
+
+/**
+ * Partition a bridged tool result into text-only MCP content and an optional
+ * image batch for inline ACP `session/prompt` continuation.
+ */
+export function splitToolResultImages(
+  item: CollectedToolResult,
+  options?: { allowImages?: boolean; label?: string },
+): { mcpContent: (TextContent | ImageContent)[]; imageBatch?: BridgedToolImageBatch } {
+  const textBlocks: TextContent[] = [];
+  const images: Array<{ type: "image"; data: string; mimeType: string }> = [];
+
+  for (const part of item.content) {
+    if (part.type === "text") {
+      textBlocks.push(part);
+    } else if (part.type === "image") {
+      images.push({ type: "image", data: part.data, mimeType: part.mimeType });
+    }
+  }
+
+  if (images.length === 0) {
+    return { mcpContent: item.content };
+  }
+
+  if (options?.allowImages === false) {
+    return {
+      mcpContent: [...textBlocks, { type: "text", text: omittedImagesPrompt(images.length) }],
+    };
+  }
+
+  const mimeSummary = [...new Set(images.map((img) => img.mimeType))].join(", ");
+  return {
+    mcpContent: [
+      ...textBlocks,
+      {
+        type: "text",
+        text: `[${images.length} image attachment(s) (${mimeSummary}) delivered inline in the immediate continuation message — inspect the attached image(s) directly without calling ${item.name} again.]`,
+      },
+    ],
+    imageBatch: {
+      callId: item.callId,
+      name: item.name,
+      ...(options?.label ? { label: options.label } : {}),
+      images,
+    },
+  };
+}
+
+/**
+ * Build an ACP `session/prompt` payload carrying bridged tool image results
+ * in execution order, optionally merged with any trailing user steering prompt.
+ */
+export function buildToolImageContinuationPrompt(
+  batches: readonly BridgedToolImageBatch[],
+  trailingPrompt?: readonly AcpContentBlock[],
+  options?: { maxBytes?: number },
+): AcpContentBlock[] {
+  if (batches.length === 0) {
+    return trailingPrompt ? [...trailingPrompt] : [];
+  }
+
+  const lines: string[] = ["[Bridged tool image result(s) attached in order:"];
+  const toolImageBlocks: AcpContentBlock[] = [];
+  for (const batch of batches) {
+    const target = batch.label ? ` (${JSON.stringify(batch.label)})` : "";
+    for (const img of batch.images) {
+      toolImageBlocks.push(img);
+      lines.push(`${toolImageBlocks.length}. ${batch.name}${target} — ${img.mimeType}`);
+    }
+  }
+  lines.push(
+    "Continue the current turn using these attached image(s); do not re-call the tool for the same image(s).]",
+  );
+  const manifestText = lines.join("\n");
+
+  const textParts: string[] = [manifestText];
+  const trailingImages: AcpContentBlock[] = [];
+  for (const block of trailingPrompt ?? []) {
+    if (block.type === "text") {
+      if (block.text.trim()) textParts.push(block.text);
+    } else if (block.type === "image") {
+      trailingImages.push(block);
+    }
+  }
+
+  const maxBytes = options?.maxBytes ?? MAX_AGY_PROMPT_BYTES;
+  const boundedText = truncateUtf8Tail(textParts.join("\n\n"), maxBytes);
+  return [{ type: "text", text: boundedText }, ...toolImageBlocks, ...trailingImages];
+}
+
 function hasMeaningfulUserContent(
   msg: Extract<TranscriptContext["messages"][number], { role: "user" }>,
 ): boolean {

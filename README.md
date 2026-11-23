@@ -10,7 +10,7 @@ Communicates over Antigravity CLI's public stdio JSON-RPC Agent Client Protocol 
 
 - `src/acp/` — Shared type/abort helpers (`shared.ts`), process-group cleanup & detached one-shot CLI runner (`process-tree.ts`), binary verification (`agy >= 1.5.0`), ACP JSON-RPC 2.0 client transport (per-RPC abort/stall timeouts & 3-stage `stdin EOF -> SIGTERM -> SIGKILL` disposal), protocol event normalization, model discovery & config planning, `/usage` quota fetching/formatting, and quota/stop-reason classification.
 - `src/bridge/` — Localhost HTTP MCP server bridging Pi active tools & Pi-private skills (`pi__activate_skill`), `--agent` lifecycle helpers, and automatic `HINDSIGHT_DISABLE_HOOKS=1` propagation when Pi's Hindsight extension is active (preventing duplicate prompt injection and double session write-back).
-- `src/provider/` — Extension settings (`~/.pi/agent/antigravity.json`), session-branch persistence, transcript prompt/system extraction (`getCurrentSystemMessage`), wave turn controller + replay store, runtime & first-response stall watchdog, Pi `streamSimple` adapter, and TUI card rendering.
+- `src/provider/` — Extension settings (`~/.pi/agent/antigravity.json`), session-branch persistence, transcript prompt/system extraction (`getCurrentSystemMessage`), inline bridged tool-image continuation (`splitToolResultImages` / `buildToolImageContinuationPrompt`), wave turn controller + replay store, runtime & first-response stall watchdog, Pi `streamSimple` adapter, and TUI card rendering.
 - `index.ts` — Thin Pi extension entrypoint registering provider `"antigravity"` (with `refreshModels` & `streamSimple`), flags, display-only `antigravity` wrapper tool, commands, and session hooks.
 
 ## Requirements
@@ -32,10 +32,14 @@ Add the package to `~/.pi/agent/settings.json`, then restart Pi or run `/reload`
 
 Extension settings are stored independently in `~/.pi/agent/antigravity.json` (never modifying Pi's `settings.json`):
 
-- **`pi` (default)** — Status: `acp:pi · 25m:88% · 7d:96%`
-  Bridges Pi's active tools (`read`, `bash`, `edit`, `write`, `codemode`, `subagent`, MCP tools) and Pi-private skills (`pi__activate_skill`) into `agy acp` via `--agent pi-tools-<pid>` and a loopback HTTP MCP server.
-- **`agy`** — Status: `acp:agy · 25m:88% · 7d:96%`
-  Lets `agy` execute its own built-in tools and workflows directly (`/swarm`, `/boost`, `/teamwork`, `/grill-me`, `/learn`, `/plan`, `run_workflow`). Multi-agent background pipelines (`/swarm`, `/boost`, `/teamwork`) require a persistent session (interactive TUI or `pi --mode rpc`) across turns; Pi's built-in `/compact` (and extension commands such as `/goal` if installed) take precedence locally before prompts reach `agy acp`.
+| Aspect               | `pi` (`acp:pi`, default)                                                                                                                                                                                                                               | `agy` (`acp:agy`)                                                                                                                                       |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Tools**            | `agy` built-in tools disabled (`"tools": []`); Pi active tools (`read`, `bash`, `edit`, `write`, `codemode`, `subagent`, MCP tools) + Pi-private skills (`pi__activate_skill`) are bridged via `--agent pi-tools-<pid>` and a loopback HTTP MCP server | `agy` executes its own built-in tools, skills, and workflows directly (`/swarm`, `/boost`, `/teamwork`, `/grill-me`, `/learn`, `/plan`, `run_workflow`) |
+| **Execution & TUI**  | Tools execute inside Pi with Pi permissions, hooks, `<read-files>` tracking, and native Pi TUI cards                                                                                                                                                   | Tools and multi-agent pipelines execute inside `agy`; Pi displays a summary card                                                                        |
+| **Multimodal files** | `pi__read` images are forwarded inline on a same-session `session/prompt` continuation; non-image files (e.g. PDF/MP4) are not natively read by `agy`                                                                                                  | `agy`'s native `read_file` handles images, PDFs, audio, and video directly                                                                              |
+
+- Multi-agent background pipelines in `agy` mode (`/swarm`, `/boost`, `/teamwork`) require a persistent session (interactive TUI or `pi --mode rpc`) across turns; Pi's built-in `/compact` (and extension commands such as `/goal` if installed) take precedence locally before prompts reach `agy acp`.
+- `agy` only discovers Antigravity skill directories by default; if you want `acp:agy` to also see shared skills in `~/.agents/skills`, add `"~/.agents/skills"` to `~/.gemini/config/skills.json` (`additionalPaths`).
 
 ## Timeouts & Failure Handling
 

@@ -2336,3 +2336,518 @@ test("settleAfterAgentEnd cancels unsettled turn and pending bridge calls, persi
     fs.rmSync(agentsDir, { recursive: true, force: true });
   }
 });
+
+test("bridged pi__read image result strips MCP image payload and continues same ACP session with inline image blocks", async () => {
+  const agentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-img-single-"));
+  const bridge = new AgyPiBridge("pi-img-single");
+  bridge.setToolSource(() => [{ name: "read", description: "read file", parameters: {} }]);
+  bridge.refreshTools();
+  await bridge.start();
+
+  const events: string[] = [];
+  const seenPrompts: Array<{
+    sessionId: string;
+    blocks: ReadonlyArray<{ type: string; text?: string; data?: string; mimeType?: string }>;
+  }> = [];
+  let mcpToolContent: Array<{ type: string; text?: string }> | undefined;
+  let releasePrompt1: (() => void) | undefined;
+
+  const runtime = new AgyRuntime({
+    cwd: "/work",
+    agentsDir,
+    bridge,
+    bridgeToken: "tok-img",
+    getToolMode: () => "pi",
+    ensureBridge: async () => true,
+    checkBinary: async () => ({ binary: "agy", version: "1.5.15" }),
+    createClient: () => ({
+      isAlive: true,
+      async initialize() {
+        return { protocolVersion: 1 };
+      },
+      async newSession() {
+        return { sessionId: "img-sess-1" };
+      },
+      async resumeSession() {
+        return { sessionId: "img-sess-1" };
+      },
+      async setConfigOption() {
+        return {};
+      },
+      cancelSession() {
+        events.push("cancelSession");
+        releasePrompt1?.();
+      },
+      async prompt(sid, blocks, opts) {
+        seenPrompts.push({ sessionId: sid, blocks });
+        if (seenPrompts.length === 1) {
+          opts?.signal?.addEventListener(
+            "abort",
+            () => {
+              events.push("cancelSession");
+              releasePrompt1?.();
+            },
+            { once: true },
+          );
+          opts?.onUpdate?.({
+            sessionUpdate: "tool_call",
+            toolCallId: "tc-read-1",
+            name: "pi__read",
+            title: "pi__read",
+            status: "in_progress",
+          });
+          const res = await fetch(bridge.url!, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-pi-bridge-token": "tok-img",
+            },
+            body: JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              method: "tools/call",
+              params: { name: "pi__read", arguments: { path: "refs/face.jpg" } },
+            }),
+          });
+          const json = (await res.json()) as {
+            result: { content: Array<{ type: string; text?: string }> };
+          };
+          mcpToolContent = json.result.content;
+          events.push("mcp_http_resolved");
+          opts?.onUpdate?.({
+            sessionUpdate: "tool_call_update",
+            toolCallId: "tc-read-1",
+            status: "completed",
+          });
+          events.push("acp_tool_ack");
+          await new Promise<void>((resolve) => {
+            releasePrompt1 = resolve;
+          });
+          events.push("prompt1_settled");
+          return { stopReason: "cancelled" };
+        }
+
+        events.push("prompt2_started");
+        opts?.onUpdate?.({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "saw-image-ok" },
+        });
+        return {
+          stopReason: "end_turn",
+          usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110 },
+        };
+      },
+      async dispose() {},
+    }),
+  });
+
+  const streamSimple = createAntigravityStreamSimple({
+    getRuntime: () => runtime,
+    getSessionId: () => "pi-img-1",
+    getBranchEntries: () => [],
+    replayStore: new AgyReplayStore(),
+  });
+
+  try {
+    let messages: unknown[] = [
+      {
+        role: "system",
+        content: "",
+        sections: { customNote: "CUSTOM_SYS_ONCE" },
+        timestamp: 0,
+      },
+      { role: "user", content: "inspect refs/face.jpg", timestamp: 1 },
+    ];
+    const wave1 = streamSimple(testModel(), makeTranscript(messages));
+    const events1 = [];
+    for await (const ev of wave1) events1.push(ev);
+    assertDeltasMatchPartial(events1);
+    const msg1 = await wave1.result();
+    assert.equal(msg1.stopReason, "toolUse");
+    const toolCall = msg1.content.find((b) => b.type === "toolCall");
+    assert.ok(toolCall && toolCall.type === "toolCall");
+
+    messages = [
+      ...messages,
+      msg1,
+      {
+        role: "toolResult",
+        toolCallId: toolCall.id,
+        toolName: "read",
+        content: [
+          { type: "text", text: "Read image file [image/jpeg]" },
+          { type: "image", data: "aW1nMQ==", mimeType: "image/jpeg" },
+        ],
+        isError: false,
+        timestamp: 2,
+      },
+    ];
+
+    const wave2 = streamSimple(testModel(), makeTranscript(messages));
+    const events2 = [];
+    for await (const ev of wave2) events2.push(ev);
+    assertDeltasMatchPartial(events2);
+    const msg2 = await wave2.result();
+    assert.equal(msg2.stopReason, "stop");
+    assert.deepEqual(msg2.content, [{ type: "text", text: "saw-image-ok" }]);
+
+    assert.ok(mcpToolContent);
+    assert.equal(
+      mcpToolContent.some((b) => b.type === "image"),
+      false,
+    );
+    assert.match(
+      mcpToolContent[1]?.text ?? "",
+      /delivered inline in the immediate continuation message/,
+    );
+
+    assert.ok(events.indexOf("acp_tool_ack") >= 0);
+    assert.ok(events.indexOf("acp_tool_ack") < events.indexOf("cancelSession"));
+    assert.ok(events.indexOf("prompt1_settled") < events.indexOf("prompt2_started"));
+
+    assert.equal(seenPrompts.length, 2);
+    assert.equal(seenPrompts[0]?.sessionId, "img-sess-1");
+    assert.equal(seenPrompts[1]?.sessionId, "img-sess-1");
+    assert.match(seenPrompts[0]?.blocks[0]?.text ?? "", /CUSTOM_SYS_ONCE/);
+    assert.equal((seenPrompts[1]?.blocks[0]?.text ?? "").includes("CUSTOM_SYS_ONCE"), false);
+    assert.match(
+      seenPrompts[1]?.blocks[0]?.text ?? "",
+      /1\. read \("refs\/face\.jpg"\) — image\/jpeg/,
+    );
+    assert.deepEqual(seenPrompts[1]?.blocks[1], {
+      type: "image",
+      data: "aW1nMQ==",
+      mimeType: "image/jpeg",
+    });
+  } finally {
+    await runtime.dispose();
+    await bridge.close();
+    fs.rmSync(agentsDir, { recursive: true, force: true });
+  }
+});
+
+test("parallel bridged calls (pi__read image + pi__bash text) wait for sibling completion before image handoff", async () => {
+  const agentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-img-parallel-"));
+  const bridge = new AgyPiBridge("pi-img-parallel");
+  bridge.setToolSource(() => [
+    { name: "read", description: "read file", parameters: {} },
+    { name: "bash", description: "run bash", parameters: {} },
+  ]);
+  bridge.refreshTools();
+  await bridge.start();
+
+  const events: string[] = [];
+  const seenPrompts: Array<{
+    blocks: ReadonlyArray<{ type: string; text?: string; data?: string; mimeType?: string }>;
+  }> = [];
+  let releasePrompt1: (() => void) | undefined;
+
+  const runtime = new AgyRuntime({
+    cwd: "/work",
+    agentsDir,
+    bridge,
+    bridgeToken: "tok-par",
+    getToolMode: () => "pi",
+    ensureBridge: async () => true,
+    checkBinary: async () => ({ binary: "agy", version: "1.5.15" }),
+    createClient: () => ({
+      isAlive: true,
+      async initialize() {
+        return { protocolVersion: 1 };
+      },
+      async newSession() {
+        return { sessionId: "par-sess-1" };
+      },
+      async resumeSession() {
+        return { sessionId: "par-sess-1" };
+      },
+      async setConfigOption() {
+        return {};
+      },
+      cancelSession() {
+        events.push("cancelSession");
+        releasePrompt1?.();
+      },
+      async prompt(_sid, blocks, opts) {
+        seenPrompts.push({ blocks });
+        if (seenPrompts.length === 1) {
+          opts?.signal?.addEventListener(
+            "abort",
+            () => {
+              events.push("cancelSession");
+              releasePrompt1?.();
+            },
+            { once: true },
+          );
+          opts?.onUpdate?.({
+            sessionUpdate: "tool_call",
+            toolCallId: "tc-read-par",
+            name: "pi__read",
+            title: "pi__read",
+            status: "in_progress",
+          });
+          const readReq = fetch(bridge.url!, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-pi-bridge-token": "tok-par",
+            },
+            body: JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              method: "tools/call",
+              params: { name: "pi__read", arguments: { path: "grid.png" } },
+            }),
+          }).then(async (res) => {
+            await res.json();
+            events.push("read_http_resolved");
+            opts?.onUpdate?.({
+              sessionUpdate: "tool_call_update",
+              toolCallId: "tc-read-par",
+              status: "completed",
+            });
+          });
+
+          // Simulate sibling tool call arriving slightly after wave 1 starts.
+          const bashReq = (async () => {
+            await new Promise((r) => setTimeout(r, 15));
+            opts?.onUpdate?.({
+              sessionUpdate: "tool_call",
+              toolCallId: "tc-bash-par",
+              name: "pi__bash",
+              title: "pi__bash",
+              status: "in_progress",
+            });
+            const res = await fetch(bridge.url!, {
+              method: "POST",
+              headers: {
+                "content-type": "application/json",
+                "x-pi-bridge-token": "tok-par",
+              },
+              body: JSON.stringify({
+                jsonrpc: "2.0",
+                id: 2,
+                method: "tools/call",
+                params: { name: "pi__bash", arguments: { command: "ls" } },
+              }),
+            });
+            await res.json();
+            events.push("bash_http_resolved");
+            opts?.onUpdate?.({
+              sessionUpdate: "tool_call_update",
+              toolCallId: "tc-bash-par",
+              status: "completed",
+            });
+            events.push("bash_acp_ack");
+          })();
+
+          await Promise.all([
+            readReq,
+            bashReq,
+            new Promise<void>((resolve) => {
+              releasePrompt1 = resolve;
+            }),
+          ]);
+          return { stopReason: "cancelled" };
+        }
+
+        opts?.onUpdate?.({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "parallel-done" },
+        });
+        return { stopReason: "end_turn" };
+      },
+      async dispose() {},
+    }),
+  });
+
+  const streamSimple = createAntigravityStreamSimple({
+    getRuntime: () => runtime,
+    getSessionId: () => "pi-par-1",
+    getBranchEntries: () => [],
+    replayStore: new AgyReplayStore(),
+  });
+
+  try {
+    let messages: unknown[] = [{ role: "user", content: "check grid and ls", timestamp: 1 }];
+    const wave1 = streamSimple(testModel(), makeTranscript(messages));
+    const msg1 = await wave1.result();
+    assert.equal(msg1.stopReason, "toolUse");
+    const readCall = msg1.content.find((b) => b.type === "toolCall" && b.name === "read");
+    assert.ok(readCall && readCall.type === "toolCall");
+
+    // Wait until the sibling parallel `pi__bash` call has also arrived at the bridge.
+    while (bridge.pendingCount < 2) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+
+    // Wave 2 resolves only `read` (image) while `bash` is still pending on the bridge.
+    messages = [
+      ...messages,
+      msg1,
+      {
+        role: "toolResult",
+        toolCallId: readCall.id,
+        toolName: "read",
+        content: [
+          { type: "text", text: "Read image file [image/png]" },
+          { type: "image", data: "Z3JpZA==", mimeType: "image/png" },
+        ],
+        isError: false,
+        timestamp: 2,
+      },
+    ];
+
+    const wave2 = streamSimple(testModel(), makeTranscript(messages));
+    const msg2 = await wave2.result();
+    assert.equal(msg2.stopReason, "toolUse");
+    const bashCall = msg2.content.find((b) => b.type === "toolCall" && b.name === "bash");
+    assert.ok(bashCall && bashCall.type === "toolCall");
+    assert.equal(seenPrompts.length, 1);
+
+    // Wave 3 resolves `bash` -> now all pending bridge calls are done, triggering image handoff.
+    messages = [
+      ...messages,
+      msg2,
+      {
+        role: "toolResult",
+        toolCallId: bashCall.id,
+        toolName: "bash",
+        content: [{ type: "text", text: "file1.txt" }],
+        isError: false,
+        timestamp: 3,
+      },
+    ];
+
+    const wave3 = streamSimple(testModel(), makeTranscript(messages));
+    const msg3 = await wave3.result();
+    assert.equal(msg3.stopReason, "stop");
+    assert.deepEqual(msg3.content, [{ type: "text", text: "parallel-done" }]);
+    assert.equal(seenPrompts.length, 2);
+    assert.ok(events.indexOf("bash_acp_ack") >= 0);
+    assert.ok(events.indexOf("bash_acp_ack") < events.indexOf("cancelSession"));
+    assert.deepEqual(seenPrompts[1]?.blocks[1], {
+      type: "image",
+      data: "Z3JpZA==",
+      mimeType: "image/png",
+    });
+  } finally {
+    await runtime.dispose();
+    await bridge.close();
+    fs.rmSync(agentsDir, { recursive: true, force: true });
+  }
+});
+
+test("text-only model omits bridged tool images over MCP without cancelling the active ACP turn", async () => {
+  const agentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-img-textonly-"));
+  const bridge = new AgyPiBridge("pi-img-textonly");
+  bridge.setToolSource(() => [{ name: "read", description: "read file", parameters: {} }]);
+  bridge.refreshTools();
+  await bridge.start();
+
+  let promptCalls = 0;
+  let cancelCalls = 0;
+  let mcpToolContent: Array<{ type: string; text?: string }> | undefined;
+
+  const runtime = new AgyRuntime({
+    cwd: "/work",
+    agentsDir,
+    bridge,
+    bridgeToken: "tok-txt",
+    getToolMode: () => "pi",
+    ensureBridge: async () => true,
+    checkBinary: async () => ({ binary: "agy", version: "1.5.15" }),
+    createClient: () => ({
+      isAlive: true,
+      async initialize() {
+        return { protocolVersion: 1 };
+      },
+      async newSession() {
+        return { sessionId: "txt-sess-1" };
+      },
+      async resumeSession() {
+        return { sessionId: "txt-sess-1" };
+      },
+      async setConfigOption() {
+        return {};
+      },
+      cancelSession() {
+        cancelCalls += 1;
+      },
+      async prompt(_sid, _blocks, opts) {
+        promptCalls += 1;
+        const res = await fetch(bridge.url!, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-pi-bridge-token": "tok-txt",
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "tools/call",
+            params: { name: "pi__read", arguments: { path: "pic.png" } },
+          }),
+        });
+        const json = (await res.json()) as {
+          result: { content: Array<{ type: string; text?: string }> };
+        };
+        mcpToolContent = json.result.content;
+        opts?.onUpdate?.({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "text-only-ok" },
+        });
+        return { stopReason: "end_turn" };
+      },
+      async dispose() {},
+    }),
+  });
+
+  const textOnlyModel: Model<Api> = { ...testModel(), input: ["text"] };
+  const streamSimple = createAntigravityStreamSimple({
+    getRuntime: () => runtime,
+    getSessionId: () => "pi-txt-1",
+    getBranchEntries: () => [],
+    replayStore: new AgyReplayStore(),
+  });
+
+  try {
+    let messages: unknown[] = [{ role: "user", content: "read pic.png", timestamp: 1 }];
+    const wave1 = streamSimple(textOnlyModel, makeTranscript(messages));
+    const msg1 = await wave1.result();
+    assert.equal(msg1.stopReason, "toolUse");
+    const toolCall = msg1.content.find((b) => b.type === "toolCall");
+    assert.ok(toolCall && toolCall.type === "toolCall");
+
+    messages = [
+      ...messages,
+      msg1,
+      {
+        role: "toolResult",
+        toolCallId: toolCall.id,
+        toolName: "read",
+        content: [
+          { type: "text", text: "Read image file [image/png]" },
+          { type: "image", data: "cGlj", mimeType: "image/png" },
+        ],
+        isError: false,
+        timestamp: 2,
+      },
+    ];
+
+    const wave2 = streamSimple(textOnlyModel, makeTranscript(messages));
+    const msg2 = await wave2.result();
+    assert.equal(msg2.stopReason, "stop");
+    assert.deepEqual(msg2.content, [{ type: "text", text: "text-only-ok" }]);
+    assert.equal(promptCalls, 1);
+    assert.equal(cancelCalls, 0);
+    assert.deepEqual(mcpToolContent, [
+      { type: "text", text: "Read image file [image/png]" },
+      { type: "text", text: "(1 image(s) omitted — this agy request is text-only)" },
+    ]);
+  } finally {
+    await runtime.dispose();
+    await bridge.close();
+    fs.rmSync(agentsDir, { recursive: true, force: true });
+  }
+});
