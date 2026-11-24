@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { JsonObject, TranscriptContext } from "@earendil-works/pi-ai";
 import { checkAgyBinary } from "../acp/binary.ts";
 import {
@@ -28,12 +29,13 @@ import {
 import { type AgyQuotaNotice, AgyQuotaTurnTracker, isAgyQuotaError } from "../acp/quota.ts";
 import { isAbortError, makeAbortError } from "../acp/shared.ts";
 import {
+  createAuxiliaryToolsAgent,
   createPiToolsAgent,
   createToollessAgent,
   type PiToolsAgentHandle,
   resolveAgyChildEnv,
 } from "../bridge/agent-files.ts";
-import type { AgyPiBridge, BridgeCall } from "../bridge/server.ts";
+import { AgyPiBridge, type BridgeCall, type BridgeToolDef } from "../bridge/server.ts";
 import {
   BACKGROUND_ACP_TOOL_MESSAGE,
   type BridgedToolImageBatch,
@@ -184,11 +186,32 @@ export interface StartEphemeralTurnParams {
   signal?: AbortSignal;
 }
 
+export interface StartAuxiliaryTurnParams {
+  modelId: string;
+  effort?: string;
+  prompt: AcpContentBlock[];
+  systemPromptAppend?: string;
+  tools: readonly BridgeToolDef[];
+  messages: TranscriptContext["messages"];
+  env?: Record<string, string>;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}
+
 export interface TurnSessionHandle {
   controller: AgyTurnController;
   attachExisting: boolean;
   bridgeServerName?: string;
   signalTurnAbort: () => void;
+  onConsumed?: () => void;
+}
+
+interface AuxiliaryTurn {
+  controller: AgyTurnController;
+  bridge: AgyPiBridge;
+  requestAbort: () => void;
+  cleanup: () => Promise<void>;
+  promptDone: boolean;
 }
 
 interface ActiveTurn {
@@ -287,6 +310,7 @@ export class AgyRuntime {
   #skipHistorySeed = false;
   #lastQuotaError: string | undefined;
   #activeTurn: ActiveTurn | undefined;
+  #auxTurns = new Set<AuxiliaryTurn>();
   #inTurnContinuation:
     | { piSessionId: string; conversationId: string; owner?: ActiveTurn }
     | undefined;
@@ -358,8 +382,16 @@ export class AgyRuntime {
       active.requestAbort();
       this.#deps.onWorkingStatus?.(undefined);
     }
-    await this.#disposeClient();
-    await this.#removeAgentFile();
+    const auxList = [...this.#auxTurns];
+    this.#auxTurns.clear();
+    for (const aux of auxList) {
+      aux.requestAbort();
+    }
+    await Promise.all([
+      this.#disposeClient(),
+      this.#removeAgentFile(),
+      ...auxList.map((aux) => aux.cleanup().catch(() => {})),
+    ]);
   }
 
   async #runWarmup(
@@ -1880,6 +1912,363 @@ export class AgyRuntime {
     };
   }
 
+  /** True when `messages` ends with `toolResult`s matching an active auxiliary turn's bridge calls. */
+  matchesAuxiliaryTurn(messages: TranscriptContext["messages"]): boolean {
+    return this.#findMatchingAuxiliaryTurn(messages) !== undefined;
+  }
+
+  #findMatchingAuxiliaryTurn(messages: TranscriptContext["messages"]): AuxiliaryTurn | undefined {
+    for (const aux of this.#auxTurns) {
+      if (aux.bridge.pendingCount === 0) continue;
+      const pendingIds = new Set(aux.bridge.pendingCallIds);
+      if (collectTurnToolResults(messages, pendingIds).length > 0) {
+        return aux;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Run or continue an isolated, tool-bridged one-off turn (e.g. Watchdog
+   * boundary reviews, permission arbiter, or foreground subagents) on its own
+   * ACP worker and loopback MCP bridge, never touching main session state.
+   */
+  async startOrContinueAuxiliaryTurn(params: StartAuxiliaryTurnParams): Promise<TurnSessionHandle> {
+    const existing = this.#findMatchingAuxiliaryTurn(params.messages);
+    if (existing) {
+      this.#resolveBridgeResultsFor(existing.bridge, params.messages, { allowImages: false });
+      return {
+        controller: existing.controller,
+        attachExisting: true,
+        bridgeServerName: existing.bridge.serverName,
+        signalTurnAbort: () => existing.requestAbort(),
+        onConsumed: () => {
+          if (existing.promptDone) {
+            this.#auxTurns.delete(existing);
+          }
+        },
+      };
+    }
+
+    if (params.signal?.aborted) {
+      throw makeAbortError("Antigravity turn aborted.");
+    }
+
+    const baseTimeoutMs = this.#deps.firstResponseTimeoutMs ?? DEFAULT_FIRST_RESPONSE_TIMEOUT_MS;
+    const effectiveTimeoutMs =
+      typeof params.timeoutMs === "number" && params.timeoutMs > 0
+        ? Math.min(params.timeoutMs, baseTimeoutMs)
+        : baseTimeoutMs;
+    const deadlineMs = effectiveTimeoutMs > 0 ? Date.now() + effectiveTimeoutMs : undefined;
+    const remainingMs = () =>
+      deadlineMs !== undefined ? Math.max(1, deadlineMs - Date.now()) : undefined;
+
+    const auxId = randomUUID().replaceAll("-", "").slice(0, 12);
+    const auxServerName = `pi-aux-${auxId}`;
+    const auxToken = randomUUID();
+    const auxBridge = new AgyPiBridge(auxServerName, undefined, auxServerName);
+    auxBridge.requireToken(auxToken);
+    const toolSnapshot = params.tools.map((tool) => ({ ...tool }));
+    auxBridge.setToolSource(() => toolSnapshot);
+    auxBridge.refreshTools();
+
+    const auxAgent = createAuxiliaryToolsAgent(
+      { serverName: auxServerName },
+      { agentsDir: this.#deps.agentsDir },
+    );
+
+    let client: AgyAcpClientLike | undefined;
+    let sessionId = "";
+    const setupStartedAt = Date.now();
+    try {
+      await auxBridge.start();
+      await auxAgent.write();
+
+      const verified = this.#deps.checkBinary
+        ? await this.#deps.checkBinary(this.#deps.binaryPath, params.signal)
+        : await checkAgyBinary({ binaryPath: this.#deps.binaryPath, signal: params.signal });
+
+      if (params.signal?.aborted) {
+        throw makeAbortError("Antigravity turn aborted.");
+      }
+      if (!auxBridge.url) {
+        throw new Error("antigravity: auxiliary MCP bridge failed to expose a URL.");
+      }
+
+      const effectiveEnv = resolveAgyChildEnv({
+        hostHindsightActive: this.#deps.isHostHindsightActive?.(),
+        env: params.env,
+      });
+      const clientOptions: AgyAcpClientOptions = {
+        binary: verified.binary,
+        cwd: this.#deps.cwd,
+        agentName: auxAgent.agentName,
+        extraDirs: this.#deps.extraDirs,
+        sandbox: this.#deps.sandbox,
+        env: effectiveEnv,
+      };
+      client = this.#deps.createClient
+        ? this.#deps.createClient(clientOptions)
+        : new AgyAcpClient(clientOptions);
+
+      const mcpServers: AcpHttpMcpServer[] = [
+        {
+          type: "http",
+          name: auxServerName,
+          url: auxBridge.url,
+          headers: [{ name: "x-pi-bridge-token", value: auxToken }],
+        },
+      ];
+
+      await client.initialize({ signal: params.signal, timeoutMs: remainingMs() });
+      const created = await client.newSession({
+        cwd: this.#deps.cwd,
+        mcpServers,
+        signal: params.signal,
+        timeoutMs: remainingMs(),
+      });
+      sessionId = created.sessionId;
+      await this.#syncSessionConfigTo(
+        client,
+        sessionId,
+        { modelId: params.modelId, effort: params.effort, executionMode: "default" },
+        created.configOptions,
+        { signal: params.signal, timeoutMs: remainingMs() },
+      );
+    } catch (err) {
+      await client?.dispose(50).catch(() => {});
+      await auxBridge.close().catch(() => {});
+      await auxAgent.remove().catch(() => {});
+      if (params.signal?.aborted || isAbortError(err)) {
+        throw makeAbortError("Antigravity turn aborted.");
+      }
+      if (err instanceof AcpRequestStallError) {
+        throw new AgyFirstResponseTimeoutError(effectiveTimeoutMs);
+      }
+      if (err instanceof Error && isAgyQuotaError(err.message)) {
+        throw new AgyQuotaError(err.message);
+      }
+      throw err;
+    }
+
+    const activeClient = client;
+    const remainingWatchdogMs = Math.max(
+      1,
+      effectiveTimeoutMs - Math.max(0, Date.now() - setupStartedAt),
+    );
+    const controller = new AgyTurnController();
+    const acpTools = new Map<string, AgyToolView>();
+    const quotaTracker = new AgyQuotaTurnTracker();
+    const promptAbort = new AbortController();
+
+    let sawFirstResponse = false;
+    let timedOut = false;
+    let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+    let cleanupPromise: Promise<void> | undefined;
+
+    const clearTimeoutTimer = () => {
+      if (timeoutTimer) {
+        clearTimeout(timeoutTimer);
+        timeoutTimer = undefined;
+      }
+    };
+
+    const noteFirstResponse = () => {
+      if (sawFirstResponse) return;
+      sawFirstResponse = true;
+      clearTimeoutTimer();
+    };
+
+    const onExternalAbort = () => {
+      auxTurn.requestAbort();
+    };
+
+    const cleanup = (): Promise<void> => {
+      cleanupPromise ??= (async () => {
+        clearTimeoutTimer();
+        params.signal?.removeEventListener("abort", onExternalAbort);
+        const cancelled = auxBridge.cancelPendingCalls(
+          "antigravity: auxiliary turn ended while tool call was pending.",
+        );
+        if (cancelled > 0) {
+          await auxBridge.flushResponses().catch(() => {});
+        }
+        await activeClient.closeSession?.(sessionId).catch(() => {});
+        await activeClient.dispose(100).catch(() => {});
+        await auxBridge.close().catch(() => {});
+        await auxAgent.remove().catch(() => {});
+      })();
+      return cleanupPromise;
+    };
+
+    const auxTurn: AuxiliaryTurn = {
+      controller,
+      bridge: auxBridge,
+      requestAbort: () => {
+        clearTimeoutTimer();
+        promptAbort.abort();
+        const cancelled = auxBridge.cancelPendingCalls(
+          "antigravity: auxiliary turn aborted while tool call was pending.",
+        );
+        if (cancelled > 0) {
+          void auxBridge.flushResponses().catch(() => {});
+        }
+      },
+      cleanup,
+      promptDone: false,
+    };
+    this.#auxTurns.add(auxTurn);
+
+    auxBridge.setOnCall((call) => {
+      if (timedOut || controller.isSettled || promptAbort.signal.aborted) return false;
+      noteFirstResponse();
+      quotaTracker.noteToolActivity();
+      controller.pushActivity({
+        type: "bridge_call",
+        callId: call.id,
+        name: call.tool,
+        args: call.args,
+      });
+      return true;
+    });
+
+    timeoutTimer = setTimeout(() => {
+      if (sawFirstResponse || controller.isSettled || promptAbort.signal.aborted) return;
+      timedOut = true;
+      clearTimeoutTimer();
+      try {
+        activeClient.cancelSession(sessionId);
+      } catch {
+        // Best-effort cancel before hard client disposal.
+      }
+      void cleanup();
+      this.#auxTurns.delete(auxTurn);
+      controller.fail(new AgyFirstResponseTimeoutError(effectiveTimeoutMs));
+    }, remainingWatchdogMs);
+    timeoutTimer.unref?.();
+
+    if (params.signal) {
+      if (params.signal.aborted) {
+        onExternalAbort();
+      } else {
+        params.signal.addEventListener("abort", onExternalAbort, { once: true });
+      }
+    }
+
+    const outboundPrompt = prependSystemContext(params.prompt, params.systemPromptAppend);
+
+    void (async () => {
+      try {
+        const promptResult = await activeClient.prompt(sessionId, outboundPrompt, {
+          signal: promptAbort.signal,
+          onUpdate: (update) => {
+            if (timedOut || controller.isSettled) return;
+            const activity = acpUpdateToActivity(update, acpTools);
+            if (!activity) return;
+
+            if (activity.type === "context_usage") {
+              if (activity.usedTokens > 0) {
+                noteFirstResponse();
+                quotaTracker.noteUsageUpdate();
+              }
+              controller.pushActivity(activity);
+              return;
+            }
+
+            noteFirstResponse();
+
+            if (activity.type === "thinking_delta") {
+              quotaTracker.noteThought();
+              controller.pushActivity(activity);
+              return;
+            }
+
+            if (activity.type === "text_delta") {
+              quotaTracker.noteText(activity.text);
+              controller.pushActivity(activity);
+              return;
+            }
+
+            if (isBridgedMcpTool(activity, auxServerName)) {
+              quotaTracker.noteToolActivity();
+            }
+          },
+        });
+
+        params.signal?.removeEventListener("abort", onExternalAbort);
+        clearTimeoutTimer();
+        if (timedOut || controller.isSettled) return;
+
+        const normalizedUsage = normalizeAcpPromptUsage(promptResult.usage);
+        const errorBanner = quotaTracker.detectTurnErrorBanner({
+          totalTokens: normalizedUsage?.total_tokens,
+          outputTokens: normalizedUsage?.output_tokens,
+        });
+        if (errorBanner?.kind === "quota") {
+          controller.fail(
+            new AgyQuotaError(errorBanner.message, { resetsIn: errorBanner.resetsIn }),
+          );
+          return;
+        }
+        if (errorBanner?.kind === "api_error") {
+          controller.fail(new Error(errorBanner.message));
+          return;
+        }
+
+        if (promptResult.stopReason === "cancelled") {
+          controller.finish({ status: "aborted", stopReason: "aborted" });
+          return;
+        }
+
+        const stopError = classifyAcpStopReasonFailure(promptResult.stopReason);
+        if (stopError) {
+          controller.fail(new Error(stopError));
+          return;
+        }
+
+        controller.finish({
+          status: "completed",
+          stopReason: promptResult.stopReason,
+          usage: normalizedUsage,
+        });
+      } catch (err) {
+        params.signal?.removeEventListener("abort", onExternalAbort);
+        clearTimeoutTimer();
+        if (timedOut || controller.isSettled) return;
+
+        if (promptAbort.signal.aborted || isAbortError(err)) {
+          controller.finish({ status: "aborted", stopReason: "aborted" });
+          return;
+        }
+
+        const error = err instanceof Error ? err : new Error(String(err));
+        if (isAgyQuotaError(error.message)) {
+          controller.fail(new AgyQuotaError(error.message));
+          return;
+        }
+        controller.fail(error);
+      } finally {
+        auxTurn.promptDone = true;
+        await cleanup();
+        if (controller.isConsumed || promptAbort.signal.aborted) {
+          this.#auxTurns.delete(auxTurn);
+        }
+      }
+    })();
+
+    return {
+      controller,
+      attachExisting: false,
+      bridgeServerName: auxServerName,
+      signalTurnAbort: () => auxTurn.requestAbort(),
+      onConsumed: () => {
+        if (auxTurn.promptDone) {
+          this.#auxTurns.delete(auxTurn);
+        }
+      },
+    };
+  }
+
   /** Resolve pending bridged MCP calls from trailing `toolResult` messages in context. */
   resolveBridgeResultsFromMessages(
     messages: Parameters<typeof collectTurnToolResults>[0],
@@ -1889,7 +2278,18 @@ export class AgyRuntime {
       outImageBatches?: BridgedToolImageBatch[];
     },
   ): number {
-    const bridge = this.#deps.bridge;
+    return this.#resolveBridgeResultsFor(this.#deps.bridge, messages, options);
+  }
+
+  #resolveBridgeResultsFor(
+    bridge: AgyPiBridge | undefined,
+    messages: Parameters<typeof collectTurnToolResults>[0],
+    options?: {
+      allowImages?: boolean;
+      labels?: ReadonlyMap<string, string>;
+      outImageBatches?: BridgedToolImageBatch[];
+    },
+  ): number {
     if (!bridge || bridge.pendingCount === 0) return 0;
     const pendingIds = new Set(bridge.pendingCallIds);
     const results = collectTurnToolResults(messages, pendingIds);

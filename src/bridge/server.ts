@@ -144,6 +144,7 @@ export class AgyPiBridge {
   /** Unique descriptor-cache key; each agy process discovers its own private server. */
   readonly serverName: string;
   readonly #callTimeoutMs: number;
+  readonly #callIdPrefix: string;
   /** Callback that routes a call into the live agy turn controller. Returns false when no turn is active. */
   #onCall: ((call: BridgeCall) => boolean) | undefined;
   /** Source of the current active-tool snapshot, invoked once per provider request. */
@@ -153,9 +154,14 @@ export class AgyPiBridge {
   #catalogDigest = createHash("sha256").update("[]").digest("hex");
   #catalogRevision = 0;
 
-  constructor(serverName: string = BRIDGE_SERVER_NAME, callTimeoutMs = BRIDGE_CALL_TIMEOUT_MS) {
+  constructor(
+    serverName: string = BRIDGE_SERVER_NAME,
+    callTimeoutMs = BRIDGE_CALL_TIMEOUT_MS,
+    callIdPrefix = "pi-bridge",
+  ) {
     this.serverName = serverName;
     this.#callTimeoutMs = callTimeoutMs;
+    this.#callIdPrefix = callIdPrefix;
   }
 
   /** Require `token` in the x-pi-bridge-token header on every request. */
@@ -528,7 +534,7 @@ export class AgyPiBridge {
         isError: true,
       };
     }
-    const id = `pi-bridge-${++this.#seq}`;
+    const id = `${this.#callIdPrefix}-${++this.#seq}`;
     if (!this.#onCall?.({ id, tool, args })) {
       return {
         content: "antigravity: no active agy turn to route the tool call into.",

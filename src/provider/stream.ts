@@ -4,6 +4,7 @@ import {
   type AssistantMessage,
   type AssistantMessageEventStream,
   createAssistantMessageEventStream,
+  getCurrentTools,
   type JsonObject,
   type Model,
   type SimpleStreamOptions,
@@ -17,7 +18,7 @@ import type { AcpContentBlock } from "../acp/client.ts";
 import type { AgyUsage } from "../acp/events.ts";
 import type { AgyExecutionMode } from "../acp/models.ts";
 import { isAbortError } from "../acp/shared.ts";
-import { WRAPPER_TOOL_NAME } from "../bridge/server.ts";
+import { type BridgeToolDef, WRAPPER_TOOL_NAME } from "../bridge/server.ts";
 import {
   buildSeededSessionPrompt,
   extractSystemPromptAppend,
@@ -43,6 +44,7 @@ export interface AgyStreamDeps {
   getAllEntries?: () => readonly SessionEntryLike[];
   requireMatchingSessionId?: () => boolean;
   getExecutionMode?: () => AgyExecutionMode;
+  getMainToolNames?: () => readonly string[];
   replayStore: AgyReplayStore;
   now?: () => number;
 }
@@ -170,6 +172,7 @@ export function createAntigravityStreamSimple(
         | { kind: "text"; index: number }
         | undefined;
       let detachAbort: (() => void) | undefined;
+      let activeTurnHandle: { onConsumed?: () => void } | undefined;
 
       const closeActiveBlock = () => {
         if (!activeBlock) return;
@@ -203,13 +206,35 @@ export function createAntigravityStreamSimple(
 
         const allowImages = model.input.includes("image");
         const mainSessionId = deps.getSessionId();
-        const isEphemeral =
+        const runtime = deps.getRuntime();
+        const contextTools: BridgeToolDef[] = getCurrentTools(context.messages)
+          .filter((tool) => tool.name !== WRAPPER_TOOL_NAME)
+          .map((tool) => ({
+            name: tool.name,
+            description: tool.description ?? "",
+            parameters: tool.parameters,
+          }));
+        const isAuxContinuation = runtime.matchesAuxiliaryTurn(context.messages);
+        const sessionMismatch =
+          options?.sessionId !== undefined
+            ? options.sessionId !== mainSessionId
+            : Boolean(deps.requireMatchingSessionId?.());
+        const forceNoTools = options?.toolChoice === "none";
+        const forceIsolated =
           options?.disableContinuation === true ||
           options?.cacheRetention === "none" ||
-          options?.toolChoice === "none" ||
-          (options?.sessionId !== undefined
-            ? options.sessionId !== mainSessionId
-            : Boolean(deps.requireMatchingSessionId?.()));
+          sessionMismatch;
+        const mainToolNames = deps.getMainToolNames?.();
+        const hasForeignTools =
+          Boolean(mainToolNames && mainToolNames.length > 0 && contextTools.length > 0) &&
+          (() => {
+            const known = new Set(mainToolNames);
+            return contextTools.some((tool) => !known.has(tool.name));
+          })();
+        const isAuxiliaryWithTools =
+          isAuxContinuation ||
+          (!forceNoTools && contextTools.length > 0 && (hasForeignTools || forceIsolated));
+        const isEphemeral = !isAuxiliaryWithTools && (forceNoTools || forceIsolated);
 
         const systemPromptAppend = extractSystemPromptAppend(context.messages);
         const reservedSysBytes = systemPromptAppend
@@ -218,13 +243,16 @@ export function createAntigravityStreamSimple(
         const initialPayload: AgyStreamPayload = {
           modelId: model.id,
           effort: options?.reasoning,
-          executionMode: isEphemeral ? "default" : deps.getExecutionMode?.(),
-          prompt: isEphemeral
-            ? buildSeededSessionPrompt(context.messages, {
-                allowImages,
-                maxBytes: Math.max(1_024, MAX_AGY_PROMPT_BYTES - reservedSysBytes),
-              })
-            : extractTrailingUserPrompt(context.messages, { allowImages }),
+          executionMode:
+            isEphemeral || isAuxiliaryWithTools ? "default" : deps.getExecutionMode?.(),
+          prompt: isAuxContinuation
+            ? []
+            : isEphemeral || isAuxiliaryWithTools
+              ? buildSeededSessionPrompt(context.messages, {
+                  allowImages,
+                  maxBytes: Math.max(1_024, MAX_AGY_PROMPT_BYTES - reservedSysBytes),
+                })
+              : extractTrailingUserPrompt(context.messages, { allowImages }),
           systemPromptAppend,
         };
 
@@ -247,33 +275,46 @@ export function createAntigravityStreamSimple(
         }
         const promptReplaced = payload.prompt !== initialPayload.prompt;
 
-        const turn = isEphemeral
-          ? await deps.getRuntime().startEphemeralTurn({
+        const turn = isAuxiliaryWithTools
+          ? await runtime.startOrContinueAuxiliaryTurn({
               modelId: payload.modelId,
               effort: payload.effort,
               prompt: payload.prompt,
               systemPromptAppend: payload.systemPromptAppend,
+              tools: contextTools,
+              messages: context.messages,
               env: options?.env,
               timeoutMs: options?.timeoutMs,
               signal: options?.signal,
             })
-          : await deps.getRuntime().startOrContinueTurn({
-              modelId: payload.modelId,
-              effort: payload.effort,
-              executionMode: payload.executionMode,
-              prompt: payload.prompt,
-              promptReplaced,
-              allowImages,
-              systemPromptAppend: payload.systemPromptAppend,
-              messages: context.messages,
-              sessionId: mainSessionId,
-              branchEntries: deps.getBranchEntries(),
-              allEntries: deps.getAllEntries?.(),
-              env: options?.env,
-              timeoutMs: options?.timeoutMs,
-              signal: options?.signal,
-              replayStore: deps.replayStore,
-            });
+          : isEphemeral
+            ? await runtime.startEphemeralTurn({
+                modelId: payload.modelId,
+                effort: payload.effort,
+                prompt: payload.prompt,
+                systemPromptAppend: payload.systemPromptAppend,
+                env: options?.env,
+                timeoutMs: options?.timeoutMs,
+                signal: options?.signal,
+              })
+            : await runtime.startOrContinueTurn({
+                modelId: payload.modelId,
+                effort: payload.effort,
+                executionMode: payload.executionMode,
+                prompt: payload.prompt,
+                promptReplaced,
+                allowImages,
+                systemPromptAppend: payload.systemPromptAppend,
+                messages: context.messages,
+                sessionId: mainSessionId,
+                branchEntries: deps.getBranchEntries(),
+                allEntries: deps.getAllEntries?.(),
+                env: options?.env,
+                timeoutMs: options?.timeoutMs,
+                signal: options?.signal,
+                replayStore: deps.replayStore,
+              });
+        activeTurnHandle = turn;
 
         if (options?.signal) {
           const onAbort = () => turn.signalTurnAbort();
@@ -391,6 +432,7 @@ export function createAntigravityStreamSimple(
         closeActiveBlock();
 
         if (waveResult.wave === "aborted") {
+          activeTurnHandle?.onConsumed?.();
           partial.stopReason = "aborted";
           partial.errorMessage = "Request was aborted.";
           stream.push({ type: "error", reason: "aborted", error: partial });
@@ -410,6 +452,7 @@ export function createAntigravityStreamSimple(
 
         const settled = waveResult.result;
         if (settled.status === "aborted") {
+          activeTurnHandle?.onConsumed?.();
           partial.stopReason = "aborted";
           partial.errorMessage = "Antigravity turn aborted.";
           stream.push({ type: "error", reason: "aborted", error: partial });
@@ -420,12 +463,14 @@ export function createAntigravityStreamSimple(
         partial.usage = toPiUsage(settled.usage, model, settled.contextTokens);
 
         if (hasAnyToolCall) {
+          activeTurnHandle?.onConsumed?.();
           partial.stopReason = "toolUse";
           stream.push({ type: "done", reason: "toolUse", message: partial });
           stream.end(partial);
           return;
         }
 
+        activeTurnHandle?.onConsumed?.();
         const reason = settled.stopReason === "max_tokens" ? "length" : "stop";
         partial.stopReason = reason;
         stream.push({ type: "done", reason, message: partial });
@@ -433,6 +478,7 @@ export function createAntigravityStreamSimple(
       } catch (err) {
         detachAbort?.();
         closeActiveBlock();
+        activeTurnHandle?.onConsumed?.();
         const isAbort = Boolean(options?.signal?.aborted) || isAbortError(err);
         partial.stopReason = isAbort ? "aborted" : "error";
         partial.errorMessage = err instanceof Error ? err.message : String(err);

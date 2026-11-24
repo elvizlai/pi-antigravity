@@ -334,6 +334,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       getAllEntries: () => activeCtx?.sessionManager.getEntries?.() ?? [],
       requireMatchingSessionId: () => activeCtx !== undefined,
       getExecutionMode: () => executionMode,
+      getMainToolNames: () => pi.getAllTools().map((t) => t.name),
       replayStore,
     }),
   });

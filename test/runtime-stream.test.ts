@@ -3889,3 +3889,454 @@ test("large systemPromptAppend plus >200KB history stays within MAX_AGY_PROMPT_B
     fs.rmSync(agentsDir, { recursive: true, force: true });
   }
 });
+
+test("watchdog-style auxiliary turn sharing main sessionId isolates ACP + MCP bridge across tool waves", async () => {
+  const agentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-aux-watchdog-"));
+  const mainBridge = new AgyPiBridge("pi-main-watchdog");
+  mainBridge.setToolSource(() => [
+    { name: "read", description: "Read", parameters: {} },
+    { name: "bash", description: "Bash", parameters: {} },
+  ]);
+  mainBridge.refreshTools();
+  await mainBridge.start();
+
+  const mainCalls: string[] = [];
+  let auxClientsCreated = 0;
+  let auxBridgeUrl = "";
+  let auxToolList: string[] = [];
+  let auxClosed = false;
+  let auxDisposed = false;
+  let auxAgentDirExistsDuringPrompt = false;
+
+  const postBridgeRpc = async (
+    server: AcpHttpMcpServer,
+    payload: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> => {
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    for (const h of server.headers) {
+      headers[h.name] = h.value;
+    }
+    const res = await fetch(server.url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+    });
+    assert.equal(res.status, 200);
+    return (await res.json()) as Record<string, unknown>;
+  };
+
+  const runtime = new AgyRuntime({
+    cwd: "/work",
+    bridge: mainBridge,
+    agentsDir,
+    getToolMode: () => "pi",
+    checkBinary: async () => ({ binary: "/bin/agy", version: "1.5.15" }),
+    createClient(opts) {
+      const isAux = (opts.agentName ?? "").startsWith("pi-aux-");
+      if (!isAux) {
+        return {
+          isAlive: true,
+          async initialize() {
+            return { protocolVersion: 1 };
+          },
+          async newSession() {
+            return { sessionId: "conv-main-1" };
+          },
+          async resumeSession() {
+            return { sessionId: "conv-main-1" };
+          },
+          async setConfigOption() {
+            return {};
+          },
+          cancelSession() {},
+          async closeSession() {},
+          async prompt(_sid, blocks, promptOpts) {
+            const text = blocks.map((b) => (b.type === "text" ? b.text : "")).join("\n");
+            mainCalls.push(text);
+            promptOpts?.onUpdate?.({
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "MAIN_OK" },
+            });
+            return { stopReason: "end_turn" };
+          },
+          async dispose() {},
+        };
+      }
+
+      auxClientsCreated += 1;
+      let auxMcpServer: AcpHttpMcpServer | undefined;
+      return {
+        isAlive: true,
+        async initialize() {
+          return { protocolVersion: 1 };
+        },
+        async newSession(sessionOpts) {
+          auxMcpServer = sessionOpts.mcpServers?.[0];
+          assert.ok(auxMcpServer);
+          auxBridgeUrl = auxMcpServer.url;
+          auxAgentDirExistsDuringPrompt = fs.existsSync(path.join(agentsDir, opts.agentName ?? ""));
+          return { sessionId: "conv-aux-1" };
+        },
+        async resumeSession() {
+          throw new Error("auxiliary client must never resume");
+        },
+        async setConfigOption() {
+          return {};
+        },
+        cancelSession() {},
+        async closeSession() {
+          auxClosed = true;
+        },
+        async prompt(_sid, _blocks, promptOpts) {
+          assert.ok(auxMcpServer);
+          await postBridgeRpc(auxMcpServer, {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "initialize",
+            params: { protocolVersion: "2024-11-05" },
+          });
+          const listed = (await postBridgeRpc(auxMcpServer, {
+            jsonrpc: "2.0",
+            id: 2,
+            method: "tools/list",
+          })) as { result: { tools: Array<{ name: string }> } };
+          auxToolList = listed.result.tools.map((t) => t.name).sort();
+
+          const diffRes = (await postBridgeRpc(auxMcpServer, {
+            jsonrpc: "2.0",
+            id: 3,
+            method: "tools/call",
+            params: { name: "pi__watchdog_diff", arguments: { stat: true } },
+          })) as { result: { content: Array<{ text: string }> } };
+          assert.equal(diffRes.result.content[0]?.text, "1 file changed");
+
+          const warnRes = (await postBridgeRpc(auxMcpServer, {
+            jsonrpc: "2.0",
+            id: 4,
+            method: "tools/call",
+            params: {
+              name: "pi__watchdog_warn",
+              arguments: { severity: "concern", summary: "missing test" },
+            },
+          })) as { result: { content: Array<{ text: string }> } };
+          assert.equal(warnRes.result.content[0]?.text, "Watchdog warning recorded.");
+
+          promptOpts?.onUpdate?.({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "WATCHDOG_DONE" },
+          });
+          return { stopReason: "end_turn" };
+        },
+        async dispose() {
+          auxDisposed = true;
+        },
+      };
+    },
+  });
+
+  const streamSimple = createAntigravityStreamSimple({
+    getRuntime: () => runtime,
+    getSessionId: () => "pi-main",
+    getBranchEntries: () => [],
+    requireMatchingSessionId: () => false,
+    getMainToolNames: () => ["read", "bash", "edit", "write"],
+    replayStore: new AgyReplayStore(),
+  });
+
+  try {
+    // 1. Main turn establishes main conversation.
+    const mainMsg = await streamSimple(
+      testModel(),
+      makeTranscript([
+        {
+          role: "system",
+          content: "Main prompt",
+          toolsAdded: [{ name: "read", description: "Read", parameters: {} }],
+          timestamp: 0,
+        },
+        { role: "user", content: "edit app.ts", timestamp: 1 },
+      ]),
+      { sessionId: "pi-main" },
+    ).result();
+    assert.equal(mainMsg.stopReason, "stop");
+    assert.equal(runtime.conversationId, "conv-main-1");
+
+    // 2. Watchdog runs at agent_end sharing sessionId="pi-main" but declaring watchdog tools.
+    const watchdogSys = {
+      role: "system",
+      content: "Watchdog instructions",
+      toolsAdded: [
+        { name: "read", description: "Read", parameters: {} },
+        { name: "watchdog_diff", description: "Diff", parameters: {} },
+        { name: "watchdog_warn", description: "Warn", parameters: {} },
+      ],
+      timestamp: 10,
+    };
+    const w1Messages: unknown[] = [
+      watchdogSys,
+      { role: "user", content: "<turn_delta>edited app.ts</turn_delta>", timestamp: 11 },
+    ];
+    const w1 = await streamSimple(testModel(), makeTranscript(w1Messages), {
+      sessionId: "pi-main",
+    }).result();
+    assert.equal(w1.stopReason, "toolUse");
+    const tc1 = w1.content.find((b) => b.type === "toolCall");
+    assert.ok(tc1 && tc1.type === "toolCall");
+    assert.equal(tc1.name, "watchdog_diff");
+    assert.match(tc1.id, /^pi-aux-/);
+
+    const w2Messages: unknown[] = [
+      ...w1Messages,
+      w1,
+      {
+        role: "toolResult",
+        toolCallId: tc1.id,
+        toolName: "watchdog_diff",
+        content: [{ type: "text", text: "1 file changed" }],
+        isError: false,
+        timestamp: 12,
+      },
+    ];
+    const w2 = await streamSimple(testModel(), makeTranscript(w2Messages), {
+      sessionId: "pi-main",
+    }).result();
+    assert.equal(w2.stopReason, "toolUse");
+    const tc2 = w2.content.find((b) => b.type === "toolCall");
+    assert.ok(tc2 && tc2.type === "toolCall");
+    assert.equal(tc2.name, "watchdog_warn");
+
+    const w3Messages: unknown[] = [
+      ...w2Messages,
+      w2,
+      {
+        role: "toolResult",
+        toolCallId: tc2.id,
+        toolName: "watchdog_warn",
+        content: [{ type: "text", text: "Watchdog warning recorded." }],
+        isError: false,
+        timestamp: 13,
+      },
+    ];
+    const w3 = await streamSimple(testModel(), makeTranscript(w3Messages), {
+      sessionId: "pi-main",
+    }).result();
+    assert.equal(w3.stopReason, "stop");
+    assert.equal(w3.content[0]?.type === "text" ? w3.content[0].text : "", "WATCHDOG_DONE");
+
+    assert.equal(auxClientsCreated, 1);
+    assert.notEqual(auxBridgeUrl, mainBridge.url);
+    assert.deepEqual(auxToolList, ["pi__read", "pi__watchdog_diff", "pi__watchdog_warn"]);
+    assert.equal(auxAgentDirExistsDuringPrompt, true);
+    assert.equal(auxClosed, true);
+    assert.equal(auxDisposed, true);
+    assert.equal(runtime.conversationId, "conv-main-1");
+    assert.equal(mainCalls.length, 1);
+
+    // Wait a tick for finally cleanup and verify no pi-aux-* agent dirs remain.
+    await new Promise((r) => setTimeout(r, 20));
+    assert.deepEqual(
+      fs.readdirSync(agentsDir).filter((name) => name.startsWith("pi-aux-")),
+      [],
+    );
+  } finally {
+    await runtime.dispose();
+    await mainBridge.close();
+    fs.rmSync(agentsDir, { recursive: true, force: true });
+  }
+});
+
+test("auxiliary turn aborts cleanly during tool_wave (watchdog_ask yield) without leaking handles", async () => {
+  const agentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-aux-abort-"));
+  let auxHttpErrorResult: boolean | undefined;
+  let auxDisposed = false;
+  let auxPromptFinished = false;
+
+  const runtime = new AgyRuntime({
+    cwd: "/work",
+    agentsDir,
+    checkBinary: async () => ({ binary: "/bin/agy", version: "1.5.15" }),
+    createClient() {
+      let auxMcpServer: AcpHttpMcpServer | undefined;
+      return {
+        isAlive: true,
+        async initialize() {
+          return { protocolVersion: 1 };
+        },
+        async newSession(sessionOpts) {
+          auxMcpServer = sessionOpts.mcpServers?.[0];
+          return { sessionId: "conv-aux-abort" };
+        },
+        async resumeSession() {
+          throw new Error("must not resume");
+        },
+        async setConfigOption() {
+          return {};
+        },
+        cancelSession() {},
+        async closeSession() {},
+        async prompt(_sid, _blocks, promptOpts) {
+          try {
+            assert.ok(auxMcpServer);
+            const headers: Record<string, string> = { "content-type": "application/json" };
+            for (const h of auxMcpServer.headers) {
+              headers[h.name] = h.value;
+            }
+            const res = await fetch(auxMcpServer.url, {
+              method: "POST",
+              headers,
+              body: JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                method: "tools/call",
+                params: { name: "pi__watchdog_ask", arguments: { question: "Scope?" } },
+              }),
+            });
+            const json = (await res.json()) as { result: { isError: boolean } };
+            auxHttpErrorResult = json.result.isError;
+            if (promptOpts?.signal?.aborted) {
+              return { stopReason: "cancelled" };
+            }
+            return { stopReason: "end_turn" };
+          } finally {
+            auxPromptFinished = true;
+          }
+        },
+        async dispose() {
+          auxDisposed = true;
+        },
+      };
+    },
+  });
+
+  const streamSimple = createAntigravityStreamSimple({
+    getRuntime: () => runtime,
+    getSessionId: () => "pi-main",
+    getBranchEntries: () => [],
+    getMainToolNames: () => ["read", "bash"],
+    replayStore: new AgyReplayStore(),
+  });
+
+  try {
+    const ac = new AbortController();
+    const w1 = await streamSimple(
+      testModel(),
+      makeTranscript([
+        {
+          role: "system",
+          content: "Watchdog prompt",
+          toolsAdded: [{ name: "watchdog_ask", description: "Ask", parameters: {} }],
+          timestamp: 0,
+        },
+        { role: "user", content: "review", timestamp: 1 },
+      ]),
+      { sessionId: "pi-main", signal: ac.signal },
+    ).result();
+
+    assert.equal(w1.stopReason, "toolUse");
+    // Simulate watchdog_ask calling agent.abort() during tool execution before Wave 2.
+    ac.abort();
+
+    for (let i = 0; i < 50 && (!auxPromptFinished || !auxDisposed); i += 1) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    assert.equal(auxHttpErrorResult, true);
+    assert.equal(auxPromptFinished, true);
+    assert.equal(auxDisposed, true);
+    assert.deepEqual(
+      fs.readdirSync(agentsDir).filter((name) => name.startsWith("pi-aux-")),
+      [],
+    );
+  } finally {
+    await runtime.dispose();
+    fs.rmSync(agentsDir, { recursive: true, force: true });
+  }
+});
+
+test("foreground subagent with different sessionId and tools routes to pi-aux while toolless side thread routes to pi-ephemeral", async () => {
+  const agentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-aux-vs-eph-"));
+  const launched: Array<{ agentName: string; mcpCount: number }> = [];
+
+  const runtime = new AgyRuntime({
+    cwd: "/work",
+    agentsDir,
+    checkBinary: async () => ({ binary: "/bin/agy", version: "1.5.15" }),
+    createClient(opts) {
+      return {
+        isAlive: true,
+        async initialize() {
+          return { protocolVersion: 1 };
+        },
+        async newSession(sessionOpts) {
+          launched.push({
+            agentName: opts.agentName ?? "",
+            mcpCount: sessionOpts.mcpServers?.length ?? 0,
+          });
+          return { sessionId: `conv-${launched.length}` };
+        },
+        async resumeSession() {
+          throw new Error("must not resume");
+        },
+        async setConfigOption() {
+          return {};
+        },
+        cancelSession() {},
+        async closeSession() {},
+        async prompt(_sid, _blocks, promptOpts) {
+          promptOpts?.onUpdate?.({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "OK" },
+          });
+          return { stopReason: "end_turn" };
+        },
+        async dispose() {},
+      };
+    },
+  });
+
+  const streamSimple = createAntigravityStreamSimple({
+    getRuntime: () => runtime,
+    getSessionId: () => "pi-main",
+    getBranchEntries: () => [],
+    getMainToolNames: () => ["read", "grep", "edit"],
+    replayStore: new AgyReplayStore(),
+  });
+
+  try {
+    const childMsg = await streamSimple(
+      testModel(),
+      makeTranscript([
+        {
+          role: "system",
+          content: "Child system prompt",
+          toolsAdded: [
+            { name: "read", description: "Read", parameters: {} },
+            { name: "grep", description: "Grep", parameters: {} },
+          ],
+          timestamp: 0,
+        },
+        { role: "user", content: "find foo", timestamp: 1 },
+      ]),
+      { sessionId: "child-1" },
+    ).result();
+    assert.equal(childMsg.stopReason, "stop");
+
+    const btwMsg = await streamSimple(
+      testModel(),
+      makeTranscript([
+        { role: "system", content: "Side thread", timestamp: 0 },
+        { role: "user", content: "quick question", timestamp: 1 },
+      ]),
+      { sessionId: "btw-1" },
+    ).result();
+    assert.equal(btwMsg.stopReason, "stop");
+
+    assert.equal(launched.length, 2);
+    assert.match(launched[0]?.agentName ?? "", /^pi-aux-/);
+    assert.equal(launched[0]?.mcpCount, 1);
+    assert.match(launched[1]?.agentName ?? "", /^pi-ephemeral-/);
+    assert.equal(launched[1]?.mcpCount, 0);
+  } finally {
+    await runtime.dispose();
+    fs.rmSync(agentsDir, { recursive: true, force: true });
+  }
+});

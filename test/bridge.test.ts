@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  createAuxiliaryToolsAgent,
   createPiToolsAgent,
   createToollessAgent,
   hasUnsupportedMcpAdapter,
@@ -214,16 +215,34 @@ test("pi-tools agent files, adapter guard, and dead agent sweeping stay clean", 
     fs.mkdirSync(deadEphemeralAgent, { recursive: true });
     fs.writeFileSync(path.join(deadEphemeralAgent, "agent.md"), "stale");
 
+    const auxAgent = createAuxiliaryToolsAgent({ serverName: "pi-aux-123" }, { agentsDir });
+    await auxAgent.write();
+    const auxContent = fs.readFileSync(auxAgent.agentFile, "utf-8");
+    const auxMatch = /^---\n([\s\S]*?)\n---/.exec(auxContent);
+    assert.ok(auxMatch);
+    const auxFrontmatter = JSON.parse(auxMatch[1]) as Record<string, unknown>;
+    assert.match(auxAgent.agentName, /^pi-aux-\d+-/);
+    assert.deepEqual(auxFrontmatter.tools, []);
+    assert.match(auxContent, /MCP server pi-aux-123/);
+    assert.match(auxContent, /Do not attempt to invoke any tools outside this MCP server/);
+
+    const deadAuxAgent = path.join(agentsDir, "pi-aux-999999-33333333");
+    fs.mkdirSync(deadAuxAgent, { recursive: true });
+    fs.writeFileSync(path.join(deadAuxAgent, "agent.md"), "stale");
+
     await sweepDeadPiToolsAgents({
       agentsRoot: agentsDir,
       isPidDead: (pid) => pid === 999999,
     });
     assert.equal(fs.existsSync(deadAgent), false);
     assert.equal(fs.existsSync(deadEphemeralAgent), false);
+    assert.equal(fs.existsSync(deadAuxAgent), false);
     assert.equal(fs.existsSync(liveAgent.agentDir), true);
     assert.equal(fs.existsSync(ephemeralAgent.agentDir), true);
+    assert.equal(fs.existsSync(auxAgent.agentDir), true);
     await liveAgent.remove();
     await ephemeralAgent.remove();
+    await auxAgent.remove();
 
     assert.equal(
       hasUnsupportedMcpAdapter([{ sourceInfo: { source: "npm:pi-mcp-adapter" } }]),
@@ -254,5 +273,40 @@ test("pi-tools agent files, adapter guard, and dead agent sweeping stay clean", 
     );
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("AgyPiBridge honors custom callIdPrefix", async () => {
+  const bridge = new AgyPiBridge("pi-aux-prefix", 5_000, "pi-aux-prefix");
+  bridge.setToolSource(() => [{ name: "watchdog_warn", description: "Warn", parameters: {} }]);
+  bridge.refreshTools();
+  const seenIds: string[] = [];
+  bridge.setOnCall((call) => {
+    seenIds.push(call.id);
+    return true;
+  });
+  await bridge.start();
+  try {
+    const url = bridge.url;
+    assert.ok(url);
+    const pending = fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "pi__watchdog_warn", arguments: { summary: "x" } },
+      }),
+    });
+    while (seenIds.length === 0) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    assert.match(seenIds[0] ?? "", /^pi-aux-prefix-\d+$/);
+    bridge.resolveCall(seenIds[0]!, { content: "ok", isError: false });
+    const res = await pending;
+    assert.equal(res.status, 200);
+  } finally {
+    await bridge.close();
   }
 });

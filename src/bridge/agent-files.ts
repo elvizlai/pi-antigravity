@@ -44,7 +44,7 @@ export interface PiToolsAgentHandle {
   remove(): Promise<void>;
 }
 
-const PI_TOOLS_AGENT_PATTERN = /^pi-(?:tools|ephemeral)-(\d+)-/i;
+const PI_TOOLS_AGENT_PATTERN = /^pi-(?:tools|ephemeral|aux)-(\d+)-/i;
 const MCP_ADAPTER_SOURCE = /(?:^|[:/\\])pi-mcp-adapter(?=$|[@/\\.])/;
 
 function defaultIsPidDead(pid: number): boolean {
@@ -76,58 +76,13 @@ function formatPiToolsAgentFile(agentName: string, bridge: PiToolsAgentBridge): 
   return `---\n${JSON.stringify(definition, null, 2)}\n---\n\n${piToolsAgentPrompt(bridge.serverName)}\n`;
 }
 
-/**
- * Create a static agy agent markdown definition (`~/.gemini/config/agents/<name>/agent.md`)
- * that scopes `agy` built-in tools and points prompts at this Pi process's ACP MCP bridge.
- */
-export function createPiToolsAgent(
-  bridge: PiToolsAgentBridge,
-  options?: PiToolsAgentOptions,
+function createStaticAgentHandle(
+  agentName: string,
+  content: string,
+  agentsDir: string = path.join(homedir(), ".gemini", "config", "agents"),
 ): PiToolsAgentHandle {
-  const agentsDir = options?.agentsDir ?? path.join(homedir(), ".gemini", "config", "agents");
-  const agentName = options?.agentName ?? `pi-tools-${process.pid}-${randomUUID()}`;
   const agentDir = path.join(agentsDir, agentName);
   const agentFile = path.join(agentDir, "agent.md");
-
-  return {
-    agentName,
-    agentDir,
-    agentFile,
-    async write(): Promise<void> {
-      await mkdir(agentDir, { recursive: true, mode: 0o700 });
-      await writeFile(agentFile, formatPiToolsAgentFile(agentName, bridge), {
-        mode: 0o600,
-      });
-    },
-    async remove(): Promise<void> {
-      await rm(agentDir, { recursive: true, force: true });
-    },
-  };
-}
-
-const TOOLLESS_AGENT_DESCRIPTION = "Complete standalone Pi requests without tools.";
-const TOOLLESS_AGENT_PROMPT = [
-  "# System Prompt",
-  "Follow the instructions in the prompt directly. Do not attempt to invoke tools.",
-].join("\n\n");
-
-/**
- * Create a static agy agent markdown definition (`~/.gemini/config/agents/<name>/agent.md`)
- * with all built-in tools disabled and no MCP bridge, for isolated one-off requests.
- */
-export function createToollessAgent(options?: PiToolsAgentOptions): PiToolsAgentHandle {
-  const agentsDir = options?.agentsDir ?? path.join(homedir(), ".gemini", "config", "agents");
-  const agentName = options?.agentName ?? `pi-ephemeral-${process.pid}-${randomUUID()}`;
-  const agentDir = path.join(agentsDir, agentName);
-  const agentFile = path.join(agentDir, "agent.md");
-  const definition = {
-    name: agentName,
-    description: TOOLLESS_AGENT_DESCRIPTION,
-    mainAgent: true,
-    subagent: false,
-    tools: [],
-  };
-  const content = `---\n${JSON.stringify(definition, null, 2)}\n---\n\n${TOOLLESS_AGENT_PROMPT}\n`;
 
   return {
     agentName,
@@ -141,6 +96,78 @@ export function createToollessAgent(options?: PiToolsAgentOptions): PiToolsAgent
       await rm(agentDir, { recursive: true, force: true });
     },
   };
+}
+
+/**
+ * Create a static agy agent markdown definition (`~/.gemini/config/agents/<name>/agent.md`)
+ * that scopes `agy` built-in tools and points prompts at this Pi process's ACP MCP bridge.
+ */
+export function createPiToolsAgent(
+  bridge: PiToolsAgentBridge,
+  options?: PiToolsAgentOptions,
+): PiToolsAgentHandle {
+  const agentName = options?.agentName ?? `pi-tools-${process.pid}-${randomUUID()}`;
+  return createStaticAgentHandle(
+    agentName,
+    formatPiToolsAgentFile(agentName, bridge),
+    options?.agentsDir,
+  );
+}
+
+const AUX_TOOLS_AGENT_DESCRIPTION =
+  "Complete standalone auxiliary Pi tasks using only the scoped MCP bridge tools.";
+
+function auxToolsAgentPrompt(serverName: string): string {
+  return [
+    "# System Prompt",
+    "You are completing a standalone auxiliary Pi task (such as a read-only review, arbiter decision, or scoped subagent request).",
+    `Your only tools are provided by the MCP server ${serverName}. Use the exact MCP tool names and schemas it exposes.`,
+    "Instructions in the prompt may refer to tools by their Pi names; match them to the corresponding bridged tools exposed by this server.",
+    "Do not attempt to invoke any tools outside this MCP server.",
+  ].join("\n\n");
+}
+
+/**
+ * Create a static agy agent markdown definition (`~/.gemini/config/agents/<name>/agent.md`)
+ * with all built-in tools disabled, scoped strictly to an isolated auxiliary MCP bridge.
+ */
+export function createAuxiliaryToolsAgent(
+  bridge: PiToolsAgentBridge,
+  options?: PiToolsAgentOptions,
+): PiToolsAgentHandle {
+  const agentName = options?.agentName ?? `pi-aux-${process.pid}-${randomUUID()}`;
+  const definition = {
+    name: agentName,
+    description: AUX_TOOLS_AGENT_DESCRIPTION,
+    mainAgent: true,
+    subagent: false,
+    tools: [],
+  };
+  const content = `---\n${JSON.stringify(definition, null, 2)}\n---\n\n${auxToolsAgentPrompt(bridge.serverName)}\n`;
+  return createStaticAgentHandle(agentName, content, options?.agentsDir);
+}
+
+const TOOLLESS_AGENT_DESCRIPTION = "Complete standalone Pi requests without tools.";
+const TOOLLESS_AGENT_PROMPT = [
+  "# System Prompt",
+  "Follow the instructions in the prompt directly. Do not attempt to invoke tools.",
+].join("\n\n");
+
+/**
+ * Create a static agy agent markdown definition (`~/.gemini/config/agents/<name>/agent.md`)
+ * with all built-in tools disabled and no MCP bridge, for isolated one-off requests.
+ */
+export function createToollessAgent(options?: PiToolsAgentOptions): PiToolsAgentHandle {
+  const agentName = options?.agentName ?? `pi-ephemeral-${process.pid}-${randomUUID()}`;
+  const definition = {
+    name: agentName,
+    description: TOOLLESS_AGENT_DESCRIPTION,
+    mainAgent: true,
+    subagent: false,
+    tools: [],
+  };
+  const content = `---\n${JSON.stringify(definition, null, 2)}\n---\n\n${TOOLLESS_AGENT_PROMPT}\n`;
+  return createStaticAgentHandle(agentName, content, options?.agentsDir);
 }
 
 /**
