@@ -54,7 +54,7 @@ import {
 } from "./state.ts";
 import { type AgyReplayStore, AgyTurnController } from "./turn.ts";
 
-export const DEFAULT_FIRST_RESPONSE_TIMEOUT_MS = 60_000;
+export const DEFAULT_FIRST_RESPONSE_TIMEOUT_MS = 120_000;
 const DEFAULT_CANCEL_GRACE_MS = 5_000;
 const DEFAULT_BRIDGED_TOOL_ACK_TIMEOUT_MS = 500;
 
@@ -78,7 +78,7 @@ export class AgyQuotaError extends Error {
 
 /**
  * First-event watchdog error: avoids `"timed out"` / `"timeout"` so Pi does not
- * stack extra 60s retries on top of `agy`'s own internal backoff window. Fast
+ * stack extra 120s retries on top of `agy`'s own internal backoff window. Fast
  * transient RPC/transport errors (e.g. `503` / `ECONNRESET`) still route to Pi's
  * native `autoRetry` (`maxRetries: 3`).
  */

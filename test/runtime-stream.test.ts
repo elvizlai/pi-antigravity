@@ -416,8 +416,8 @@ test("AgyQuotaError maps to non-retryable Pi error (0 retries) and hooks/env wor
   assert.match(msg.errorMessage ?? "", /quota exceeded/i);
   assert.equal(isRetryableAssistantError(msg), false);
 
-  assert.equal(DEFAULT_FIRST_RESPONSE_TIMEOUT_MS, 60_000);
-  assert.equal(new AgyFirstResponseTimeoutError(60_000).timeoutMs, 60_000);
+  assert.equal(DEFAULT_FIRST_RESPONSE_TIMEOUT_MS, 120_000);
+  assert.equal(new AgyFirstResponseTimeoutError(120_000).timeoutMs, 120_000);
   assert.match(new AgyQuotaError("Individual quota reached").message, /quota exceeded/i);
   await runtime.dispose();
 });

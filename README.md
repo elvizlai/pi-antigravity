@@ -43,7 +43,7 @@ Extension settings are stored independently in `~/.pi/agent/antigravity.json` (n
 
 ## Timeouts & Failure Handling
 
-- **First-event watchdog (`60s` default)**: covers both handshake/session setup (`initialize`, `newSession` / `resumeSession`, `setConfigOption`) and pre-first-event `session/prompt`, clearing immediately once any thinking, text, or tool/subagent activity begins — so subagents and long-running tasks have no time limit. If `agy acp` stalls for 60 seconds before emitting an initial event, the runtime cancels and disposes the stalled worker cleanly.
+- **First-event watchdog (`120s` default)**: covers both handshake/session setup (`initialize`, `newSession` / `resumeSession`, `setConfigOption`) and pre-first-event `session/prompt`, clearing immediately once any thinking, text, or tool/subagent activity begins — so subagents and long-running tasks have no time limit. If `agy acp` stalls for 120 seconds before emitting an initial event, the runtime cancels and disposes the stalled worker cleanly.
 - **Explicit quota & terminal stop reasons**: quota exhaustion (`Antigravity quota exceeded`), `max_turn_requests`, and `refusal` fail fast without retries.
 
 ## Commands & Flags
