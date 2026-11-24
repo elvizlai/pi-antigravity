@@ -18,7 +18,7 @@ import {
   resolveAgyChildEnv,
 } from "../src/bridge/agent-files.ts";
 import { AgyPiBridge } from "../src/bridge/server.ts";
-import { BACKGROUND_ACP_TOOL_MESSAGE } from "../src/provider/prompt.ts";
+import { BACKGROUND_ACP_TOOL_MESSAGE, MAX_AGY_PROMPT_BYTES } from "../src/provider/prompt.ts";
 import {
   type AgyAcpClientLike,
   AgyFirstResponseTimeoutError,
@@ -3247,6 +3247,626 @@ test("side-thread isolation, /agy-reset skip-seed, and /tree rewind invalidation
     assert.equal(mainPrompts[1]?.sessionId, "main-2");
     assert.match(mainPrompts[1]?.text ?? "", /reply at turn 1/);
     assert.match(mainPrompts[1]?.text ?? "", /new branch question$/);
+  } finally {
+    await runtime.dispose();
+    fs.rmSync(agentsDir, { recursive: true, force: true });
+  }
+});
+
+test("bridged image handoff on Turn 1 preserves ACP session when branchEntries already include live assistant/toolResult", async () => {
+  const agentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-img-livebranch-"));
+  const bridge = new AgyPiBridge("pi-img-livebranch");
+  bridge.setToolSource(() => [{ name: "read", description: "read file", parameters: {} }]);
+  bridge.refreshTools();
+  await bridge.start();
+
+  const seenPrompts: Array<{
+    sessionId: string;
+    blocks: ReadonlyArray<{ type: string; text?: string; data?: string; mimeType?: string }>;
+  }> = [];
+  let newSessionCalls = 0;
+  let closeSessionCalls = 0;
+  let releasePrompt1: (() => void) | undefined;
+
+  const runtime = new AgyRuntime({
+    cwd: "/work",
+    agentsDir,
+    bridge,
+    bridgeToken: "tok-live-img",
+    getToolMode: () => "pi",
+    ensureBridge: async () => true,
+    checkBinary: async () => ({ binary: "agy", version: "1.5.15" }),
+    createClient: () => ({
+      isAlive: true,
+      async initialize() {
+        return { protocolVersion: 1 };
+      },
+      async newSession() {
+        newSessionCalls += 1;
+        return { sessionId: `live-img-sess-${newSessionCalls}` };
+      },
+      async resumeSession() {
+        throw new Error("should reuse live session without resume");
+      },
+      async setConfigOption() {
+        return {};
+      },
+      cancelSession() {
+        releasePrompt1?.();
+      },
+      async closeSession() {
+        closeSessionCalls += 1;
+      },
+      async prompt(sid, blocks, opts) {
+        seenPrompts.push({ sessionId: sid, blocks });
+        if (seenPrompts.length === 1) {
+          opts?.signal?.addEventListener(
+            "abort",
+            () => {
+              releasePrompt1?.();
+            },
+            { once: true },
+          );
+          opts?.onUpdate?.({
+            sessionUpdate: "tool_call",
+            toolCallId: "tc-img-live",
+            name: "pi__read",
+            title: "pi__read",
+            status: "in_progress",
+          });
+          const res = await fetch(bridge.url!, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-pi-bridge-token": "tok-live-img",
+            },
+            body: JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              method: "tools/call",
+              params: { name: "pi__read", arguments: { path: "01-new-app-dialog.png" } },
+            }),
+          });
+          await res.json();
+          opts?.onUpdate?.({
+            sessionUpdate: "tool_call_update",
+            toolCallId: "tc-img-live",
+            status: "completed",
+          });
+          await new Promise<void>((resolve) => {
+            releasePrompt1 = resolve;
+          });
+          return { stopReason: "cancelled" };
+        }
+        opts?.onUpdate?.({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "kept-same-session" },
+        });
+        return { stopReason: "end_turn", usage: { totalTokens: 200 } };
+      },
+      async dispose() {},
+    }),
+  });
+
+  // Simulate realistic Pi SessionManager.getBranch() during Turn 1 before agent_end persists antigravity-state.
+  const branchEntries: Array<Record<string, unknown>> = [
+    { type: "session" },
+    { type: "model_change" },
+    { type: "message", message: { role: "user" } },
+  ];
+  const streamSimple = createAntigravityStreamSimple({
+    getRuntime: () => runtime,
+    getSessionId: () => "pi-324c5bde",
+    getBranchEntries: () => branchEntries as never,
+    getAllEntries: () => branchEntries as never,
+    replayStore: new AgyReplayStore(),
+  });
+
+  try {
+    const initialMessages: unknown[] = [
+      {
+        role: "system",
+        content: "",
+        sections: { project_context: "CUSTOM_SYS_TURN1" },
+        timestamp: 0,
+      },
+      { role: "user", content: "Implement managed PG and verify screenshots", timestamp: 1 },
+    ];
+    const msg1 = await streamSimple(testModel(), makeTranscript(initialMessages)).result();
+    assert.equal(msg1.stopReason, "toolUse");
+    const toolCall = msg1.content.find((b) => b.type === "toolCall");
+    assert.ok(toolCall && toolCall.type === "toolCall");
+
+    const toolResultMsg = {
+      role: "toolResult",
+      toolCallId: toolCall.id,
+      toolName: "read",
+      content: [
+        { type: "text", text: "Read image file [image/png]" },
+        { type: "image", data: "cG5n", mimeType: "image/png" },
+      ],
+      isError: false,
+      timestamp: 2,
+    };
+    branchEntries.push(
+      { type: "message", message: msg1 },
+      { type: "message", message: toolResultMsg },
+    );
+
+    const msg2 = await streamSimple(
+      testModel(),
+      makeTranscript([...initialMessages, msg1, toolResultMsg]),
+    ).result();
+    assert.equal(msg2.stopReason, "stop");
+    assert.deepEqual(msg2.content, [{ type: "text", text: "kept-same-session" }]);
+    assert.equal(newSessionCalls, 1);
+    assert.equal(closeSessionCalls, 0);
+    assert.equal(seenPrompts.length, 2);
+    assert.equal(seenPrompts[0]?.sessionId, "live-img-sess-1");
+    assert.equal(seenPrompts[1]?.sessionId, "live-img-sess-1");
+    const prompt2Text = seenPrompts[1]?.blocks[0]?.text ?? "";
+    assert.equal(prompt2Text.includes("CUSTOM_SYS_TURN1"), false);
+    assert.equal(prompt2Text.includes("<conversation_history>"), false);
+    assert.match(prompt2Text, /01-new-app-dialog\.png/);
+    assert.deepEqual(seenPrompts[1]?.blocks[1], {
+      type: "image",
+      data: "cG5n",
+      mimeType: "image/png",
+    });
+  } finally {
+    await runtime.dispose();
+    await bridge.close();
+    fs.rmSync(agentsDir, { recursive: true, force: true });
+  }
+});
+
+test("mid-turn steering after subagent-notify keeps existing Turn N ACP session intact without re-seeding", async () => {
+  const agentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-steer-livebranch-"));
+  const bridge = new AgyPiBridge("pi-steer-livebranch");
+  bridge.setToolSource(() => [{ name: "bash", description: "run bash", parameters: {} }]);
+  bridge.refreshTools();
+  await bridge.start();
+
+  const seenPrompts: Array<{ sessionId: string; text: string }> = [];
+  let newSessionCalls = 0;
+  let resumeCalls = 0;
+  let closeSessionCalls = 0;
+  let releasePrompt1: (() => void) | undefined;
+
+  const runtime = new AgyRuntime({
+    cwd: "/work",
+    agentsDir,
+    bridge,
+    bridgeToken: "tok-steer-live",
+    getToolMode: () => "pi",
+    ensureBridge: async () => true,
+    checkBinary: async () => ({ binary: "agy", version: "1.5.15" }),
+    createClient: () => ({
+      isAlive: true,
+      async initialize() {
+        return { protocolVersion: 1 };
+      },
+      async newSession() {
+        newSessionCalls += 1;
+        return { sessionId: `unexpected-new-${newSessionCalls}` };
+      },
+      async resumeSession(opts) {
+        resumeCalls += 1;
+        return { sessionId: opts.sessionId };
+      },
+      async setConfigOption() {
+        return {};
+      },
+      cancelSession() {
+        releasePrompt1?.();
+      },
+      async closeSession() {
+        closeSessionCalls += 1;
+      },
+      async prompt(sid, blocks, opts) {
+        const text = blocks.map((b) => (b.type === "text" ? b.text : "")).join("\n");
+        seenPrompts.push({ sessionId: sid, text });
+        if (seenPrompts.length === 1) {
+          opts?.signal?.addEventListener(
+            "abort",
+            () => {
+              releasePrompt1?.();
+            },
+            { once: true },
+          );
+          opts?.onUpdate?.({
+            sessionUpdate: "tool_call",
+            toolCallId: "tc-bash-live",
+            name: "pi__bash",
+            title: "pi__bash",
+            status: "in_progress",
+          });
+          const res = await fetch(bridge.url!, {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-pi-bridge-token": "tok-steer-live",
+            },
+            body: JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              method: "tools/call",
+              params: { name: "pi__bash", arguments: { command: "git status" } },
+            }),
+          });
+          await res.json();
+          opts?.onUpdate?.({
+            sessionUpdate: "tool_call_update",
+            toolCallId: "tc-bash-live",
+            status: "completed",
+          });
+          await new Promise<void>((resolve) => {
+            releasePrompt1 = resolve;
+          });
+          return { stopReason: "cancelled" };
+        }
+        opts?.onUpdate?.({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "steered-same-session" },
+        });
+        return { stopReason: "end_turn", usage: { totalTokens: 300 } };
+      },
+      async dispose() {},
+    }),
+  });
+
+  const branchEntries: Array<Record<string, unknown>> = [
+    {
+      type: "custom",
+      customType: AGY_STATE_ENTRY_TYPE,
+      data: {
+        version: 1,
+        kind: "conversation",
+        sessionId: "pi-01a20b48",
+        conversationId: "0f683650-live",
+        cwd: "/work",
+        turns: 4,
+      },
+    },
+    { type: "custom_message", customType: "subagent-notify" },
+  ];
+  const streamSimple = createAntigravityStreamSimple({
+    getRuntime: () => runtime,
+    getSessionId: () => "pi-01a20b48",
+    getBranchEntries: () => branchEntries as never,
+    getAllEntries: () => branchEntries as never,
+    replayStore: new AgyReplayStore(),
+  });
+
+  try {
+    const turnMessages: unknown[] = [
+      {
+        role: "system",
+        content: "",
+        sections: { project_context: "CUSTOM_SYS_SHOULD_NOT_REPEAT" },
+        timestamp: 0,
+      },
+      { role: "user", content: "Background task completed: worker 1", timestamp: 1 },
+    ];
+    const msg1 = await streamSimple(testModel(), makeTranscript(turnMessages)).result();
+    assert.equal(msg1.stopReason, "toolUse");
+    const bashCall = msg1.content.find((b) => b.type === "toolCall");
+    assert.ok(bashCall && bashCall.type === "toolCall");
+
+    const toolResultMsg = {
+      role: "toolResult",
+      toolCallId: bashCall.id,
+      toolName: "bash",
+      content: [{ type: "text", text: "clean" }],
+      isError: false,
+      timestamp: 2,
+    };
+    const worker2Notice = {
+      role: "user",
+      content: "Background task completed: worker 2 (324c5bde)",
+      timestamp: 3,
+    };
+    branchEntries.push(
+      { type: "message", message: msg1 },
+      { type: "message", message: toolResultMsg },
+      { type: "custom_message", customType: "subagent-notify" },
+    );
+
+    const msg2 = await streamSimple(
+      testModel(),
+      makeTranscript([...turnMessages, msg1, toolResultMsg, worker2Notice]),
+    ).result();
+    assert.equal(msg2.stopReason, "stop");
+    assert.deepEqual(msg2.content, [{ type: "text", text: "steered-same-session" }]);
+    assert.equal(newSessionCalls, 0);
+    assert.equal(resumeCalls, 1);
+    assert.equal(closeSessionCalls, 0);
+    assert.equal(seenPrompts.length, 2);
+    assert.equal(seenPrompts[0]?.sessionId, "0f683650-live");
+    assert.equal(seenPrompts[1]?.sessionId, "0f683650-live");
+    assert.equal(seenPrompts[1]?.text, "Background task completed: worker 2 (324c5bde)");
+    assert.equal(seenPrompts[1]?.text.includes("<conversation_history>"), false);
+    assert.equal(seenPrompts[1]?.text.includes("CUSTOM_SYS_SHOULD_NOT_REPEAT"), false);
+  } finally {
+    await runtime.dispose();
+    await bridge.close();
+    fs.rmSync(agentsDir, { recursive: true, force: true });
+  }
+});
+
+test("forced new ACP session during image handoff seeds history, customSys, manifest, and inline images", async () => {
+  const agentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-img-fallback-"));
+  const bridge = new AgyPiBridge("pi-img-fallback");
+  bridge.setToolSource(() => [{ name: "read", description: "read file", parameters: {} }]);
+  bridge.refreshTools();
+  await bridge.start();
+
+  const seenPrompts: Array<{
+    sessionId: string;
+    blocks: ReadonlyArray<{ type: string; text?: string; data?: string; mimeType?: string }>;
+  }> = [];
+  let newSessionCalls = 0;
+
+  const runtime = new AgyRuntime({
+    cwd: "/work",
+    agentsDir,
+    bridge,
+    bridgeToken: "tok-fallback",
+    getToolMode: () => "pi",
+    cancelGraceMs: 10,
+    ensureBridge: async () => true,
+    checkBinary: async () => ({ binary: "agy", version: "1.5.15" }),
+    createClient: () => {
+      let alive = true;
+      return {
+        get isAlive() {
+          return alive;
+        },
+        async initialize() {
+          return { protocolVersion: 1 };
+        },
+        async newSession() {
+          newSessionCalls += 1;
+          return { sessionId: `fallback-sess-${newSessionCalls}` };
+        },
+        async resumeSession() {
+          throw new Error("cannot resume disposed session");
+        },
+        async setConfigOption() {
+          return {};
+        },
+        cancelSession() {},
+        async prompt(sid, blocks, opts) {
+          seenPrompts.push({ sessionId: sid, blocks });
+          if (seenPrompts.length === 1) {
+            opts?.onUpdate?.({
+              sessionUpdate: "tool_call",
+              toolCallId: "tc-img-fb",
+              name: "pi__read",
+              title: "pi__read",
+              status: "in_progress",
+            });
+            const res = await fetch(bridge.url!, {
+              method: "POST",
+              headers: {
+                "content-type": "application/json",
+                "x-pi-bridge-token": "tok-fallback",
+              },
+              body: JSON.stringify({
+                jsonrpc: "2.0",
+                id: 1,
+                method: "tools/call",
+                params: { name: "pi__read", arguments: { path: "shot.png" } },
+              }),
+            });
+            await res.json();
+            opts?.onUpdate?.({
+              sessionUpdate: "tool_call_update",
+              toolCallId: "tc-img-fb",
+              status: "completed",
+            });
+            // Never resolves so cancelGraceMs triggers hard client disposal -> forces resume/newSession fallback.
+            return new Promise(() => {});
+          }
+          opts?.onUpdate?.({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "recovered-with-context" },
+          });
+          return { stopReason: "end_turn", usage: { totalTokens: 250 } };
+        },
+        async dispose() {
+          alive = false;
+        },
+      };
+    },
+  });
+
+  const branchEntries: Array<Record<string, unknown>> = [
+    { type: "message", message: { role: "user" } },
+  ];
+  const streamSimple = createAntigravityStreamSimple({
+    getRuntime: () => runtime,
+    getSessionId: () => "pi-img-fb",
+    getBranchEntries: () => branchEntries as never,
+    getAllEntries: () => branchEntries as never,
+    replayStore: new AgyReplayStore(),
+  });
+
+  try {
+    const messages: unknown[] = [
+      {
+        role: "system",
+        content: "",
+        sections: { project_context: "PROJECT_RULES_KEEP" },
+        timestamp: 0,
+      },
+      { role: "user", content: "Build feature Y and inspect shot.png", timestamp: 1 },
+    ];
+    const msg1 = await streamSimple(testModel(), makeTranscript(messages)).result();
+    assert.equal(msg1.stopReason, "toolUse");
+    const toolCall = msg1.content.find((b) => b.type === "toolCall");
+    assert.ok(toolCall && toolCall.type === "toolCall");
+
+    const toolResultMsg = {
+      role: "toolResult",
+      toolCallId: toolCall.id,
+      toolName: "read",
+      content: [
+        { type: "text", text: "Read image file [image/png]" },
+        { type: "image", data: "ZmFsbGJhY2s=", mimeType: "image/png" },
+      ],
+      isError: false,
+      timestamp: 2,
+    };
+    branchEntries.push(
+      { type: "message", message: msg1 },
+      { type: "message", message: toolResultMsg },
+    );
+
+    const msg2 = await streamSimple(
+      testModel(),
+      makeTranscript([...messages, msg1, toolResultMsg]),
+    ).result();
+    assert.equal(msg2.stopReason, "stop");
+    assert.deepEqual(msg2.content, [{ type: "text", text: "recovered-with-context" }]);
+    assert.equal(newSessionCalls, 2);
+    assert.equal(seenPrompts[1]?.sessionId, "fallback-sess-2");
+    const fallbackText = seenPrompts[1]?.blocks[0]?.text ?? "";
+    assert.match(fallbackText, /^PROJECT_RULES_KEEP/);
+    assert.match(fallbackText, /<conversation_history>/);
+    assert.match(fallbackText, /Build feature Y and inspect shot\.png/);
+    assert.match(fallbackText, /<\/conversation_history>/);
+    assert.match(fallbackText, /1\. read \("shot\.png"\) — image\/png/);
+    assert.deepEqual(seenPrompts[1]?.blocks[1], {
+      type: "image",
+      data: "ZmFsbGJhY2s=",
+      mimeType: "image/png",
+    });
+  } finally {
+    await runtime.dispose();
+    await bridge.close();
+    fs.rmSync(agentsDir, { recursive: true, force: true });
+  }
+});
+
+test("large systemPromptAppend plus >200KB history stays within MAX_AGY_PROMPT_BYTES on main and ephemeral turns", async () => {
+  const agentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-budget-agents-"));
+  const seenMainTexts: string[] = [];
+  const seenEphemeralTexts: string[] = [];
+
+  const runtime = new AgyRuntime({
+    cwd: "/work",
+    agentsDir,
+    getToolMode: () => "native",
+    checkBinary: async () => ({ binary: "agy", version: "1.5.15" }),
+    createClient: (opts) => {
+      const isEphemeral = (opts.agentName ?? "").startsWith("pi-ephemeral-");
+      let alive = true;
+      return {
+        get isAlive() {
+          return alive;
+        },
+        async initialize() {
+          return { protocolVersion: 1 };
+        },
+        async newSession() {
+          return { sessionId: isEphemeral ? "eph-budget" : "main-budget" };
+        },
+        async resumeSession(rOpts) {
+          return { sessionId: rOpts.sessionId };
+        },
+        async setConfigOption() {
+          return {};
+        },
+        cancelSession() {},
+        async closeSession() {},
+        async prompt(_sid, blocks, promptOpts) {
+          const text = blocks.map((b) => (b.type === "text" ? b.text : "")).join("\n");
+          if (isEphemeral) {
+            seenEphemeralTexts.push(text);
+          } else {
+            seenMainTexts.push(text);
+          }
+          promptOpts?.onUpdate?.({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "ok" },
+          });
+          return { stopReason: "end_turn", usage: { totalTokens: 100 } };
+        },
+        async dispose() {
+          alive = false;
+        },
+      };
+    },
+  });
+
+  const streamSimple = createAntigravityStreamSimple({
+    getRuntime: () => runtime,
+    getSessionId: () => "pi-budget-main",
+    getBranchEntries: () => [],
+    getAllEntries: () => [],
+    requireMatchingSessionId: () => true,
+    replayStore: new AgyReplayStore(),
+  });
+
+  try {
+    const bigSystem = `SYS_HEADER ${"A".repeat(20_000)} SYS_FOOTER`;
+    const largeMessages: unknown[] = [
+      {
+        role: "system",
+        content: "",
+        sections: { project_context: bigSystem },
+        timestamp: 0,
+      },
+      { role: "user", content: `OLD_HUGE_USER ${"U".repeat(110_000)}`, timestamp: 1 },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: `OLD_HUGE_ASSISTANT ${"R".repeat(110_000)}` }],
+        api: "antigravity-acp",
+        provider: "antigravity",
+        model: "gemini-4-hydrogen",
+        usage: {} as never,
+        stopReason: "stop",
+        timestamp: 2,
+      },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "RECENT_KEPT_TURN" }],
+        api: "antigravity-acp",
+        provider: "antigravity",
+        model: "gemini-4-hydrogen",
+        usage: {} as never,
+        stopReason: "stop",
+        timestamp: 3,
+      },
+      { role: "user", content: "FINAL_COMPLETE_LIVE_PROMPT", timestamp: 4 },
+    ];
+
+    const mainMsg = await streamSimple(testModel(), makeTranscript(largeMessages), {
+      sessionId: "pi-budget-main",
+    }).result();
+    assert.equal(mainMsg.stopReason, "stop");
+    assert.equal(seenMainTexts.length, 1);
+    const mainText = seenMainTexts[0] ?? "";
+    assert.ok(Buffer.byteLength(mainText, "utf8") <= MAX_AGY_PROMPT_BYTES);
+    assert.match(mainText, /^SYS_HEADER/);
+    assert.match(mainText, /SYS_FOOTER/);
+    assert.match(mainText, /<\/conversation_history>/);
+    assert.match(mainText, /RECENT_KEPT_TURN/);
+    assert.match(mainText, /FINAL_COMPLETE_LIVE_PROMPT$/);
+
+    const ephMsg = await streamSimple(testModel(), makeTranscript(largeMessages), {
+      sessionId: "pi-budget-side",
+    }).result();
+    assert.equal(ephMsg.stopReason, "stop");
+    assert.equal(seenEphemeralTexts.length, 1);
+    const ephText = seenEphemeralTexts[0] ?? "";
+    assert.ok(Buffer.byteLength(ephText, "utf8") <= MAX_AGY_PROMPT_BYTES);
+    assert.match(ephText, /^SYS_HEADER/);
+    assert.match(ephText, /SYS_FOOTER/);
+    assert.match(ephText, /<\/conversation_history>/);
+    assert.match(ephText, /RECENT_KEPT_TURN/);
+    assert.match(ephText, /FINAL_COMPLETE_LIVE_PROMPT$/);
   } finally {
     await runtime.dispose();
     fs.rmSync(agentsDir, { recursive: true, force: true });

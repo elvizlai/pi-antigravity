@@ -22,6 +22,7 @@ import {
   buildSeededSessionPrompt,
   extractSystemPromptAppend,
   extractTrailingUserPrompt,
+  MAX_AGY_PROMPT_BYTES,
 } from "./prompt.ts";
 import type { AgyRuntime } from "./runtime.ts";
 import type { SessionEntryLike } from "./state.ts";
@@ -210,14 +211,21 @@ export function createAntigravityStreamSimple(
             ? options.sessionId !== mainSessionId
             : Boolean(deps.requireMatchingSessionId?.()));
 
+        const systemPromptAppend = extractSystemPromptAppend(context.messages);
+        const reservedSysBytes = systemPromptAppend
+          ? Buffer.byteLength(systemPromptAppend, "utf8") + 2
+          : 0;
         const initialPayload: AgyStreamPayload = {
           modelId: model.id,
           effort: options?.reasoning,
           executionMode: isEphemeral ? "default" : deps.getExecutionMode?.(),
           prompt: isEphemeral
-            ? buildSeededSessionPrompt(context.messages, { allowImages })
+            ? buildSeededSessionPrompt(context.messages, {
+                allowImages,
+                maxBytes: Math.max(1_024, MAX_AGY_PROMPT_BYTES - reservedSysBytes),
+              })
             : extractTrailingUserPrompt(context.messages, { allowImages }),
-          systemPromptAppend: extractSystemPromptAppend(context.messages),
+          systemPromptAppend,
         };
 
         let payload = initialPayload;

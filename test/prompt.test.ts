@@ -8,6 +8,8 @@ import {
   extractSystemPromptAppend,
   extractTrailingUserPrompt,
   isContinuationAfterToolUse,
+  MAX_AGY_PROMPT_BYTES,
+  prependSystemContext,
   splitToolResultImages,
 } from "../src/provider/prompt.ts";
 import {
@@ -15,6 +17,7 @@ import {
   findActiveAgyConversation,
   parseAgyStateEntry,
   resolveAgyBranchState,
+  resolveInTurnBranchState,
 } from "../src/provider/state.ts";
 
 function asTranscript(messages: TranscriptContext["messages"]): TranscriptContext["messages"] {
@@ -466,6 +469,204 @@ test("resolveAgyBranchState distinguishes none, active, reset, compaction, and t
     findActiveAgyConversation("pi-1", "/work", [markerT1], [markerT1, markerT3]),
     undefined,
   );
+});
+
+test("resolveInTurnBranchState allows trailing live-turn messages while enforcing reset, compaction, ownership, and tree rewind", () => {
+  const markerT4 = {
+    type: "custom",
+    customType: AGY_STATE_ENTRY_TYPE,
+    data: {
+      version: 1,
+      kind: "conversation",
+      sessionId: "pi-1",
+      conversationId: "acp-1",
+      cwd: "/work",
+      turns: 4,
+    },
+  };
+  const markerT5 = {
+    type: "custom",
+    customType: AGY_STATE_ENTRY_TYPE,
+    data: {
+      version: 1,
+      kind: "conversation",
+      sessionId: "pi-1",
+      conversationId: "acp-1",
+      cwd: "/work",
+      turns: 5,
+    },
+  };
+
+  // Turn 1 before antigravity-state is persisted at agent_end.
+  assert.equal(
+    resolveInTurnBranchState("pi-1", "/work", [
+      { type: "session" },
+      { type: "model_change" },
+      { type: "message", message: { role: "user" } },
+      { type: "message", message: { role: "assistant" } },
+      { type: "message", message: { role: "toolResult" } },
+    ]),
+    "ok",
+  );
+
+  // Turn N mid-turn steering / subagent-notify after antigravity-state(turns=4).
+  assert.equal(
+    resolveInTurnBranchState("pi-1", "/work", [
+      markerT4,
+      { type: "custom_message" },
+      { type: "message", message: { role: "assistant" } },
+      { type: "message", message: { role: "toolResult" } },
+      { type: "custom_message" },
+    ]),
+    "ok",
+  );
+
+  // Explicit reset marker.
+  assert.equal(
+    resolveInTurnBranchState("pi-1", "/work", [
+      markerT4,
+      {
+        type: "custom",
+        customType: AGY_STATE_ENTRY_TYPE,
+        data: { version: 1, kind: "reset", sessionId: "pi-1", cwd: "/work" },
+      },
+      { type: "message", message: { role: "user" } },
+    ]),
+    "reset",
+  );
+
+  // Compaction / branch_summary / context_edit, wrong session/cwd, and /tree rewind still invalidate.
+  for (const invalidType of ["compaction", "branch_summary", "context_edit"]) {
+    assert.equal(
+      resolveInTurnBranchState("pi-1", "/work", [
+        markerT4,
+        { type: invalidType },
+        { type: "message", message: { role: "assistant" } },
+      ]),
+      "invalidated",
+    );
+  }
+  assert.equal(resolveInTurnBranchState("pi-fork", "/work", [markerT4]), "invalidated");
+  assert.equal(resolveInTurnBranchState("pi-1", "/other", [markerT4]), "invalidated");
+  assert.equal(
+    resolveInTurnBranchState(
+      "pi-1",
+      "/work",
+      [markerT4, { type: "message", message: { role: "assistant" } }],
+      [markerT4, markerT5],
+    ),
+    "invalidated",
+  );
+});
+
+test("prependSystemContext and buildSeededSessionPrompt budget customSystemContext and trailingPrompt within maxBytes", () => {
+  assert.equal(MAX_AGY_PROMPT_BYTES, 185_000);
+
+  const prepended = prependSystemContext(
+    [
+      { type: "text", text: "LIVE_TAIL" },
+      { type: "image", data: "Zm9v", mimeType: "image/png" },
+    ],
+    "SYS_PREFIX",
+    64,
+  );
+  assert.equal(prepended.length, 2);
+  assert.equal(prepended[0]?.type, "text");
+  assert.equal(prepended[0]?.type === "text" ? prepended[0].text : "", "SYS_PREFIX\n\nLIVE_TAIL");
+
+  const cappedPrepend = prependSystemContext(
+    [{ type: "text", text: `${"a".repeat(200)} KEEP_END` }],
+    "SYS_TOO_BIG",
+    80,
+  );
+  const cappedPrependText = cappedPrepend[0]?.type === "text" ? cappedPrepend[0].text : "";
+  assert.ok(Buffer.byteLength(cappedPrependText, "utf8") <= 80);
+  assert.match(cappedPrependText, /KEEP_END$/);
+
+  // Seeded prompt with customSystemContext keeps total bytes <= maxBytes and preserves </conversation_history> + live tail.
+  const largeCustomSys = `CUSTOM_SYS_START ${"S".repeat(600)} CUSTOM_SYS_END`;
+  const transcriptWithBigHistory = asTranscript([
+    { role: "user", content: `OLD_TURN ${"H".repeat(2_000)}`, timestamp: 1 },
+    {
+      role: "assistant",
+      content: [{ type: "text", text: "RECENT_ASSISTANT_CONTEXT" }],
+      api: "a",
+      provider: "antigravity",
+      model: "m",
+      usage: {} as never,
+      stopReason: "stop",
+      timestamp: 2,
+    },
+    { role: "user", content: "LIVE_STEERING_NOTICE_COMPLETE", timestamp: 3 },
+  ]);
+  const seededBudgeted = buildSeededSessionPrompt(transcriptWithBigHistory, {
+    maxBytes: 1_200,
+    customSystemContext: largeCustomSys,
+  });
+  const seededBudgetedText = seededBudgeted[0]?.type === "text" ? seededBudgeted[0].text : "";
+  assert.ok(Buffer.byteLength(seededBudgetedText, "utf8") <= 1_200);
+  assert.match(seededBudgetedText, /^CUSTOM_SYS_START/);
+  assert.match(seededBudgetedText, /CUSTOM_SYS_END/);
+  assert.match(seededBudgetedText, /<\/conversation_history>/);
+  assert.match(seededBudgetedText, /RECENT_ASSISTANT_CONTEXT/);
+  assert.match(seededBudgetedText, /LIVE_STEERING_NOTICE_COMPLETE$/);
+  assert.equal(seededBudgetedText.includes("OLD_TURN"), false);
+
+  // Pure image continuation (no trailing user message) with trailingPrompt + customSystemContext.
+  const imageContinuation = buildToolImageContinuationPrompt([
+    {
+      callId: "c1",
+      name: "read",
+      label: "shot.png",
+      images: [{ type: "image", data: "aW1n", mimeType: "image/png" }],
+    },
+  ]);
+  const imageTranscript = asTranscript([
+    { role: "user", content: "Implement feature X and inspect shot.png", timestamp: 1 },
+    {
+      role: "assistant",
+      content: [{ type: "toolCall", id: "c1", name: "read", arguments: { path: "shot.png" } }],
+      api: "a",
+      provider: "antigravity",
+      model: "m",
+      usage: {} as never,
+      stopReason: "toolUse",
+      timestamp: 2,
+    },
+    {
+      role: "toolResult",
+      toolCallId: "c1",
+      toolName: "read",
+      content: [{ type: "text", text: "Read image file [image/png]" }],
+      isError: false,
+      timestamp: 3,
+    },
+  ]);
+  const seededImg = buildSeededSessionPrompt(imageTranscript, {
+    allowImages: true,
+    customSystemContext: "SYS_CTX",
+    trailingPrompt: imageContinuation,
+  });
+  assert.equal(seededImg.length, 2);
+  const seededImgText = seededImg[0]?.type === "text" ? seededImg[0].text : "";
+  assert.match(seededImgText, /^SYS_CTX/);
+  assert.match(seededImgText, /Implement feature X and inspect shot\.png/);
+  assert.match(seededImgText, /<\/conversation_history>/);
+  assert.match(seededImgText, /1\. read \("shot\.png"\) — image\/png$/m);
+  assert.deepEqual(seededImg[1], { type: "image", data: "aW1n", mimeType: "image/png" });
+
+  // Tight maxBytes fallback (historyBudget <= 64) still preserves trailingPrompt + image + customSystemContext.
+  const tightImg = buildSeededSessionPrompt(imageTranscript, {
+    allowImages: true,
+    maxBytes: 220,
+    customSystemContext: "SYS",
+    trailingPrompt: imageContinuation,
+  });
+  assert.equal(tightImg.length, 2);
+  const tightImgText = tightImg[0]?.type === "text" ? tightImg[0].text : "";
+  assert.ok(Buffer.byteLength(tightImgText, "utf8") <= 220);
+  assert.match(tightImgText, /shot\.png/);
+  assert.deepEqual(tightImg[1], { type: "image", data: "aW1n", mimeType: "image/png" });
 });
 
 test("buildSeededSessionPrompt preserves single-turn fast path and seeds post-compaction history within byte budget", () => {

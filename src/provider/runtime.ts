@@ -41,6 +41,7 @@ import {
   buildToolImageContinuationPrompt,
   collectTurnToolResults,
   isContinuationAfterToolUse,
+  prependSystemContext,
   splitToolResultImages,
 } from "./prompt.ts";
 import { AgyWorkingStatusTracker } from "./render.ts";
@@ -48,6 +49,7 @@ import type { AgyToolMode } from "./settings.ts";
 import {
   type AgyConversationState,
   resolveAgyBranchState,
+  resolveInTurnBranchState,
   type SessionEntryLike,
 } from "./state.ts";
 import { type AgyReplayStore, AgyTurnController } from "./turn.ts";
@@ -285,6 +287,9 @@ export class AgyRuntime {
   #skipHistorySeed = false;
   #lastQuotaError: string | undefined;
   #activeTurn: ActiveTurn | undefined;
+  #inTurnContinuation:
+    | { piSessionId: string; conversationId: string; owner?: ActiveTurn }
+    | undefined;
 
   constructor(deps: AgyRuntimeDeps) {
     this.#deps = deps;
@@ -307,6 +312,7 @@ export class AgyRuntime {
     if (this.#activeTurn) {
       this.#activeTurn.requestAbort();
     }
+    this.#inTurnContinuation = undefined;
     this.#conversationId = undefined;
     this.#piSessionId = undefined;
     this.#openedOnClient = undefined;
@@ -323,6 +329,7 @@ export class AgyRuntime {
    * keeping the initialized `agy acp` worker process warm for the next turn.
    */
   async invalidateConversation(): Promise<void> {
+    this.#inTurnContinuation = undefined;
     const active = this.#activeTurn;
     if (active) {
       await this.#interruptActiveTurn(active);
@@ -339,6 +346,7 @@ export class AgyRuntime {
   }
 
   async dispose(): Promise<void> {
+    this.#inTurnContinuation = undefined;
     this.#warmupAbort?.abort();
     this.#warmupAbort = undefined;
     if (this.#activeWarmup) {
@@ -668,11 +676,62 @@ export class AgyRuntime {
     };
 
     if (this.#piSessionId && this.#piSessionId !== params.piSessionId) {
+      this.#inTurnContinuation = undefined;
       closeOpenedOnClient();
       this.#conversationId = undefined;
       this.#turns = 0;
       this.#skipHistorySeed = false;
       this.#failedResumeIds.clear();
+    }
+
+    const inTurn =
+      this.#inTurnContinuation?.piSessionId === params.piSessionId
+        ? this.#inTurnContinuation
+        : undefined;
+    if (inTurn) {
+      const inTurnBranch = resolveInTurnBranchState(
+        params.piSessionId,
+        this.#deps.cwd,
+        params.branchEntries,
+        params.allEntries,
+      );
+      if (inTurnBranch === "ok") {
+        this.#skipHistorySeed = false;
+        const convId = inTurn.conversationId;
+        if (
+          this.#openedOnClient === convId &&
+          this.#client === client &&
+          this.#piSessionId === params.piSessionId
+        ) {
+          this.#turns = Math.max(1, this.#turns);
+          return { sessionId: convId, configOptions: this.#configOptions };
+        }
+        if (!this.#failedResumeIds.has(convId)) {
+          if (this.#openedOnClient && this.#openedOnClient !== convId) {
+            closeOpenedOnClient();
+          }
+          const resumed = await tryResume(convId, Math.max(1, this.#turns));
+          if (resumed) return resumed;
+          this.#failedResumeIds.add(convId);
+        }
+        this.#inTurnContinuation = undefined;
+        closeOpenedOnClient();
+        this.#conversationId = undefined;
+        this.#turns = 0;
+        const created = await client.newSession({
+          cwd: this.#deps.cwd,
+          mcpServers: params.mcpServers,
+          signal: params.signal,
+          timeoutMs: params.timeoutMs,
+        });
+        this.#conversationId = created.sessionId;
+        this.#piSessionId = params.piSessionId;
+        this.#openedOnClient = created.sessionId;
+        this.#configOptions = created.configOptions;
+        this.#turns = 0;
+        return { sessionId: created.sessionId, configOptions: created.configOptions };
+      }
+      this.#inTurnContinuation = undefined;
     }
 
     const branchState = resolveAgyBranchState(
@@ -1012,6 +1071,12 @@ export class AgyRuntime {
       });
     };
 
+    const clearOwnedInTurnContinuation = () => {
+      if (this.#inTurnContinuation?.owner === ctx.activeTurn) {
+        this.#inTurnContinuation = undefined;
+      }
+    };
+
     const flushBackgroundNativeTools = () => {
       for (const [callId, tool] of acpTools.entries()) {
         if (
@@ -1108,6 +1173,7 @@ export class AgyRuntime {
       }
 
       if (promptResult.stopReason === "cancelled") {
+        clearOwnedInTurnContinuation();
         recordTurnState(true);
         controller.finish({ status: "aborted", stopReason: "aborted" });
         dropIfConsumed();
@@ -1125,6 +1191,7 @@ export class AgyRuntime {
       flushBackgroundNativeTools();
 
       this.#lastQuotaError = undefined;
+      clearOwnedInTurnContinuation();
       recordTurnState(false);
 
       controller.finish({
@@ -1139,6 +1206,7 @@ export class AgyRuntime {
       cleanupActive(false);
 
       if (promptAbort.signal.aborted || isAbortError(err)) {
+        clearOwnedInTurnContinuation();
         recordTurnState(true);
         controller.finish({ status: "aborted", stopReason: "aborted" });
         dropIfConsumed();
@@ -1257,6 +1325,7 @@ export class AgyRuntime {
    * (`agent_end`), e.g. when a tool batch terminates early or aborts mid-turn.
    */
   async settleAfterAgentEnd(): Promise<void> {
+    this.#inTurnContinuation = undefined;
     const active = this.#activeTurn;
     if (!active) {
       const cancelled = this.#deps.bridge?.cancelPendingCalls() ?? 0;
@@ -1330,13 +1399,22 @@ export class AgyRuntime {
         }
 
         continuationImageBatches = active.pendingToolImageBatches.splice(0);
+        const continueConversationId =
+          this.#turns > 0 || active.isFirstResponseSeen?.() ? active.sessionId : undefined;
         await this.#interruptActiveTurn(active, {
           samePiSession: true,
           signal: params.signal,
         });
+        this.#inTurnContinuation = continueConversationId
+          ? { piSessionId: params.sessionId, conversationId: continueConversationId }
+          : undefined;
       } else {
         const steeredBatches = samePiSession ? [...active.pendingToolImageBatches] : [];
         active.pendingToolImageBatches.length = 0;
+        const continueConversationId =
+          samePiSession && (this.#turns > 0 || active.isFirstResponseSeen?.())
+            ? active.sessionId
+            : undefined;
         await this.#interruptActiveTurn(active, {
           messages: params.messages,
           samePiSession,
@@ -1344,6 +1422,9 @@ export class AgyRuntime {
           outImageBatches: steeredBatches,
           signal: params.signal,
         });
+        this.#inTurnContinuation = continueConversationId
+          ? { piSessionId: params.sessionId, conversationId: continueConversationId }
+          : undefined;
         if (samePiSession && steeredBatches.length > 0) {
           continuationImageBatches = steeredBatches;
         }
@@ -1464,6 +1545,13 @@ export class AgyRuntime {
       waitForBridgedToolsAck,
     };
     this.#activeTurn = activeTurn;
+    if (this.#inTurnContinuation?.piSessionId === params.sessionId) {
+      this.#inTurnContinuation = {
+        piSessionId: params.sessionId,
+        conversationId: sessionId,
+        owner: activeTurn,
+      };
+    }
 
     const cleanupActive = (dropTurn = false) => {
       clearTimeoutTimer();
@@ -1507,34 +1595,25 @@ export class AgyRuntime {
       }
     }
 
-    const shouldSeedHistory =
-      this.#turns === 0 &&
-      continuationImageBatches.length === 0 &&
-      !this.#skipHistorySeed &&
-      !params.promptReplaced;
+    const shouldSeedHistory = this.#turns === 0 && !this.#skipHistorySeed && !params.promptReplaced;
     this.#skipHistorySeed = false;
 
-    let basePrompt: AcpContentBlock[];
-    if (continuationImageBatches.length > 0) {
-      basePrompt = buildToolImageContinuationPrompt(continuationImageBatches, params.prompt);
-    } else if (shouldSeedHistory) {
-      const seeded = buildSeededSessionPrompt(params.messages, { allowImages });
-      basePrompt = seeded.length > 0 ? seeded : params.prompt;
+    const customSys = this.#turns === 0 ? params.systemPromptAppend?.trim() : undefined;
+    const livePrompt =
+      continuationImageBatches.length > 0
+        ? buildToolImageContinuationPrompt(continuationImageBatches, params.prompt)
+        : params.prompt;
+
+    let outboundPrompt: AcpContentBlock[];
+    if (shouldSeedHistory) {
+      const seeded = buildSeededSessionPrompt(params.messages, {
+        allowImages,
+        customSystemContext: customSys,
+        ...(continuationImageBatches.length > 0 ? { trailingPrompt: livePrompt } : {}),
+      });
+      outboundPrompt = seeded.length > 0 ? seeded : prependSystemContext(livePrompt, customSys);
     } else {
-      basePrompt = params.prompt;
-    }
-    const outboundPrompt = [...basePrompt];
-    const customSys = params.systemPromptAppend?.trim();
-    if (this.#turns === 0 && continuationImageBatches.length === 0 && customSys) {
-      const firstTextIdx = outboundPrompt.findIndex((block) => block.type === "text");
-      if (firstTextIdx >= 0 && outboundPrompt[firstTextIdx]?.type === "text") {
-        outboundPrompt[firstTextIdx] = {
-          type: "text",
-          text: `${customSys}\n\n${outboundPrompt[firstTextIdx].text}`,
-        };
-      } else {
-        outboundPrompt.unshift({ type: "text", text: customSys });
-      }
+      outboundPrompt = prependSystemContext(livePrompt, customSys);
     }
 
     // Fire `session/prompt` asynchronously while `streamSimple` consumes `controller.drainWave()`.
@@ -1698,19 +1777,7 @@ export class AgyRuntime {
       }
     }
 
-    const outboundPrompt = [...params.prompt];
-    const customSys = params.systemPromptAppend?.trim();
-    if (customSys) {
-      const firstTextIdx = outboundPrompt.findIndex((block) => block.type === "text");
-      if (firstTextIdx >= 0 && outboundPrompt[firstTextIdx]?.type === "text") {
-        outboundPrompt[firstTextIdx] = {
-          type: "text",
-          text: `${customSys}\n\n${outboundPrompt[firstTextIdx].text}`,
-        };
-      } else {
-        outboundPrompt.unshift({ type: "text", text: customSys });
-      }
-    }
+    const outboundPrompt = prependSystemContext(params.prompt, params.systemPromptAppend);
 
     void (async () => {
       try {

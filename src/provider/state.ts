@@ -99,6 +99,27 @@ function hasAdvancedConversationTurn(
   return false;
 }
 
+function evaluateStateMarker(
+  state: AgyPersistedState,
+  sessionId: string,
+  cwd: string,
+  allEntries?: readonly SessionEntryLike[],
+): Exclude<AgyBranchResolution, { status: "none" }> {
+  if (state.sessionId !== sessionId || state.cwd !== cwd) {
+    return { status: "invalidated" };
+  }
+  if (state.kind === "reset") {
+    return { status: "reset" };
+  }
+  if (
+    allEntries &&
+    hasAdvancedConversationTurn(allEntries, sessionId, state.conversationId, state.turns)
+  ) {
+    return { status: "invalidated" };
+  }
+  return { status: "active", state };
+}
+
 /**
  * Resolve the ACP conversation state for the current Pi session branch.
  *
@@ -117,19 +138,7 @@ export function resolveAgyBranchState(
     if (entry.type === "custom" && entry.customType === AGY_STATE_ENTRY_TYPE) {
       const state = parseAgyStateEntry(entry.data);
       if (!state) continue;
-      if (state.sessionId !== sessionId || state.cwd !== cwd) {
-        return { status: "invalidated" };
-      }
-      if (state.kind === "reset") {
-        return { status: "reset" };
-      }
-      if (
-        allEntries &&
-        hasAdvancedConversationTurn(allEntries, sessionId, state.conversationId, state.turns)
-      ) {
-        return { status: "invalidated" };
-      }
-      return { status: "active", state };
+      return evaluateStateMarker(state, sessionId, cwd, allEntries);
     }
 
     if (entry.type === "custom_message") continue;
@@ -145,6 +154,35 @@ export function resolveAgyBranchState(
     }
   }
   return { status: "none" };
+}
+
+/**
+ * Validate branch integrity for an active mid-turn continuation (bridged image
+ * handoff or mid-turn steering). Because `antigravity-state` is only persisted at
+ * `agent_end`, trailing `assistant` and `toolResult` messages from the live Pi
+ * turn are expected and do not invalidate the in-flight ACP session.
+ */
+export function resolveInTurnBranchState(
+  sessionId: string,
+  cwd: string,
+  branchEntries: readonly SessionEntryLike[],
+  allEntries?: readonly SessionEntryLike[],
+): "ok" | "reset" | "invalidated" {
+  for (let i = branchEntries.length - 1; i >= 0; i -= 1) {
+    const entry = branchEntries[i];
+    if (entry.type === "custom" && entry.customType === AGY_STATE_ENTRY_TYPE) {
+      const state = parseAgyStateEntry(entry.data);
+      if (!state) continue;
+      const resolution = evaluateStateMarker(state, sessionId, cwd, allEntries);
+      return resolution.status === "active" ? "ok" : resolution.status;
+    }
+
+    if (entry.type === "custom_message" || entry.type === "message") continue;
+    if (!NON_CONTEXT_ENTRY_TYPES.has(entry.type)) {
+      return "invalidated";
+    }
+  }
+  return "ok";
 }
 
 /**

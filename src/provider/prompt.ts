@@ -24,7 +24,7 @@ export const BRIDGE_PENDING_TOOL_MESSAGE =
 export const BACKGROUND_ACP_TOOL_MESSAGE = "Started and continuing in the background.";
 
 /** Maximum UTF-8 byte budget allocated to text blocks in a single `session/prompt`. */
-const MAX_AGY_PROMPT_BYTES = 185_000;
+export const MAX_AGY_PROMPT_BYTES = 185_000;
 const SEEDED_TOOL_RESULT_MAX_CHARS = 2_000;
 const SEEDED_TOOL_ARGS_MAX_CHARS = 500;
 const COMPACTION_CHECKPOINT_PREFIX =
@@ -252,13 +252,42 @@ function serializePriorMessage(msg: TranscriptContext["messages"][number]): stri
 }
 
 /**
+ * Prepend optional custom system context to the first text block (or unshift a
+ * new text block) while staying within the UTF-8 byte ceiling.
+ */
+export function prependSystemContext(
+  blocks: readonly AcpContentBlock[],
+  customSystemContext: string | undefined,
+  maxBytes = MAX_AGY_PROMPT_BYTES,
+): AcpContentBlock[] {
+  const customSys = customSystemContext?.trim();
+  if (!customSys) return [...blocks];
+  const out = [...blocks];
+  const firstTextIdx = out.findIndex((block) => block.type === "text");
+  if (firstTextIdx >= 0 && out[firstTextIdx]?.type === "text") {
+    out[firstTextIdx] = {
+      type: "text",
+      text: truncateUtf8Tail(`${customSys}\n\n${out[firstTextIdx].text}`, maxBytes),
+    };
+  } else {
+    out.unshift({ type: "text", text: truncateUtf8Tail(customSys, maxBytes) });
+  }
+  return out;
+}
+
+/**
  * Build an ACP `session/prompt` payload for a fresh ACP session that must inherit
  * prior projected transcript context (e.g., after `/compact`, `/fork`, `/tree`, or
  * cross-provider switch), keeping the live trailing user prompt and images intact.
  */
 export function buildSeededSessionPrompt(
   messages: TranscriptContext["messages"],
-  options?: { maxBytes?: number; allowImages?: boolean; customSystemContext?: string },
+  options?: {
+    maxBytes?: number;
+    allowImages?: boolean;
+    customSystemContext?: string;
+    trailingPrompt?: readonly AcpContentBlock[];
+  },
 ): AcpContentBlock[] {
   let trailingStart = messages.length;
   const trailingUsers: Extract<TranscriptContext["messages"][number], { role: "user" }>[] = [];
@@ -270,9 +299,14 @@ export function buildSeededSessionPrompt(
     trailingStart = i;
   }
 
+  const fallbackLive = () =>
+    options?.trailingPrompt
+      ? prependSystemContext(options.trailingPrompt, options.customSystemContext, options.maxBytes)
+      : extractTrailingUserPrompt(messages, options);
+
   const priorMessages = messages.slice(0, trailingStart).filter((msg) => msg.role !== "system");
   if (priorMessages.length === 0) {
-    return extractTrailingUserPrompt(messages, options);
+    return fallbackLive();
   }
 
   let checkpointSummary: string | undefined;
@@ -295,26 +329,40 @@ export function buildSeededSessionPrompt(
   }
 
   if (!checkpointSummary && historyItems.length === 0) {
-    return extractTrailingUserPrompt(messages, options);
+    return fallbackLive();
   }
 
   const liveParts: string[] = [];
   const imageBlocks: AcpContentBlock[] = [];
   let omittedImages = 0;
   const allowImages = options?.allowImages ?? true;
-  for (const msg of trailingUsers) {
-    if (typeof msg.content === "string") {
-      if (msg.content.trim()) liveParts.push(msg.content);
-      continue;
-    }
-    for (const part of msg.content) {
-      if (part.type === "text") {
-        if (part.text.trim()) liveParts.push(part.text);
-      } else if (part.type === "image") {
+  if (options?.trailingPrompt) {
+    for (const block of options.trailingPrompt) {
+      if (block.type === "text") {
+        if (block.text.trim()) liveParts.push(block.text);
+      } else if (block.type === "image") {
         if (allowImages) {
-          imageBlocks.push({ type: "image", data: part.data, mimeType: part.mimeType });
+          imageBlocks.push({ type: "image", data: block.data, mimeType: block.mimeType });
         } else {
           omittedImages += 1;
+        }
+      }
+    }
+  } else {
+    for (const msg of trailingUsers) {
+      if (typeof msg.content === "string") {
+        if (msg.content.trim()) liveParts.push(msg.content);
+        continue;
+      }
+      for (const part of msg.content) {
+        if (part.type === "text") {
+          if (part.text.trim()) liveParts.push(part.text);
+        } else if (part.type === "image") {
+          if (allowImages) {
+            imageBlocks.push({ type: "image", data: part.data, mimeType: part.mimeType });
+          } else {
+            omittedImages += 1;
+          }
         }
       }
     }
@@ -336,7 +384,7 @@ export function buildSeededSessionPrompt(
   );
   const historyBudget = maxBytes - fixedBytes - wrapperBytes;
   if (historyBudget <= 64) {
-    return extractTrailingUserPrompt(messages, options);
+    return fallbackLive();
   }
 
   let remainingBudget = historyBudget;
@@ -385,7 +433,7 @@ export function buildSeededSessionPrompt(
   historySections.push(...keptHistory);
 
   if (historySections.length === 0) {
-    return extractTrailingUserPrompt(messages, options);
+    return fallbackLive();
   }
 
   const historyBlock = `${SEEDED_HISTORY_HEADER}${historySections.join("\n\n")}${SEEDED_HISTORY_FOOTER}`;
