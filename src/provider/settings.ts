@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import type { ThinkingLevelMap } from "@earendil-works/pi-ai";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { AgyExecutionMode } from "../acp/models.ts";
 import { asRecord } from "../acp/shared.ts";
@@ -13,6 +14,7 @@ const DEFAULT_AGY_TOOL_MODE: AgyToolMode = "pi";
 export interface AgyCachedModelEntry {
   id: string;
   name: string;
+  thinkingLevelMap?: ThinkingLevelMap;
 }
 
 export interface AgySettings {
@@ -94,6 +96,26 @@ export function agySettingsPath(agentDir: string = getAgentDir()): string {
   return path.join(agentDir, "antigravity.json");
 }
 
+const THINKING_MAP_KEYS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+
+function sanitizeThinkingLevelMap(raw: unknown): ThinkingLevelMap | undefined {
+  const rec = asRecord(raw);
+  if (!rec) return undefined;
+  const out: ThinkingLevelMap = {};
+  let hasAny = false;
+  for (const key of THINKING_MAP_KEYS) {
+    const val = rec[key];
+    if (val === null) {
+      out[key] = null;
+      hasAny = true;
+    } else if (typeof val === "string" && val.trim()) {
+      out[key] = val.trim();
+      hasAny = true;
+    }
+  }
+  return hasAny ? out : undefined;
+}
+
 function sanitizeSettings(raw: unknown): AgySettings {
   const obj = asRecord(raw);
   if (!obj) return {};
@@ -115,7 +137,8 @@ function sanitizeSettings(raw: unknown): AgySettings {
       if (!rec || typeof rec.id !== "string" || !rec.id.trim()) continue;
       const id = rec.id.trim();
       const name = typeof rec.name === "string" && rec.name.trim() ? rec.name.trim() : id;
-      cached.push({ id, name });
+      const thinkingLevelMap = sanitizeThinkingLevelMap(rec.thinkingLevelMap);
+      cached.push(thinkingLevelMap ? { id, name, thinkingLevelMap } : { id, name });
     }
     if (cached.length > 0) {
       settings.cachedModels = cached;

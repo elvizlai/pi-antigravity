@@ -1,4 +1,4 @@
-import type { Model } from "@earendil-works/pi-ai";
+import type { Model, ThinkingLevelMap } from "@earendil-works/pi-ai";
 import { getAgyBinary } from "./binary.ts";
 import { execAgyCommand } from "./process-tree.ts";
 
@@ -30,7 +30,42 @@ export interface AgyModelSpec {
   maxTokens: number;
   reasoning: boolean;
   defaultEffort?: AgyEffort;
+  thinkingLevelMap?: ThinkingLevelMap;
 }
+
+/** Build a Pi `thinkingLevelMap` from a set of ACP `thought_level` / effort suffixes. */
+export function buildThinkingLevelMap(
+  efforts: Iterable<string> | undefined,
+): ThinkingLevelMap | undefined {
+  if (!efforts) return undefined;
+  const set = new Set<string>();
+  for (const raw of efforts) {
+    const normalized = raw === "extra" ? "xhigh" : raw;
+    if (
+      normalized === "low" ||
+      normalized === "medium" ||
+      normalized === "high" ||
+      normalized === "xhigh" ||
+      normalized === "max"
+    ) {
+      set.add(normalized);
+    }
+  }
+  if (set.size === 0) return undefined;
+  const map: ThinkingLevelMap = {
+    off: null,
+    minimal: null,
+    low: set.has("low") ? "low" : null,
+    medium: set.has("medium") ? "medium" : null,
+    high: set.has("high") ? "high" : null,
+  };
+  if (set.has("xhigh")) map.xhigh = "xhigh";
+  if (set.has("max")) map.max = "max";
+  return map;
+}
+
+const STANDARD_EFFORT_MAP = buildThinkingLevelMap(["low", "medium", "high"]);
+const XHIGH_EFFORT_MAP = buildThinkingLevelMap(["low", "medium", "high", "xhigh"]);
 
 const DEFAULT_FALLBACK_SPECS: readonly AgyModelSpec[] = [
   {
@@ -40,6 +75,7 @@ const DEFAULT_FALLBACK_SPECS: readonly AgyModelSpec[] = [
     maxTokens: 65_536,
     reasoning: true,
     defaultEffort: "high",
+    thinkingLevelMap: XHIGH_EFFORT_MAP,
   },
   {
     id: "gemini-4-carbon",
@@ -48,6 +84,7 @@ const DEFAULT_FALLBACK_SPECS: readonly AgyModelSpec[] = [
     maxTokens: 65_536,
     reasoning: true,
     defaultEffort: "high",
+    thinkingLevelMap: STANDARD_EFFORT_MAP,
   },
   {
     id: "gemini-4-argon",
@@ -56,6 +93,7 @@ const DEFAULT_FALLBACK_SPECS: readonly AgyModelSpec[] = [
     maxTokens: 65_536,
     reasoning: true,
     defaultEffort: "high",
+    thinkingLevelMap: STANDARD_EFFORT_MAP,
   },
   {
     id: "gemini-4-hydrogen",
@@ -64,6 +102,7 @@ const DEFAULT_FALLBACK_SPECS: readonly AgyModelSpec[] = [
     maxTokens: 65_536,
     reasoning: true,
     defaultEffort: "high",
+    thinkingLevelMap: XHIGH_EFFORT_MAP,
   },
   {
     id: "gemini-pro-orchestrator-neon",
@@ -93,6 +132,7 @@ const DEFAULT_FALLBACK_SPECS: readonly AgyModelSpec[] = [
     maxTokens: 65_536,
     reasoning: true,
     defaultEffort: "medium",
+    thinkingLevelMap: STANDARD_EFFORT_MAP,
   },
   {
     id: "claude-opus-5-5",
@@ -100,6 +140,7 @@ const DEFAULT_FALLBACK_SPECS: readonly AgyModelSpec[] = [
     contextWindow: 200_000,
     maxTokens: 64_000,
     reasoning: true,
+    thinkingLevelMap: STANDARD_EFFORT_MAP,
   },
   {
     id: "claude-sonnet-5-5",
@@ -107,6 +148,7 @@ const DEFAULT_FALLBACK_SPECS: readonly AgyModelSpec[] = [
     contextWindow: 200_000,
     maxTokens: 64_000,
     reasoning: true,
+    thinkingLevelMap: STANDARD_EFFORT_MAP,
   },
   {
     id: "gpt-oss-120b-medium",
@@ -127,6 +169,7 @@ function specToPiModel(spec: AgyModelSpec): Model<string> {
     provider: "antigravity",
     baseUrl: "acp://agy",
     reasoning: spec.reasoning,
+    ...(spec.thinkingLevelMap ? { thinkingLevelMap: { ...spec.thinkingLevelMap } } : {}),
     input: ["text", "image"],
     cost: ZERO_COST,
     contextWindow: spec.contextWindow,
@@ -139,9 +182,9 @@ export function getFallbackModels(): Model<string>[] {
   return DEFAULT_FALLBACK_SPECS.map(specToPiModel);
 }
 
-/** Hydrate lightweight `{ id, name }` cached model entries into Pi `Model` records synchronously. */
+/** Hydrate lightweight `{ id, name, thinkingLevelMap? }` cached model entries into Pi `Model` records synchronously. */
 export function modelsFromCachedEntries(
-  entries: ReadonlyArray<{ id: string; name?: string }>,
+  entries: ReadonlyArray<{ id: string; name?: string; thinkingLevelMap?: ThinkingLevelMap }>,
 ): Model<string>[] {
   if (entries.length === 0) return [];
   const byId = new Map<string, Model<string>>();
@@ -149,13 +192,21 @@ export function modelsFromCachedEntries(
     const id = entry.id.trim();
     if (!id || byId.has(id)) continue;
     const name = entry.name?.trim() || id;
-    byId.set(id, specToPiModel(inferModelSpec(id, name)));
+    const spec = inferModelSpec(id, name);
+    byId.set(
+      id,
+      specToPiModel(
+        entry.thinkingLevelMap
+          ? { ...spec, thinkingLevelMap: { ...entry.thinkingLevelMap } }
+          : spec,
+      ),
+    );
   }
   return [...byId.values()];
 }
 
 const KNOWN_SPECS = new Map(DEFAULT_FALLBACK_SPECS.map((spec) => [spec.id, spec]));
-const SUFFIX_RE = /-(low|medium|high|xhigh)$/;
+const SUFFIX_RE = /-(low|medium|high|extra|xhigh|max)$/;
 
 function stripEffortSuffix(rawId: string): { base: string; suffix?: AgyEffort } {
   const match = SUFFIX_RE.exec(rawId);
@@ -238,8 +289,11 @@ export function parseAgyModelsOutput(stdout: string): Model<string>[] {
     if (byId.has(canonicalId)) continue;
     const cleanLabel = keepFullId
       ? entry.label
-      : entry.label.replace(/\s*\((Low|Medium|High|XHigh)\)\s*$/i, "").trim();
-    byId.set(canonicalId, inferModelSpec(canonicalId, cleanLabel));
+      : entry.label.replace(/\s*\((Low|Medium|High|Extra|XHigh|Max)\)\s*$/i, "").trim();
+    const spec = inferModelSpec(canonicalId, cleanLabel);
+    const thinkingLevelMap =
+      !keepFullId && siblings && siblings.size > 0 ? buildThinkingLevelMap(siblings) : undefined;
+    byId.set(canonicalId, thinkingLevelMap ? { ...spec, thinkingLevelMap } : spec);
   }
 
   return [...byId.values()].map(specToPiModel);
@@ -259,7 +313,16 @@ export function mergeModelLists(
     if (seen.has(model.id)) continue;
     seen.add(model.id);
     const base = fallbackById.get(model.id);
-    out.push(base ? { ...base, name: model.name || base.name } : model);
+    if (base) {
+      const thinkingLevelMap = model.thinkingLevelMap ?? base.thinkingLevelMap;
+      out.push({
+        ...base,
+        name: model.name || base.name,
+        ...(thinkingLevelMap ? { thinkingLevelMap: { ...thinkingLevelMap } } : {}),
+      });
+    } else {
+      out.push(model);
+    }
   }
   return out;
 }

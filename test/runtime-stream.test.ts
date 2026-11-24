@@ -1503,6 +1503,15 @@ test("antigravityExtension defers CLI flag reads until after Pi populates flag v
       }
     | undefined;
 
+  let registeredProviderConfig:
+    | {
+        models?: Array<{
+          id: string;
+          thinkingLevelMap?: Record<string, string | null | undefined>;
+        }>;
+      }
+    | undefined;
+
   const mockPi = {
     registerFlag() {},
     getFlag(name: string) {
@@ -1512,7 +1521,9 @@ test("antigravityExtension defers CLI flag reads until after Pi populates flag v
     getActiveTools: () => [],
     setActiveTools() {},
     getCommands: () => [],
-    registerProvider() {},
+    registerProvider(_id: string, config: typeof registeredProviderConfig) {
+      registeredProviderConfig = config;
+    },
     registerTool(def: typeof registeredTool) {
       registeredTool = def;
     },
@@ -1529,6 +1540,12 @@ test("antigravityExtension defers CLI flag reads until after Pi populates flag v
   };
 
   antigravityExtension(mockPi as unknown as Parameters<typeof antigravityExtension>[0]);
+
+  assert.ok(registeredProviderConfig?.models);
+  const regById = new Map(registeredProviderConfig.models.map((m) => [m.id, m]));
+  assert.equal(regById.get("gemini-4-neon")?.thinkingLevelMap?.xhigh, "xhigh");
+  assert.equal(regById.get("gemini-4-hydrogen")?.thinkingLevelMap?.xhigh, "xhigh");
+  assert.equal(regById.get("gemini-4-carbon")?.thinkingLevelMap?.xhigh, undefined);
 
   assert.ok(registeredTool);
   const missingToolRes = await registeredTool.execute("missing-id", { tool: "Read a", input: {} });

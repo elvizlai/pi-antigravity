@@ -76,6 +76,7 @@ function toProviderModelConfigs(models: readonly Model<string>[]): ProviderModel
     api: m.api as Api,
     baseUrl: m.baseUrl,
     reasoning: m.reasoning,
+    ...(m.thinkingLevelMap ? { thinkingLevelMap: { ...m.thinkingLevelMap } } : {}),
     input: [...m.input],
     cost: m.cost,
     contextWindow: m.contextWindow,
@@ -316,7 +317,11 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         currentModels = mergeModelLists(probed, getFallbackModels());
         modelsFetchedAt = Date.now();
         saveAgySettings({
-          cachedModels: currentModels.map((m) => ({ id: m.id, name: m.name })),
+          cachedModels: currentModels.map((m) => ({
+            id: m.id,
+            name: m.name,
+            ...(m.thinkingLevelMap ? { thinkingLevelMap: m.thinkingLevelMap } : {}),
+          })),
           modelsFetchedAt,
         });
       }
