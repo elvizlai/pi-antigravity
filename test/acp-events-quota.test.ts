@@ -106,13 +106,12 @@ test("normalizeAcpPromptUsage and isBridgedMcpTool work across standard ACP shap
       totalTokens: 170,
     }),
     {
-      input_tokens: 100,
-      output_tokens: 50,
-      cache_read_tokens: 20,
-      cache_creation_tokens: undefined,
-      reasoning_tokens: 12,
-      thinking_tokens: 12,
-      total_tokens: 170,
+      inputTokens: 100,
+      outputTokens: 50,
+      cachedReadTokens: 20,
+      cachedWriteTokens: undefined,
+      thoughtTokens: 12,
+      totalTokens: 170,
     },
   );
   assert.equal(normalizeAcpPromptUsage({}), undefined);

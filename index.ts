@@ -307,7 +307,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       if (context.signal.aborted || (!context.allowNetwork && !context.force)) {
         return toProviderModelConfigs(currentModels);
       }
-      if (!context.force && modelCacheIsFresh({ fetchedAt: modelsFetchedAt, source: "live" })) {
+      if (!context.force && modelCacheIsFresh({ fetchedAt: modelsFetchedAt })) {
         return toProviderModelConfigs(currentModels);
       }
       const probed = await probeAgyModels({ signal: context.signal, timeoutMs: 5_000 }).catch(
@@ -343,6 +343,8 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     name: WRAPPER_TOOL_NAME,
     label: WRAPPER_TOOL_NAME,
     description: WRAPPER_TOOL_DESCRIPTION,
+    exposure: "model-only",
+    defaultActive: false,
     parameters: Type.Object({
       tool: Type.String(),
       kind: Type.Optional(Type.String()),
@@ -625,10 +627,8 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   pi.on("session_tree", async (_event, ctx) => {
     activeCtx = ctx;
     pendingState = undefined;
-    if (runtime) {
-      await runtime.dispose();
-      runtime = undefined;
-    }
+    await runtime?.invalidateConversation();
+    syncWrapperTool(ctx);
     updateStatus(ctx);
   });
 
@@ -642,14 +642,6 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   pi.on("before_agent_start", async (event, ctx) => {
     applyCliFlagsOnce();
     activeCtx = ctx;
-    if (ctx.model?.provider !== PROVIDER_ID) {
-      pendingState = undefined;
-      if (runtime) {
-        await runtime.dispose();
-        runtime = undefined;
-      }
-      return;
-    }
     const promptSkills = event.systemPromptOptions?.skills?.filter(
       (skill) => !skill.disableModelInvocation,
     );
@@ -658,7 +650,9 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     } else {
       seedSkillsFromCommands(ctx);
     }
-    bridge.refreshTools();
+    if (ctx.model?.provider !== PROVIDER_ID) {
+      return;
+    }
     if (toolMode === "pi") {
       if (!warnedMcpAdapter && hasUnsupportedMcpAdapter(pi.getAllTools())) {
         warnedMcpAdapter = true;
@@ -674,20 +668,6 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         );
       }
     }
-    const effort = ctx.thinkingLevel === "off" ? undefined : ctx.thinkingLevel;
-    await getRuntime()
-      .warmupSession({
-        modelId: ctx.model.id,
-        effort,
-        executionMode,
-        sessionId: ctx.sessionManager.getSessionId(),
-        branchEntries: ctx.sessionManager.getBranch(),
-        allEntries: ctx.sessionManager.getEntries?.() ?? [],
-        signal: ctx.signal,
-      })
-      .catch(() => {
-        // Defer binary/auth/config failures to streamSimple so Pi renders standard turn errors.
-      });
   });
 
   pi.on("agent_end", async () => {
@@ -700,6 +680,9 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       pendingState = undefined;
     }
     replayStore.clear();
+  });
+
+  pi.on("agent_settled", () => {
     if (activeCtx?.model?.provider === PROVIDER_ID) {
       void refreshUsageSummary(activeCtx, Boolean(runtime?.lastQuotaError));
     }

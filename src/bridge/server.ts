@@ -47,27 +47,22 @@ export interface PiToolInfo {
 }
 
 /**
- * Native mode exposes active tools registered by Pi's built-in MCP extension
- * (`builtin:mcp`), with skills bridged separately as `pi__activate_skill`.
- * Pi tool mode instead exposes every active Pi builtin, extension and MCP
- * tool. Calls execute as real model tool calls in Pi, so its active tool set,
- * hooks and permissions apply. Inactive and hidden tools and the display-only
- * replay wrapper are never exposed; codemode can reach its own callable tools.
+ * Pi tool mode exposes every active Pi builtin, extension, and MCP tool
+ * (with skills bridged separately as `pi__activate_skill`). Inactive and
+ * hidden tools and the display-only replay wrapper are never exposed; codemode
+ * reaches its own callable tools. Native mode disables the bridge (`[]`).
  */
-const BUILTIN_MCP_PATH = "builtin:mcp";
-
-/** Native mode bridges built-in MCP tools; Pi mode bridges the active Pi tool set. */
 export function selectBridgedTools(
   tools: PiToolInfo[],
   activeNames: readonly string[],
-  mode: AgyToolMode = "native",
+  mode: AgyToolMode = "pi",
 ): BridgeToolDef[] {
+  if (mode !== "pi") return [];
   const active = new Set(activeNames);
   const bridged: BridgeToolDef[] = [];
   for (const tool of tools) {
     if (!active.has(tool.name) || tool.exposure === "hidden") continue;
     if (tool.name === WRAPPER_TOOL_NAME) continue; // display-only replay wrapper
-    if (mode === "native" && tool.sourceInfo?.path !== BUILTIN_MCP_PATH) continue;
     bridged.push({
       name: tool.name,
       description: tool.description ?? "",
@@ -180,6 +175,12 @@ export class AgyPiBridge {
   /** Refresh the exposed-tool snapshot and report whether canonical content changed. */
   refreshTools(): boolean {
     this.#tools = this.#toolSource?.() ?? [];
+    return this.#updateCatalogRevision();
+  }
+
+  /** Replace the exposed tool snapshot directly (used when Pi supplies a prepared loadout). */
+  setTools(tools: readonly BridgeToolDef[]): boolean {
+    this.#tools = tools.map((tool) => ({ ...tool }));
     return this.#updateCatalogRevision();
   }
 
@@ -331,10 +332,15 @@ export class AgyPiBridge {
       res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "Forbidden" } }));
       return;
     }
+    if (req.method === "DELETE") {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
     if (req.method !== "POST") {
       res.writeHead(405, { "content-type": "application/json" });
       res.end(
-        JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "GET not supported" } }),
+        JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed" } }),
       );
       return;
     }

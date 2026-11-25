@@ -77,22 +77,6 @@ export class AcpRequestStallError extends Error {
   }
 }
 
-export class MissingAgyConversationError extends Error {
-  readonly requestedSessionId: string;
-  readonly actualSessionId?: string;
-
-  constructor(requestedSessionId: string, actualSessionId?: string) {
-    super(
-      actualSessionId && actualSessionId !== requestedSessionId
-        ? `agy session/resume returned different sessionId "${actualSessionId}" for requested "${requestedSessionId}".`
-        : `agy conversation "${requestedSessionId}" was not found for resume.`,
-    );
-    this.name = "MissingAgyConversationError";
-    this.requestedSessionId = requestedSessionId;
-    this.actualSessionId = actualSessionId;
-  }
-}
-
 export interface AgyAcpClientOptions {
   binary: string;
   cwd: string;
@@ -150,14 +134,6 @@ function formatRpcError(errObj: Record<string, unknown>, method: string): Error 
   const err = new Error(code !== undefined ? `${msg} (code ${String(code)})` : msg);
   (err as Error & { code?: unknown }).code = code;
   return err;
-}
-
-function looksLikeMissingSessionError(err: Error): boolean {
-  const code = (err as Error & { code?: unknown }).code;
-  if (code === -32001 || code === -32002) return true;
-  return /not\s+found|missing|does\s+not\s+exist|unknown\s+session|no\s+such\s+conversation/i.test(
-    err.message,
-  );
 }
 
 export class AgyAcpClient {
@@ -482,28 +458,24 @@ export class AgyAcpClient {
     signal?: AbortSignal;
     timeoutMs?: number;
   }): Promise<AcpSessionResult> {
-    const params: Record<string, unknown> = {
-      sessionId: options.sessionId,
-      cwd: options.cwd,
-      mcpServers: options.mcpServers ?? [],
-    };
-    let result: AcpSessionResult;
-    try {
-      result = await this.#request<AcpSessionResult>("session/resume", params, {
-        signal: options.signal,
-        timeoutMs: options.timeoutMs,
-      });
-    } catch (err) {
-      if (err instanceof Error && looksLikeMissingSessionError(err)) {
-        throw new MissingAgyConversationError(options.sessionId);
-      }
-      throw err;
-    }
+    const result = await this.#request<AcpSessionResult>(
+      "session/resume",
+      {
+        sessionId: options.sessionId,
+        cwd: options.cwd,
+        mcpServers: options.mcpServers ?? [],
+      },
+      { signal: options.signal, timeoutMs: options.timeoutMs },
+    );
     if (!result.sessionId || result.sessionId !== options.sessionId) {
       if (result.sessionId) {
         await this.closeSession(result.sessionId).catch(() => {});
       }
-      throw new MissingAgyConversationError(options.sessionId, result.sessionId);
+      throw new Error(
+        result.sessionId
+          ? `agy session/resume returned different sessionId "${result.sessionId}" for requested "${options.sessionId}".`
+          : `agy session/resume returned empty sessionId for requested "${options.sessionId}".`,
+      );
     }
     return result;
   }
@@ -613,7 +585,7 @@ export class AgyAcpClient {
     ]);
   }
 
-  async dispose(graceMs = 400): Promise<void> {
+  async dispose(graceMs = 2_500): Promise<void> {
     if (this.#closed) {
       await this.#exitPromise;
       return;

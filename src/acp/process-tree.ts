@@ -14,14 +14,13 @@ const PROCESS_TREE_REGISTRY_SYMBOL = Symbol.for("pi-antigravity.process-tree");
 interface ProcessTreeRegistry {
   pids: Set<number>;
   hooked: boolean;
-  onExitHooks: Set<() => void>;
 }
 
 function getRegistry(): ProcessTreeRegistry {
   const g = globalThis as Record<symbol, ProcessTreeRegistry | undefined>;
   let registry = g[PROCESS_TREE_REGISTRY_SYMBOL];
   if (!registry) {
-    registry = { pids: new Set<number>(), hooked: false, onExitHooks: new Set<() => void>() };
+    registry = { pids: new Set<number>(), hooked: false };
     g[PROCESS_TREE_REGISTRY_SYMBOL] = registry;
   }
   return registry;
@@ -101,34 +100,17 @@ function sweepTrackedProcessGroups(): void {
  * Install process-exit / SIGHUP cleanup hooks once per Node process (safe across
  * `/reload` via `globalThis` symbol registry).
  */
-export function registerProcessGroupDeathHooks(onExit?: () => void): () => void {
+export function registerProcessGroupDeathHooks(): void {
   const registry = getRegistry();
-  if (onExit) registry.onExitHooks.add(onExit);
-
-  if (!registry.hooked) {
-    registry.hooked = true;
-    const sweep = () => {
-      for (const hook of registry.onExitHooks) {
-        try {
-          hook();
-        } catch {
-          // Best-effort shutdown hook.
-        }
-      }
+  if (registry.hooked) return;
+  registry.hooked = true;
+  process.on("exit", sweepTrackedProcessGroups);
+  if (process.platform !== "win32") {
+    process.on("SIGHUP", () => {
       sweepTrackedProcessGroups();
-    };
-    process.on("exit", sweep);
-    if (process.platform !== "win32") {
-      process.on("SIGHUP", () => {
-        sweep();
-        process.exit(129);
-      });
-    }
+      process.exit(129);
+    });
   }
-
-  return () => {
-    if (onExit) registry.onExitHooks.delete(onExit);
-  };
 }
 
 export interface ExecAgyOptions {

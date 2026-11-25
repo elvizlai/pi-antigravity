@@ -36,10 +36,7 @@ test("selectBridgedTools separates pi vs native modes and strips hidden/wrapper 
     selectBridgedTools(tools, active, "pi").map((t) => t.name),
     ["read", "hindsight_recall"],
   );
-  assert.deepEqual(
-    selectBridgedTools(tools, active, "native").map((t) => t.name),
-    ["hindsight_recall"],
-  );
+  assert.deepEqual(selectBridgedTools(tools, active, "native"), []);
 });
 
 test("AgyPiBridge enforces token header, exposes tools/list + activate_skill, and resolves tools/call", async () => {
@@ -97,6 +94,41 @@ test("AgyPiBridge enforces token header, exposes tools/list + activate_skill, an
       "pi__activate_skill",
       "pi__read",
     ]);
+
+    const revBefore = bridge.catalogRevision;
+    assert.equal(
+      bridge.setTools([
+        {
+          name: "bash",
+          description: "Run bash",
+          parameters: { type: "object", properties: { command: { type: "string" } } },
+        },
+      ]),
+      true,
+    );
+    assert.ok(bridge.catalogRevision > revBefore);
+    const updatedListRes = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-pi-bridge-token": "secret-token" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 21, method: "tools/list" }),
+    });
+    const updatedListJson = (await updatedListRes.json()) as {
+      result: { tools: Array<{ name: string }> };
+    };
+    assert.deepEqual(updatedListJson.result.tools.map((t) => t.name).sort(), [
+      "pi__activate_skill",
+      "pi__bash",
+    ]);
+    // Restore original tool source before testing pi__read call below.
+    assert.equal(bridge.refreshTools(), true);
+
+    const deleteUnauth = await fetch(url, { method: "DELETE" });
+    assert.equal(deleteUnauth.status, 403);
+    const deleteAuth = await fetch(url, {
+      method: "DELETE",
+      headers: { "x-pi-bridge-token": "secret-token" },
+    });
+    assert.equal(deleteAuth.status, 204);
 
     const skillRes = await fetch(url, {
       method: "POST",

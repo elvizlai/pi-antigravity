@@ -31,9 +31,9 @@ import {
   saveAgySettings,
 } from "../src/provider/settings.ts";
 
-test("parseAgyVersion and checkAgyBinary enforce >= 1.5.0 and cache per binary fingerprint", async () => {
+test("parseAgyVersion and checkAgyBinary enforce >= 1.5.16 and cache per binary fingerprint", async () => {
   resetAgyBinaryCache();
-  assert.equal(parseAgyVersion("agy version v1.5.13"), "1.5.13");
+  assert.equal(parseAgyVersion("agy version v1.5.16"), "1.5.16");
   assert.equal(parseAgyVersion("not-a-version"), undefined);
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-bin-"));
@@ -42,19 +42,19 @@ test("parseAgyVersion and checkAgyBinary enforce >= 1.5.0 and cache per binary f
 
   try {
     await assert.rejects(
-      () => checkAgyBinary({ binaryPath: fakeBin, runner: async () => "agy 1.4.9" }),
-      (err: unknown) => err instanceof AgyCompatibilityError && err.detectedVersion === "1.4.9",
+      () => checkAgyBinary({ binaryPath: fakeBin, runner: async () => "agy 1.5.15" }),
+      (err: unknown) => err instanceof AgyCompatibilityError && err.detectedVersion === "1.5.15",
     );
 
     let runs = 0;
     const runner = async () => {
       runs += 1;
-      return "agy 1.5.13";
+      return "agy 1.5.16";
     };
     const info1 = await checkAgyBinary({ binaryPath: fakeBin, runner });
     const info2 = await checkAgyBinary({ binaryPath: fakeBin, runner });
-    assert.equal(info1.version, "1.5.13");
-    assert.equal(info2.version, "1.5.13");
+    assert.equal(info1.version, "1.5.16");
+    assert.equal(info2.version, "1.5.16");
     assert.equal(runs, 1);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -64,14 +64,37 @@ test("parseAgyVersion and checkAgyBinary enforce >= 1.5.0 and cache per binary f
 
 test("model parsing, fallback merge, effort stripping, and config planning", () => {
   const parsed = parseAgyModelsOutput(
-    "⠋ Fetching available models...\r\ngemini-4-hydrogen  Gemini 4 Hydrogen\nclaude-opus-5-5  Claude Opus 5.5\n",
+    "⠋ Fetching available models...\r\ngemini-4-hydrogen  Gemini 4 Hydrogen\nclaude-opus-5-5  Claude Opus 5.5\ngemini-pro-orchestrator-next  Orchestrator (Next)\n",
   );
-  assert.equal(parsed.length, 2);
+  assert.equal(parsed.length, 3);
+  const parsedById = new Map(parsed.map((m) => [m.id, m]));
+  assert.equal(parsedById.get("gemini-4-hydrogen")?.contextWindow, 1_048_576);
+  assert.equal(parsedById.get("claude-opus-5-5")?.contextWindow, 1_000_000);
+  assert.equal(parsedById.get("gemini-pro-orchestrator-next")?.contextWindow, 1_048_576);
+  assert.equal(parsedById.get("gemini-pro-orchestrator-next")?.reasoning, false);
+  assert.deepEqual(getSupportedThinkingLevels(parsedById.get("gemini-pro-orchestrator-next")!), [
+    "off",
+  ]);
 
   const merged = mergeModelLists(parsed, getFallbackModels());
   assert.ok(merged.some((m) => m.id === "gemini-4-hydrogen"));
   assert.ok(merged.some((m) => m.id === "claude-opus-5-5"));
-  assert.ok(mergeModelLists([], getFallbackModels()).some((m) => m.id === "gpt-oss-120b-medium"));
+  const fallbackById = new Map(getFallbackModels().map((m) => [m.id, m]));
+  assert.equal(fallbackById.get("gemini-4-neon")?.contextWindow, 1_048_576);
+  assert.equal(fallbackById.get("claude-opus-5-5")?.contextWindow, 1_000_000);
+  assert.equal(fallbackById.get("claude-sonnet-5-5")?.contextWindow, 1_000_000);
+  assert.equal(fallbackById.get("gpt-oss-120b-medium")?.contextWindow, 131_072);
+  for (const orchId of [
+    "gemini-pro-orchestrator-neon",
+    "gemini-pro-orchestrator",
+    "gemini-pro-orchestrator-argon",
+  ]) {
+    const orch = fallbackById.get(orchId);
+    assert.ok(orch);
+    assert.equal(orch.contextWindow, 1_048_576);
+    assert.equal(orch.reasoning, false);
+    assert.deepEqual(getSupportedThinkingLevels(orch), ["off"]);
+  }
 
   const candidate = resolveAcpModelCandidate("gemini-3.1-pro-high", {
     id: "model",
@@ -91,16 +114,16 @@ test("model parsing, fallback merge, effort stripping, and config planning", () 
   assert.equal(resolvedEffort, "high");
 
   assert.equal(
-    resolveAcpThoughtLevel("extra", {
+    resolveAcpThoughtLevel("xhigh", {
       id: "thought_level",
       type: "select",
       options: [
         { value: "low", name: "Low" },
-        { value: "extra", name: "Extra" },
+        { value: "xhigh", name: "XHigh" },
         { value: "max", name: "Max" },
       ],
     }),
-    "extra",
+    "xhigh",
   );
   assert.equal(
     resolveAcpThoughtLevel("max", {
@@ -108,7 +131,7 @@ test("model parsing, fallback merge, effort stripping, and config planning", () 
       type: "select",
       options: [
         { value: "low", name: "Low" },
-        { value: "extra", name: "Extra" },
+        { value: "xhigh", name: "XHigh" },
         { value: "max", name: "Max" },
       ],
     }),
@@ -127,20 +150,9 @@ test("model parsing, fallback merge, effort stripping, and config planning", () 
   };
   assert.equal(resolveAcpExecutionMode("plan", modeOption), "plan");
   assert.equal(resolveAcpExecutionMode("default", modeOption), "default");
-  assert.equal(
-    resolveAcpExecutionMode("default", {
-      id: "mode",
-      type: "select",
-      options: [
-        { value: "agent", name: "Agent" },
-        { value: "plan", name: "Plan" },
-      ],
-    }),
-    "agent",
-  );
 
-  assert.equal(modelCacheIsFresh({ fetchedAt: Date.now(), source: "live" }), true);
-  assert.equal(modelCacheIsFresh({ fetchedAt: 0, source: "live" }), false);
+  assert.equal(modelCacheIsFresh({ fetchedAt: Date.now() }), true);
+  assert.equal(modelCacheIsFresh({ fetchedAt: 0 }), false);
 });
 
 test("extension settings persist atomically to antigravity.json without touching Pi settings.json", () => {
@@ -213,7 +225,7 @@ test("thinkingLevelMap unlocks xhigh for neon/hydrogen and preserves live discov
   assert.deepEqual(getSupportedThinkingLevels(gptOss), ["off"]);
 
   assert.equal(buildThinkingLevelMap([]), undefined);
-  assert.deepEqual(buildThinkingLevelMap(["low", "extra", "max"]), {
+  assert.deepEqual(buildThinkingLevelMap(["low", "xhigh", "max"]), {
     off: null,
     minimal: null,
     low: "low",

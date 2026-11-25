@@ -763,3 +763,87 @@ test("buildSeededSessionPrompt preserves single-turn fast path and seeds post-co
   assert.match(cappedText, /LIVE_USER_QUESTION/);
   assert.equal(cappedText.includes("OLD_TURN_DROP"), false);
 });
+
+test("leading slash commands keep block 0 untouched and move custom context/history to block 1", () => {
+  // 1. prependSystemContext keeps /plan and /swarm in block 0, puts customSys in block 1.
+  const planBlocks = prependSystemContext(
+    [
+      { type: "text", text: "  /plan build auth" },
+      { type: "image", data: "Zm9v", mimeType: "image/png" },
+    ],
+    "SYS_CONTEXT",
+  );
+  assert.deepEqual(planBlocks, [
+    { type: "text", text: "  /plan build auth" },
+    { type: "text", text: "SYS_CONTEXT" },
+    { type: "image", data: "Zm9v", mimeType: "image/png" },
+  ]);
+
+  // 2. extractTrailingUserPrompt (used by Turn 1 fallbackLive) applies the same two-block rule.
+  const turn1Swarm = extractTrailingUserPrompt(
+    asTranscript([{ role: "user", content: "/swarm implement feature X", timestamp: 1 }]),
+    { customSystemContext: "HINDSIGHT_MEMORY" },
+  );
+  assert.deepEqual(turn1Swarm, [
+    { type: "text", text: "/swarm implement feature X" },
+    { type: "text", text: "HINDSIGHT_MEMORY" },
+  ]);
+
+  // 3. Tight maxBytes keeps total UTF-8 bytes <= maxBytes when splitting slash + customSys.
+  const tightSlash = prependSystemContext(
+    [{ type: "text", text: "/swarm go" }],
+    `HEAD_${"x".repeat(200)}_TAIL`,
+    48,
+  );
+  assert.equal(tightSlash.length, 2);
+  assert.equal(tightSlash[0]?.type === "text" ? tightSlash[0].text : "", "/swarm go");
+  const totalBytes = tightSlash.reduce(
+    (sum, b) => sum + (b.type === "text" ? Buffer.byteLength(b.text, "utf8") : 0),
+    0,
+  );
+  assert.ok(totalBytes <= 48);
+  assert.match(tightSlash[1]?.type === "text" ? tightSlash[1].text : "", /_TAIL$/);
+
+  // Oversized command text exceeding maxBytes head-truncates cleanly and omits customSys.
+  const hugeCmd = prependSystemContext(
+    [{ type: "text", text: `/plan ${"你".repeat(40)}` }],
+    "SYS",
+    40,
+  );
+  assert.equal(hugeCmd.length, 1);
+  const hugeCmdText = hugeCmd[0]?.type === "text" ? hugeCmd[0].text : "";
+  assert.ok(Buffer.byteLength(hugeCmdText, "utf8") <= 40);
+  assert.match(hugeCmdText, /^\/plan /);
+
+  // 4. buildSeededSessionPrompt with prior history emits [command, customSys + history] for slash prompts.
+  const seededSlash = buildSeededSessionPrompt(
+    asTranscript([
+      { role: "user", content: "earlier question", timestamp: 1 },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "earlier reply" }],
+        api: "a",
+        provider: "antigravity",
+        model: "m",
+        usage: {} as never,
+        stopReason: "stop",
+        timestamp: 2,
+      },
+      { role: "user", content: "/plan next phase", timestamp: 3 },
+    ]),
+    { customSystemContext: "SYS_AFTER_COMPACT" },
+  );
+  assert.equal(seededSlash.length, 2);
+  assert.equal(seededSlash[0]?.type === "text" ? seededSlash[0].text : "", "/plan next phase");
+  const ctxText = seededSlash[1]?.type === "text" ? seededSlash[1].text : "";
+  assert.match(ctxText, /^SYS_AFTER_COMPACT/);
+  assert.match(ctxText, /<conversation_history>/);
+  assert.match(ctxText, /earlier reply/);
+
+  // 5. Non-slash prompts remain single-block with prepended customSys.
+  const normal = extractTrailingUserPrompt(
+    asTranscript([{ role: "user", content: "normal question", timestamp: 1 }]),
+    { customSystemContext: "SYS_PREFIX" },
+  );
+  assert.deepEqual(normal, [{ type: "text", text: "SYS_PREFIX\n\nnormal question" }]);
+});

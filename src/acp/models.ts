@@ -4,9 +4,9 @@ import { execAgyCommand } from "./process-tree.ts";
 
 export type AgyExecutionMode = "default" | "plan";
 
-export type AgyEffort = "low" | "medium" | "high" | "extra" | "xhigh" | "max";
+export type AgyEffort = "low" | "medium" | "high" | "xhigh" | "max";
 
-const AGY_EFFORT_ORDER: readonly AgyEffort[] = ["low", "medium", "high", "extra", "xhigh", "max"];
+const AGY_EFFORT_ORDER: readonly AgyEffort[] = ["low", "medium", "high", "xhigh", "max"];
 
 export interface AgyAcpSelectOption {
   value: string;
@@ -29,7 +29,6 @@ export interface AgyModelSpec {
   contextWindow: number;
   maxTokens: number;
   reasoning: boolean;
-  defaultEffort?: AgyEffort;
   thinkingLevelMap?: ThinkingLevelMap;
 }
 
@@ -40,15 +39,8 @@ export function buildThinkingLevelMap(
   if (!efforts) return undefined;
   const set = new Set<string>();
   for (const raw of efforts) {
-    const normalized = raw === "extra" ? "xhigh" : raw;
-    if (
-      normalized === "low" ||
-      normalized === "medium" ||
-      normalized === "high" ||
-      normalized === "xhigh" ||
-      normalized === "max"
-    ) {
-      set.add(normalized);
+    if (raw === "low" || raw === "medium" || raw === "high" || raw === "xhigh" || raw === "max") {
+      set.add(raw);
     }
   }
   if (set.size === 0) return undefined;
@@ -71,73 +63,68 @@ const DEFAULT_FALLBACK_SPECS: readonly AgyModelSpec[] = [
   {
     id: "gemini-4-neon",
     name: "Gemini 4 Neon",
-    contextWindow: 1_000_000,
+    contextWindow: 1_048_576,
     maxTokens: 65_536,
     reasoning: true,
-    defaultEffort: "high",
     thinkingLevelMap: XHIGH_EFFORT_MAP,
   },
   {
     id: "gemini-4-carbon",
     name: "Gemini 4 Carbon",
-    contextWindow: 1_000_000,
+    contextWindow: 1_048_576,
     maxTokens: 65_536,
     reasoning: true,
-    defaultEffort: "high",
     thinkingLevelMap: STANDARD_EFFORT_MAP,
   },
   {
     id: "gemini-4-argon",
     name: "Gemini 4 Argon",
-    contextWindow: 1_000_000,
+    contextWindow: 1_048_576,
     maxTokens: 65_536,
     reasoning: true,
-    defaultEffort: "high",
     thinkingLevelMap: STANDARD_EFFORT_MAP,
   },
   {
     id: "gemini-4-hydrogen",
     name: "Gemini 4 Hydrogen",
-    contextWindow: 1_000_000,
+    contextWindow: 1_048_576,
     maxTokens: 65_536,
     reasoning: true,
-    defaultEffort: "high",
     thinkingLevelMap: XHIGH_EFFORT_MAP,
   },
   {
     id: "gemini-pro-orchestrator-neon",
     name: "Orchestrator (Neon)",
-    contextWindow: 1_000_000,
+    contextWindow: 1_048_576,
     maxTokens: 65_536,
-    reasoning: true,
+    reasoning: false,
   },
   {
     id: "gemini-pro-orchestrator",
     name: "Orchestrator (Carbon)",
-    contextWindow: 1_000_000,
+    contextWindow: 1_048_576,
     maxTokens: 65_536,
-    reasoning: true,
+    reasoning: false,
   },
   {
     id: "gemini-pro-orchestrator-argon",
     name: "Orchestrator (Argon)",
-    contextWindow: 1_000_000,
+    contextWindow: 1_048_576,
     maxTokens: 65_536,
-    reasoning: true,
+    reasoning: false,
   },
   {
     id: "gemini-3.8-flash",
     name: "Gemini 3.8 Flash",
-    contextWindow: 1_000_000,
+    contextWindow: 1_048_576,
     maxTokens: 65_536,
     reasoning: true,
-    defaultEffort: "medium",
     thinkingLevelMap: STANDARD_EFFORT_MAP,
   },
   {
     id: "claude-opus-5-5",
     name: "Claude Opus 5.5",
-    contextWindow: 200_000,
+    contextWindow: 1_000_000,
     maxTokens: 64_000,
     reasoning: true,
     thinkingLevelMap: STANDARD_EFFORT_MAP,
@@ -145,7 +132,7 @@ const DEFAULT_FALLBACK_SPECS: readonly AgyModelSpec[] = [
   {
     id: "claude-sonnet-5-5",
     name: "Claude Sonnet 5.5",
-    contextWindow: 200_000,
+    contextWindow: 1_000_000,
     maxTokens: 64_000,
     reasoning: true,
     thinkingLevelMap: STANDARD_EFFORT_MAP,
@@ -153,7 +140,7 @@ const DEFAULT_FALLBACK_SPECS: readonly AgyModelSpec[] = [
   {
     id: "gpt-oss-120b-medium",
     name: "GPT-OSS 120B (Medium)",
-    contextWindow: 128_000,
+    contextWindow: 131_072,
     maxTokens: 32_768,
     reasoning: false,
   },
@@ -177,7 +164,7 @@ function specToPiModel(spec: AgyModelSpec): Model<string> {
   };
 }
 
-/** Return built-in fallback models derived from live `agy 1.5.13` ACP capabilities. */
+/** Return built-in fallback models derived from live `agy 1.5.16` ACP capabilities. */
 export function getFallbackModels(): Model<string>[] {
   return DEFAULT_FALLBACK_SPECS.map(specToPiModel);
 }
@@ -206,7 +193,7 @@ export function modelsFromCachedEntries(
 }
 
 const KNOWN_SPECS = new Map(DEFAULT_FALLBACK_SPECS.map((spec) => [spec.id, spec]));
-const SUFFIX_RE = /-(low|medium|high|extra|xhigh|max)$/;
+const SUFFIX_RE = /-(low|medium|high|xhigh|max)$/;
 
 function stripEffortSuffix(rawId: string): { base: string; suffix?: AgyEffort } {
   const match = SUFFIX_RE.exec(rawId);
@@ -227,7 +214,7 @@ function inferModelSpec(id: string, displayName?: string): AgyModelSpec {
     return {
       id,
       name: displayName || id,
-      contextWindow: 200_000,
+      contextWindow: 1_000_000,
       maxTokens: 64_000,
       reasoning: true,
     };
@@ -236,15 +223,24 @@ function inferModelSpec(id: string, displayName?: string): AgyModelSpec {
     return {
       id,
       name: displayName || id,
-      contextWindow: 128_000,
+      contextWindow: 131_072,
       maxTokens: 32_768,
+      reasoning: false,
+    };
+  }
+  if (lower.includes("orchestrator")) {
+    return {
+      id,
+      name: displayName || id,
+      contextWindow: 1_048_576,
+      maxTokens: 65_536,
       reasoning: false,
     };
   }
   return {
     id,
     name: displayName || id,
-    contextWindow: 1_000_000,
+    contextWindow: 1_048_576,
     maxTokens: 65_536,
     reasoning: true,
   };
@@ -289,7 +285,7 @@ export function parseAgyModelsOutput(stdout: string): Model<string>[] {
     if (byId.has(canonicalId)) continue;
     const cleanLabel = keepFullId
       ? entry.label
-      : entry.label.replace(/\s*\((Low|Medium|High|Extra|XHigh|Max)\)\s*$/i, "").trim();
+      : entry.label.replace(/\s*\((Low|Medium|High|XHigh|Max)\)\s*$/i, "").trim();
     const spec = inferModelSpec(canonicalId, cleanLabel);
     const thinkingLevelMap =
       !keepFullId && siblings && siblings.size > 0 ? buildThinkingLevelMap(siblings) : undefined;
@@ -397,7 +393,6 @@ export function resolveAcpThoughtLevel(
         : requested === "low" ||
             requested === "medium" ||
             requested === "high" ||
-            requested === "extra" ||
             requested === "xhigh"
           ? requested
           : "medium";
@@ -422,20 +417,11 @@ export function resolveAcpExecutionMode(
   if (!modeOption) return undefined;
   const supported = new Set((modeOption.options ?? []).map((o) => o.value));
   if (supported.size === 0 || supported.has(desired)) return desired;
-  if (desired === "default" && supported.has("agent")) return "agent";
   return undefined;
 }
 
-const LIVE_CACHE_TTL_MS = 60 * 60 * 1000;
-const FALLBACK_CACHE_TTL_MS = 5 * 60 * 1000;
+const MODEL_CACHE_TTL_MS = 60 * 60 * 1000;
 
-function modelCacheTtlMs(source: "live" | "fallback" | undefined): number {
-  return source === "live" ? LIVE_CACHE_TTL_MS : FALLBACK_CACHE_TTL_MS;
-}
-
-export function modelCacheIsFresh(
-  cache: { fetchedAt?: number; source?: "live" | "fallback" },
-  now = Date.now(),
-): boolean {
-  return Boolean(cache.fetchedAt && now - cache.fetchedAt < modelCacheTtlMs(cache.source));
+export function modelCacheIsFresh(cache: { fetchedAt?: number }, now = Date.now()): boolean {
+  return Boolean(cache.fetchedAt && now - cache.fetchedAt < MODEL_CACHE_TTL_MS);
 }

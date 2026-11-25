@@ -2,11 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import test from "node:test";
 import { getAgyBinary } from "../src/acp/binary.ts";
-import {
-  AcpRequestStallError,
-  AgyAcpClient,
-  MissingAgyConversationError,
-} from "../src/acp/client.ts";
+import { AcpRequestStallError, AgyAcpClient } from "../src/acp/client.ts";
 
 type SpawnProcessFn = NonNullable<ConstructorParameters<typeof AgyAcpClient>[0]["spawnProcess"]>;
 
@@ -137,7 +133,7 @@ test("AgyAcpClient initialize, newSession, resumeSession missing error, prompt u
 
     await assert.rejects(
       () => client.resumeSession({ sessionId: "missing-id", cwd: process.cwd() }),
-      (err: unknown) => err instanceof MissingAgyConversationError,
+      (err: unknown) => err instanceof Error && /session not found/i.test(err.message),
     );
 
     const chunks: string[] = [];
@@ -190,7 +186,7 @@ test("AgyAcpClient aborts prompt via AbortSignal and kills process tree on dispo
   }
 });
 
-test("Live agy acp initialize handshake (non-LLM smoke test when agy CLI >= 1.5.0 is present)", async (t) => {
+test("Live agy acp initialize handshake (non-LLM smoke test when agy CLI >= 1.5.16 is present)", async (t) => {
   let binary: string;
   try {
     binary = getAgyBinary();

@@ -69,19 +69,15 @@ export function toPiUsage(
     typeof contextTokens === "number" && Number.isFinite(contextTokens) && contextTokens > 0;
   if (!usage && !hasContextTokens) return zeroUsage();
 
-  const rawInput = Math.max(0, usage?.input_tokens ?? 0);
-  const rawOutput = Math.max(0, usage?.output_tokens ?? 0);
-  const rawCacheRead = Math.max(0, usage?.cache_read_tokens ?? 0);
-  const rawCacheWrite = Math.max(0, usage?.cache_creation_tokens ?? 0);
+  const rawInput = Math.max(0, usage?.inputTokens ?? 0);
+  const rawOutput = Math.max(0, usage?.outputTokens ?? 0);
+  const rawCacheRead = Math.max(0, usage?.cachedReadTokens ?? 0);
+  const rawCacheWrite = Math.max(0, usage?.cachedWriteTokens ?? 0);
   const rawReasoning =
-    usage?.thinking_tokens !== undefined
-      ? Math.max(0, usage.thinking_tokens)
-      : usage?.reasoning_tokens !== undefined
-        ? Math.max(0, usage.reasoning_tokens)
-        : undefined;
+    usage?.thoughtTokens !== undefined ? Math.max(0, usage.thoughtTokens) : undefined;
   const rawPrompt = rawInput + rawCacheRead + rawCacheWrite;
   const rawComponentSum = rawPrompt + rawOutput;
-  const rawTotal = Math.max(usage?.total_tokens ?? 0, rawComponentSum);
+  const rawTotal = Math.max(usage?.totalTokens ?? 0, rawComponentSum);
 
   let input = rawInput;
   let output = rawOutput;
@@ -214,6 +210,11 @@ export function createAntigravityStreamSimple(
             description: tool.description ?? "",
             parameters: tool.parameters,
           }));
+        const hasTranscriptToolDelta = context.messages.some(
+          (msg) =>
+            msg.role === "system" &&
+            ((msg.toolsAdded?.length ?? 0) > 0 || (msg.toolsRemoved?.length ?? 0) > 0),
+        );
         const isAuxContinuation = runtime.matchesAuxiliaryTurn(context.messages);
         const sessionMismatch =
           options?.sessionId !== undefined
@@ -305,6 +306,7 @@ export function createAntigravityStreamSimple(
                 promptReplaced,
                 allowImages,
                 systemPromptAppend: payload.systemPromptAppend,
+                tools: hasTranscriptToolDelta ? contextTools : undefined,
                 messages: context.messages,
                 sessionId: mainSessionId,
                 branchEntries: deps.getBranchEntries(),

@@ -75,6 +75,19 @@ export function extractSystemPromptAppend(
 
 const TRUNCATION_NOTICE = "\n...[truncated]";
 
+function truncateUtf8Head(text: string, maxBytes: number): string {
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  const noticeBytes = Buffer.byteLength(TRUNCATION_NOTICE, "utf8");
+  const buf = Buffer.from(text, "utf8");
+  const sliceBytes = maxBytes <= noticeBytes ? Math.max(0, maxBytes) : maxBytes - noticeBytes;
+  let slice = buf.subarray(0, sliceBytes).toString("utf8");
+  // Trim any trailing replacement char caused by slicing mid-codepoint.
+  while (slice.length > 0 && slice.charCodeAt(slice.length - 1) === 0xfffd) {
+    slice = slice.slice(0, -1);
+  }
+  return maxBytes <= noticeBytes ? slice : `${slice}${TRUNCATION_NOTICE}`;
+}
+
 function truncateUtf8Tail(text: string, maxBytes: number): string {
   if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
   const noticeBytes = Buffer.byteLength(TRUNCATION_NOTICE, "utf8");
@@ -119,11 +132,6 @@ export function extractTrailingUserPrompt(
   let omittedImages = 0;
   const allowImages = options?.allowImages ?? true;
 
-  const customSys = options?.customSystemContext?.trim();
-  if (customSys) {
-    textParts.push(customSys);
-  }
-
   for (const msg of trailingUsers) {
     if (typeof msg.content === "string") {
       if (msg.content.trim()) {
@@ -157,7 +165,9 @@ export function extractTrailingUserPrompt(
     result.push({ type: "text", text: boundedText });
   }
   result.push(...imageBlocks);
-  return result;
+  return options?.customSystemContext
+    ? prependSystemContext(result, options.customSystemContext, maxBytes)
+    : result;
 }
 
 function truncateHeadChars(text: string, maxChars: number): string {
@@ -252,8 +262,10 @@ function serializePriorMessage(msg: TranscriptContext["messages"][number]): stri
 }
 
 /**
- * Prepend optional custom system context to the first text block (or unshift a
- * new text block) while staying within the UTF-8 byte ceiling.
+ * Attach optional custom system context while staying within the UTF-8 byte ceiling.
+ * When the first text block starts with `/` (an `agy` slash command or skill), keep it
+ * in block 0 untouched and append `customSystemContext` as a second text block so
+ * `agy` still expands the leading command natively.
  */
 export function prependSystemContext(
   blocks: readonly AcpContentBlock[],
@@ -265,10 +277,23 @@ export function prependSystemContext(
   const out = [...blocks];
   const firstTextIdx = out.findIndex((block) => block.type === "text");
   if (firstTextIdx >= 0 && out[firstTextIdx]?.type === "text") {
-    out[firstTextIdx] = {
-      type: "text",
-      text: truncateUtf8Tail(`${customSys}\n\n${out[firstTextIdx].text}`, maxBytes),
-    };
+    const firstText = out[firstTextIdx].text;
+    if (firstText.trimStart().startsWith("/")) {
+      const firstBytes = Buffer.byteLength(firstText, "utf8");
+      if (firstBytes >= maxBytes) {
+        out[firstTextIdx] = { type: "text", text: truncateUtf8Head(firstText, maxBytes) };
+      } else {
+        const trailingText = truncateUtf8Tail(customSys, maxBytes - firstBytes);
+        if (trailingText) {
+          out.splice(firstTextIdx + 1, 0, { type: "text", text: trailingText });
+        }
+      }
+    } else {
+      out[firstTextIdx] = {
+        type: "text",
+        text: truncateUtf8Tail(`${customSys}\n\n${firstText}`, maxBytes),
+      };
+    }
   } else {
     out.unshift({ type: "text", text: truncateUtf8Tail(customSys, maxBytes) });
   }
@@ -374,6 +399,14 @@ export function buildSeededSessionPrompt(
   const customSys = options?.customSystemContext?.trim();
   const liveText = liveParts.join("\n\n");
   const maxBytes = options?.maxBytes ?? MAX_AGY_PROMPT_BYTES;
+  const isSlashPrompt = liveText.trimStart().startsWith("/");
+
+  if (isSlashPrompt) {
+    const liveBytes = Buffer.byteLength(liveText, "utf8");
+    if (liveBytes >= maxBytes) {
+      return [{ type: "text", text: truncateUtf8Head(liveText, maxBytes) }, ...imageBlocks];
+    }
+  }
 
   const fixedSegments = [customSys, liveText].filter((s): s is string => Boolean(s));
   const fixedBytes =
@@ -437,6 +470,20 @@ export function buildSeededSessionPrompt(
   }
 
   const historyBlock = `${SEEDED_HISTORY_HEADER}${historySections.join("\n\n")}${SEEDED_HISTORY_FOOTER}`;
+  if (isSlashPrompt) {
+    const contextBudget = maxBytes - Buffer.byteLength(liveText, "utf8");
+    const contextText = truncateUtf8Tail(
+      [customSys, historyBlock].filter(Boolean).join("\n\n"),
+      contextBudget,
+    );
+    const result: AcpContentBlock[] = [{ type: "text", text: liveText }];
+    if (contextText) {
+      result.push({ type: "text", text: contextText });
+    }
+    result.push(...imageBlocks);
+    return result;
+  }
+
   const assembled = [customSys, historyBlock, liveText].filter(Boolean).join("\n\n");
   const boundedText = truncateUtf8Tail(assembled, maxBytes);
 

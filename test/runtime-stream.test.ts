@@ -630,11 +630,11 @@ test("multi-step cumulative PromptResponse.usage scales to usage_update.used wit
 
     const singleStep = toPiUsage(
       {
-        input_tokens: 3_113,
-        cache_read_tokens: 4_662,
-        output_tokens: 27,
-        thinking_tokens: 10,
-        total_tokens: 7_802,
+        inputTokens: 3_113,
+        cachedReadTokens: 4_662,
+        outputTokens: 27,
+        thoughtTokens: 10,
+        totalTokens: 7_802,
       },
       model,
       7_802,
@@ -647,10 +647,10 @@ test("multi-step cumulative PromptResponse.usage scales to usage_update.used wit
 
     const realOverflow = toPiUsage(
       {
-        input_tokens: 150_000,
-        cache_read_tokens: 1_900_000,
-        output_tokens: 4_000,
-        total_tokens: 2_054_000,
+        inputTokens: 150_000,
+        cachedReadTokens: 1_900_000,
+        outputTokens: 4_000,
+        totalTokens: 2_054_000,
       },
       model,
       1_050_000,
@@ -1288,9 +1288,10 @@ test("native acp:agy multi-step tools split waves at thinking/text boundaries so
   }
 });
 
-test("warmupSession completes setup before streamSimple and reloads client when bridge catalog changes", async () => {
+test("warmupClient reuses warm process and refreshes MCP catalog via closeSession + resumeSession", async () => {
   const agentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-warmup-agents-"));
   let spawnCount = 0;
+  let sessionSeq = 0;
   const calls: string[] = [];
   const sessionMcpCalls: Array<{
     method: "newSession" | "resumeSession";
@@ -1309,7 +1310,7 @@ test("warmupSession completes setup before streamSimple and reloads client when 
       bridge,
       bridgeToken: "tok-warmup",
       getToolMode: () => "pi",
-      checkBinary: async () => ({ binary: "agy", version: "1.5.13" }),
+      checkBinary: async () => ({ binary: "agy", version: "1.5.16" }),
       createClient: () => {
         spawnCount += 1;
         const clientId = spawnCount;
@@ -1320,10 +1321,12 @@ test("warmupSession completes setup before streamSimple and reloads client when 
             return { protocolVersion: 1 };
           },
           async newSession(opts) {
-            calls.push(`new:${clientId}`);
+            sessionSeq += 1;
+            const sid = `sess-${clientId}-${sessionSeq}`;
+            calls.push(`new:${clientId}:${sid}`);
             sessionMcpCalls.push({ method: "newSession", mcpServers: opts.mcpServers ?? [] });
             return {
-              sessionId: `sess-${clientId}`,
+              sessionId: sid,
               configOptions: [
                 {
                   id: "mode",
@@ -1378,6 +1381,9 @@ test("warmupSession completes setup before streamSimple and reloads client when 
             return { configOptions: [] };
           },
           cancelSession() {},
+          async closeSession(sid) {
+            calls.push(`close:${clientId}:${sid}`);
+          },
           async prompt(
             _sid: string,
             _blocks: unknown,
@@ -1403,13 +1409,8 @@ test("warmupSession completes setup before streamSimple and reloads client when 
       },
     });
 
-    await runtime.warmupSession({
-      modelId: "gemini-4-hydrogen",
-      executionMode: "default",
-      sessionId: "pi-warmup-1",
-      branchEntries: [],
-    });
-    assert.deepEqual(calls, ["init:1", "new:1"]);
+    await runtime.warmupClient();
+    assert.deepEqual(calls, ["init:1"]);
 
     calls.length = 0;
     const streamSimple = createAntigravityStreamSimple({
@@ -1427,9 +1428,9 @@ test("warmupSession completes setup before streamSimple and reloads client when 
     }
     const msg1 = await wave1.result();
     assert.equal(msg1.stopReason, "stop");
-    assert.deepEqual(calls, ["prompt:1"]);
+    assert.deepEqual(calls, ["new:1:sess-1-1", "prompt:1"]);
 
-    // Changing dynamic bridge tools bumps catalogRevision and forces a fresh agy acp process.
+    // Changing dynamic bridge tools bumps catalogRevision and refreshes via closeSession + resumeSession on the SAME process.
     bridge.setDynamicTools([
       {
         name: "activate_skill",
@@ -1451,10 +1452,8 @@ test("warmupSession completes setup before streamSimple and reloads client when 
       // Drain stream events.
     }
     await wave2.result();
-    assert.equal(spawnCount, 2);
-    assert.ok(calls.includes("dispose:1"));
-    assert.ok(calls.includes("init:2"));
-    assert.ok(calls.includes("prompt:2"));
+    assert.equal(spawnCount, 1);
+    assert.deepEqual(calls, ["close:1:sess-1-1", "resume:1:sess-1-1", "prompt:1"]);
     assert.equal(aliveClient?.isAlive, true);
     assert.deepEqual(sessionMcpCalls, [
       {
@@ -1487,15 +1486,18 @@ test("warmupSession completes setup before streamSimple and reloads client when 
   }
 });
 
-test("antigravityExtension defers CLI flag reads until after Pi populates flag values", async () => {
+test("antigravityExtension defers CLI flag reads and adheres to Pi 1.6.0 wrapper/lifecycle hooks", async () => {
   const flagValues = new Map<string, unknown>();
   const handlers = new Map<
     string,
     Array<(event: unknown, ctx: unknown) => Promise<unknown> | unknown>
   >();
   const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+  let activeTools: string[] = ["read", "bash"];
   let registeredTool:
     | {
+        exposure?: string;
+        defaultActive?: boolean;
         execute: (
           id: string,
           params: { tool: string; kind?: string; input: Record<string, unknown> },
@@ -1517,9 +1519,15 @@ test("antigravityExtension defers CLI flag reads until after Pi populates flag v
     getFlag(name: string) {
       return flagValues.get(name);
     },
-    getAllTools: () => [],
-    getActiveTools: () => [],
-    setActiveTools() {},
+    getAllTools: () => [
+      { name: "read", description: "Read", parameters: {} },
+      { name: "bash", description: "Bash", parameters: {} },
+      { name: "antigravity", description: "", parameters: {}, exposure: "model-only" },
+    ],
+    getActiveTools: () => [...activeTools],
+    setActiveTools(next: string[]) {
+      activeTools = [...next];
+    },
     getCommands: () => [],
     registerProvider(_id: string, config: typeof registeredProviderConfig) {
       registeredProviderConfig = config;
@@ -1548,6 +1556,9 @@ test("antigravityExtension defers CLI flag reads until after Pi populates flag v
   assert.equal(regById.get("gemini-4-carbon")?.thinkingLevelMap?.xhigh, undefined);
 
   assert.ok(registeredTool);
+  assert.equal(registeredTool.exposure, "model-only");
+  assert.equal(registeredTool.defaultActive, false);
+  assert.ok((handlers.get("agent_settled")?.length ?? 0) >= 1);
   const missingToolRes = await registeredTool.execute("missing-id", { tool: "Read a", input: {} });
   assert.equal(missingToolRes.terminate, undefined);
 
@@ -1573,6 +1584,8 @@ test("antigravityExtension defers CLI flag reads until after Pi populates flag v
     for (const handler of handlers.get("session_start") ?? []) {
       await handler({}, { ...mockCtx, hasUI: false, model: { provider: "other", id: "m" } });
     }
+    assert.equal(activeTools.includes("antigravity"), false);
+
     await commands.get("agy-doctor")?.handler("", mockCtx);
     const doctorReport = notifications[0] ?? "";
     assert.match(doctorReport, /- Tool mode: native/);
@@ -1583,11 +1596,27 @@ test("antigravityExtension defers CLI flag reads until after Pi populates flag v
     await statusHandler?.("", mockCtx);
     assert.match(notifications[0] ?? "", /acp:agy/);
 
+    // session_tree re-syncs antigravity wrapper tool after Pi restores transcript tools.
+    activeTools = ["read", "bash"];
+    for (const handler of handlers.get("session_tree") ?? []) {
+      await handler({}, mockCtx);
+    }
+    assert.equal(activeTools.includes("antigravity"), true);
+
+    // before_agent_start with a non-Antigravity model (e.g. virtual router) does not throw or strip active wrapper.
+    for (const handler of handlers.get("before_agent_start") ?? []) {
+      await handler(
+        { systemPromptOptions: { skills: [] } },
+        { ...mockCtx, model: { provider: "virtual-router", id: "auto" } },
+      );
+    }
+
     // Non-antigravity status update is cleared; antigravity renders acp:agy plan.
     for (const handler of handlers.get("model_select") ?? []) {
       await handler({}, { ...mockCtx, model: { provider: "other", id: "m" } });
     }
     assert.equal(statuses.at(-1), undefined);
+    assert.equal(activeTools.includes("antigravity"), false);
   } finally {
     for (const handler of handlers.get("session_shutdown") ?? []) {
       await handler({}, mockCtx);
@@ -3045,15 +3074,7 @@ test("compaction isolates summarization on ephemeral clients and resets main ACP
     // Append compaction entry (without calling session_compact hook to verify runtime branch check).
     branchEntries.push({ type: "compaction", summary: "Compacted summary" });
 
-    // Warmup + Turn 2 after compaction must close acp-main-1, open acp-main-2, seed summary+kept, and report 24_800!
-    await runtime.warmupSession({
-      modelId: "gemini-4-hydrogen",
-      sessionId: "pi-01a2069c",
-      branchEntries: branchEntries as never,
-      allEntries: branchEntries as never,
-    });
-    assert.deepEqual(closedMainSessions, ["acp-main-1"]);
-
+    // Turn 2 after compaction must close acp-main-1, open acp-main-2, seed summary+kept, and report 24_800!
     const t2 = await streamSimple(
       testModel(),
       makeTranscript([
@@ -3078,6 +3099,7 @@ test("compaction isolates summarization on ephemeral clients and resets main ACP
       ]),
       { sessionId: "pi-01a2069c" },
     ).result();
+    assert.deepEqual(closedMainSessions, ["acp-main-1"]);
 
     assert.equal(t2.usage.totalTokens, 24_800);
     assert.equal(mainSessionPrompts.length, 2);
@@ -4337,6 +4359,140 @@ test("foreground subagent with different sessionId and tools routes to pi-aux wh
     assert.equal(launched[1]?.mcpCount, 0);
   } finally {
     await runtime.dispose();
+    fs.rmSync(agentsDir, { recursive: true, force: true });
+  }
+});
+
+test("streamSimple syncs prepareLoadout/codemode tools into main bridge and emits two text blocks for leading slash commands", async () => {
+  const agentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agy-loadout-"));
+  const bridge = new AgyPiBridge("pi-loadout-test");
+  bridge.setToolSource(() => [{ name: "read", description: "Static read", parameters: {} }]);
+  bridge.refreshTools();
+  await bridge.start();
+
+  const seenToolsAtPrompt: Array<Array<{ name: string; description: string }>> = [];
+  const seenPrompts: Array<Array<{ type: string; text?: string }>> = [];
+  let sessionSeq = 0;
+  let spawnCount = 0;
+
+  const runtime = new AgyRuntime({
+    cwd: "/work",
+    agentsDir,
+    bridge,
+    bridgeToken: "tok-loadout",
+    getToolMode: () => "pi",
+    checkBinary: async () => ({ binary: "/bin/agy", version: "1.5.16" }),
+    createClient() {
+      spawnCount += 1;
+      return {
+        isAlive: true,
+        async initialize() {
+          return { protocolVersion: 1 };
+        },
+        async newSession() {
+          sessionSeq += 1;
+          return { sessionId: `sess-${sessionSeq}` };
+        },
+        async resumeSession({ sessionId }) {
+          return { sessionId };
+        },
+        async setConfigOption() {
+          return {};
+        },
+        cancelSession() {},
+        async closeSession() {},
+        async prompt(_sid, blocks, opts) {
+          seenPrompts.push(blocks as Array<{ type: string; text?: string }>);
+          const listRes = await fetch(bridge.url!, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-pi-bridge-token": "tok-loadout" },
+            body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+          });
+          const listJson = (await listRes.json()) as {
+            result: { tools: Array<{ name: string; description: string }> };
+          };
+          seenToolsAtPrompt.push(listJson.result.tools);
+          opts?.onUpdate?.({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "done" },
+          });
+          return { stopReason: "end_turn" };
+        },
+        async dispose() {},
+      };
+    },
+  });
+
+  const streamSimple = createAntigravityStreamSimple({
+    getRuntime: () => runtime,
+    getSessionId: () => "pi-loadout",
+    getBranchEntries: () => [],
+    replayStore: new AgyReplayStore(),
+  });
+
+  try {
+    // Turn 1: /swarm with custom system section + prepareLoadout rewritten codemode description (read hidden via toolsRemoved).
+    const t1 = await streamSimple(
+      testModel(),
+      makeTranscript([
+        {
+          role: "system",
+          content: "",
+          sections: { custom: "<project_context>remember this</project_context>" },
+          toolsAdded: [
+            { name: "codemode", description: "Callable catalog: read, grep", parameters: {} },
+            { name: "antigravity", description: "", parameters: {} },
+          ],
+          timestamp: 0,
+        },
+        { role: "user", content: "/swarm audit repo", timestamp: 1 },
+      ]),
+      { sessionId: "pi-loadout" },
+    ).result();
+    assert.equal(t1.stopReason, "stop");
+    assert.deepEqual(seenPrompts[0], [
+      { type: "text", text: "/swarm audit repo" },
+      { type: "text", text: "<project_context>remember this</project_context>" },
+    ]);
+    assert.deepEqual(seenToolsAtPrompt[0], [
+      { name: "pi__codemode", description: "Callable catalog: read, grep", inputSchema: {} },
+    ]);
+
+    // Turn 2: prepareLoadout updates codemode catalog; same process refreshes via closeSession + resumeSession.
+    const t2 = await streamSimple(
+      testModel(),
+      makeTranscript([
+        {
+          role: "system",
+          content: "",
+          toolsAdded: [
+            { name: "codemode", description: "Callable catalog: read, grep, bash", parameters: {} },
+          ],
+          timestamp: 0,
+        },
+        { role: "user", content: "/swarm audit repo", timestamp: 1 },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "done" }],
+          api: "antigravity-acp",
+          provider: "antigravity",
+          model: "gemini-4-hydrogen",
+          usage: {} as never,
+          stopReason: "stop",
+          timestamp: 2,
+        },
+        { role: "user", content: "follow up", timestamp: 3 },
+      ]),
+      { sessionId: "pi-loadout" },
+    ).result();
+    assert.equal(t2.stopReason, "stop");
+    assert.equal(spawnCount, 1);
+    assert.deepEqual(seenToolsAtPrompt[1], [
+      { name: "pi__codemode", description: "Callable catalog: read, grep, bash", inputSchema: {} },
+    ]);
+  } finally {
+    await runtime.dispose();
+    await bridge.close();
     fs.rmSync(agentsDir, { recursive: true, force: true });
   }
 });

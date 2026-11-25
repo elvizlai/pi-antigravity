@@ -7,13 +7,12 @@ export type AcpToolLocation = {
 };
 
 export interface AgyUsage {
-  input_tokens?: number;
-  output_tokens?: number;
-  cache_read_tokens?: number;
-  cache_creation_tokens?: number;
-  reasoning_tokens?: number;
-  thinking_tokens?: number;
-  total_tokens?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  cachedReadTokens?: number;
+  cachedWriteTokens?: number;
+  thoughtTokens?: number;
+  totalTokens?: number;
 }
 
 export type AgyToolStatus = "pending" | "in_progress" | "completed" | "failed" | "cancelled";
@@ -310,22 +309,20 @@ export function normalizeAcpPromptUsage(raw: unknown): AgyUsage | undefined {
     return typeof val === "number" && Number.isFinite(val) ? val : undefined;
   };
   const usage: AgyUsage = {
-    input_tokens: num("inputTokens") ?? num("input_tokens"),
-    output_tokens: num("outputTokens") ?? num("output_tokens"),
-    cache_read_tokens: num("cachedReadTokens") ?? num("cache_read_tokens"),
-    cache_creation_tokens: num("cachedWriteTokens") ?? num("cache_creation_tokens"),
-    reasoning_tokens: num("thoughtTokens") ?? num("reasoning_tokens"),
-    thinking_tokens: num("thoughtTokens") ?? num("thinking_tokens") ?? num("reasoning_tokens"),
-    total_tokens: num("totalTokens") ?? num("total_tokens"),
+    inputTokens: num("inputTokens"),
+    outputTokens: num("outputTokens"),
+    cachedReadTokens: num("cachedReadTokens"),
+    cachedWriteTokens: num("cachedWriteTokens"),
+    thoughtTokens: num("thoughtTokens"),
+    totalTokens: num("totalTokens"),
   };
   if (
-    usage.input_tokens === undefined &&
-    usage.output_tokens === undefined &&
-    usage.cache_read_tokens === undefined &&
-    usage.cache_creation_tokens === undefined &&
-    usage.reasoning_tokens === undefined &&
-    usage.thinking_tokens === undefined &&
-    usage.total_tokens === undefined
+    usage.inputTokens === undefined &&
+    usage.outputTokens === undefined &&
+    usage.cachedReadTokens === undefined &&
+    usage.cachedWriteTokens === undefined &&
+    usage.thoughtTokens === undefined &&
+    usage.totalTokens === undefined
   ) {
     return undefined;
   }

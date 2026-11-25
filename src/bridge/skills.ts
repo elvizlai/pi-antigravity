@@ -42,13 +42,13 @@ function isUnderDir(filePath: string, dir: string): boolean {
  * - `<session cwd>/<CONFIG_DIR_NAME>` (`<project>/.pi`): project-private pi
  *   skills.
  *
- * Shared `.agents/skills` roots (user-global and project walk-up) are the
- * agents format — agy scans the workspace ones itself and the global ones
- * belong to other agents; never bridged. The exclusion targets the actual
- * `<dir>/.agents/skills/` root boundary, not any ancestor named `.agents` —
- * a pi agent dir or a workspace nested under some `.agents` directory keeps
- * its own private skills. Anything else outside those two roots is excluded
- * too: sitting outside the workspace does not make a skill pi-private.
+ * Shared `.agents/skills` roots (user-global `~/.agents/skills` and project
+ * walk-up) are natively discovered by `agy >= 1.5.16`; never bridged. The
+ * exclusion targets the actual `<dir>/.agents/skills/` root boundary, not any
+ * ancestor named `.agents` — a pi agent dir or a workspace nested under some
+ * `.agents` directory keeps its own private skills. Anything else outside those
+ * two roots is excluded too: sitting outside the workspace does not make a
+ * skill pi-private.
  */
 export function piPrivateSkills(skills: SkillLite[], sessionCwd: string | undefined): SkillLite[] {
   const roots = [path.resolve(getAgentDir())];

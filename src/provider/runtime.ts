@@ -166,6 +166,7 @@ export interface StartTurnParams {
   promptReplaced?: boolean;
   allowImages?: boolean;
   systemPromptAppend?: string;
+  tools?: readonly BridgeToolDef[];
   messages: TranscriptContext["messages"];
   sessionId: string;
   branchEntries: readonly SessionEntryLike[];
@@ -283,6 +284,50 @@ function isFatalSessionSetupError(
   );
 }
 
+function computeEffectiveTimeoutMs(
+  requestedTimeoutMs: number | undefined,
+  baseTimeoutMs = DEFAULT_FIRST_RESPONSE_TIMEOUT_MS,
+): number {
+  return typeof requestedTimeoutMs === "number" && requestedTimeoutMs > 0
+    ? Math.min(requestedTimeoutMs, baseTimeoutMs)
+    : baseTimeoutMs;
+}
+
+function mapSessionSetupError(
+  err: unknown,
+  effectiveTimeoutMs: number,
+  signal?: AbortSignal,
+): Error {
+  if (signal?.aborted || isAbortError(err)) {
+    return makeAbortError("Antigravity turn aborted.");
+  }
+  if (err instanceof AcpRequestStallError) {
+    return new AgyFirstResponseTimeoutError(effectiveTimeoutMs);
+  }
+  if (err instanceof Error && isAgyQuotaError(err.message)) {
+    return new AgyQuotaError(err.message);
+  }
+  return err instanceof Error ? err : new Error(String(err));
+}
+
+type AgyToolActivity = Exclude<
+  AgyActivity,
+  { type: "context_usage" | "thinking_delta" | "text_delta" }
+>;
+
+interface TurnGuard {
+  controller: AgyTurnController;
+  acpTools: Map<string, AgyToolView>;
+  quotaTracker: AgyQuotaTurnTracker;
+  promptAbort: AbortController;
+  noteFirstResponse: () => void;
+  isFirstResponseSeen: () => boolean;
+  isTimedOut: () => boolean;
+  armWatchdog: (remainingWatchdogMs: number, onTimeout: () => void) => void;
+  disarm: () => void;
+  requestAbort: () => void;
+}
+
 /**
  * Owns the persistent `agy acp` child process, session/resume lifecycle, config
  * synchronization (`mode -> model -> thought_level`), bridged MCP wave loop,
@@ -304,6 +349,7 @@ export class AgyRuntime {
   #conversationId: string | undefined;
   #piSessionId: string | undefined;
   #openedOnClient: string | undefined;
+  #openedCatalogRevision: number | undefined;
   #configOptions: AgyAcpConfigOption[] | undefined;
   #turns = 0;
   #failedResumeIds = new Set<string>();
@@ -340,6 +386,7 @@ export class AgyRuntime {
     this.#conversationId = undefined;
     this.#piSessionId = undefined;
     this.#openedOnClient = undefined;
+    this.#openedCatalogRevision = undefined;
     this.#configOptions = undefined;
     this.#turns = 0;
     this.#failedResumeIds.clear();
@@ -363,6 +410,7 @@ export class AgyRuntime {
     }
     this.#conversationId = undefined;
     this.#openedOnClient = undefined;
+    this.#openedCatalogRevision = undefined;
     this.#configOptions = undefined;
     this.#turns = 0;
     this.#failedResumeIds.clear();
@@ -450,47 +498,12 @@ export class AgyRuntime {
     await this.#runWarmup(params?.signal, async (signal) => {
       if (signal.aborted || this.#activeTurn) return;
       const toolMode = this.#deps.getToolMode?.() ?? "pi";
-      this.#deps.bridge?.refreshTools();
       const { agentName, mcpServers } = await this.#ensurePiToolsAgent(toolMode);
       if (signal.aborted || this.#activeTurn) return;
       await this.#ensureClient({
         agentName,
         mcpServers,
         env: params?.env,
-        signal,
-        timeoutMs: this.#deps.firstResponseTimeoutMs ?? DEFAULT_FIRST_RESPONSE_TIMEOUT_MS,
-      });
-    });
-  }
-
-  /** Pre-open/resume and configure the active ACP session right before `streamSimple` begins timing. */
-  async warmupSession(params: {
-    modelId: string;
-    effort?: string;
-    executionMode?: AgyExecutionMode;
-    sessionId: string;
-    branchEntries: readonly SessionEntryLike[];
-    allEntries?: readonly SessionEntryLike[];
-    env?: Record<string, string>;
-    signal?: AbortSignal;
-  }): Promise<void> {
-    this.clearSettledTurn();
-    if (this.#activeTurn) return;
-    if (this.#activeWarmup) {
-      await this.#activeWarmup.catch(() => {});
-    }
-    if (params.signal?.aborted || this.#activeTurn) return;
-    await this.#runWarmup(params.signal, async (signal) => {
-      if (signal.aborted || this.#activeTurn) return;
-      const executionMode = params.executionMode ?? this.#deps.getExecutionMode?.() ?? "default";
-      await this.#prepareConfiguredSession({
-        modelId: params.modelId,
-        effort: params.effort,
-        executionMode,
-        sessionId: params.sessionId,
-        branchEntries: params.branchEntries,
-        allEntries: params.allEntries,
-        env: params.env,
         signal,
         timeoutMs: this.#deps.firstResponseTimeoutMs ?? DEFAULT_FIRST_RESPONSE_TIMEOUT_MS,
       });
@@ -515,11 +528,12 @@ export class AgyRuntime {
     return true;
   }
 
-  async #disposeClient(graceMs = 400): Promise<void> {
+  async #disposeClient(graceMs = 2_500): Promise<void> {
     const client = this.#client;
     this.#client = undefined;
     this.#clientFingerprint = undefined;
     this.#openedOnClient = undefined;
+    this.#openedCatalogRevision = undefined;
     this.#configOptions = undefined;
     if (this.#pendingDispose) {
       await this.#pendingDispose.catch(() => {});
@@ -616,7 +630,6 @@ export class AgyRuntime {
     const fingerprint = JSON.stringify({
       agentName: params.agentName ?? "",
       bridgeUrl: params.mcpServers?.[0]?.url ?? "",
-      bridgeCatalogRevision: params.agentName ? (this.#deps.bridge?.catalogRevision ?? 0) : 0,
       sandbox: Boolean(this.#deps.sandbox),
       extraDirs: this.#deps.extraDirs ?? [],
       env: stableEnvFingerprint(effectiveEnv),
@@ -666,16 +679,19 @@ export class AgyRuntime {
       branchEntries: readonly SessionEntryLike[];
       allEntries?: readonly SessionEntryLike[];
       mcpServers: readonly AcpHttpMcpServer[];
+      catalogRevision: number;
       signal?: AbortSignal;
       timeoutMs?: number;
     },
   ): Promise<{ sessionId: string; configOptions?: AgyAcpConfigOption[] }> {
-    const closeOpenedOnClient = () => {
-      if (this.#openedOnClient && this.#client === client) {
-        void client.closeSession?.(this.#openedOnClient)?.catch(() => {});
-      }
+    const closeOpenedOnClient = async () => {
+      const opened = this.#openedOnClient;
       this.#openedOnClient = undefined;
+      this.#openedCatalogRevision = undefined;
       this.#configOptions = undefined;
+      if (opened && this.#client === client) {
+        await client.closeSession?.(opened)?.catch(() => {});
+      }
     };
 
     const tryResume = async (
@@ -694,6 +710,7 @@ export class AgyRuntime {
         this.#conversationId = resumed.sessionId;
         this.#piSessionId = params.piSessionId;
         this.#openedOnClient = resumed.sessionId;
+        this.#openedCatalogRevision = params.catalogRevision;
         this.#configOptions = resumed.configOptions;
         if (markerTurns !== undefined) {
           this.#turns = samePrevious ? Math.max(this.#turns, markerTurns) : markerTurns;
@@ -709,7 +726,7 @@ export class AgyRuntime {
 
     if (this.#piSessionId && this.#piSessionId !== params.piSessionId) {
       this.#inTurnContinuation = undefined;
-      closeOpenedOnClient();
+      await closeOpenedOnClient();
       this.#conversationId = undefined;
       this.#turns = 0;
       this.#skipHistorySeed = false;
@@ -733,21 +750,22 @@ export class AgyRuntime {
         if (
           this.#openedOnClient === convId &&
           this.#client === client &&
-          this.#piSessionId === params.piSessionId
+          this.#piSessionId === params.piSessionId &&
+          this.#openedCatalogRevision === params.catalogRevision
         ) {
           this.#turns = Math.max(1, this.#turns);
           return { sessionId: convId, configOptions: this.#configOptions };
         }
         if (!this.#failedResumeIds.has(convId)) {
-          if (this.#openedOnClient && this.#openedOnClient !== convId) {
-            closeOpenedOnClient();
+          if (this.#openedOnClient) {
+            await closeOpenedOnClient();
           }
           const resumed = await tryResume(convId, Math.max(1, this.#turns));
           if (resumed) return resumed;
           this.#failedResumeIds.add(convId);
         }
         this.#inTurnContinuation = undefined;
-        closeOpenedOnClient();
+        await closeOpenedOnClient();
         this.#conversationId = undefined;
         this.#turns = 0;
         const created = await client.newSession({
@@ -759,6 +777,7 @@ export class AgyRuntime {
         this.#conversationId = created.sessionId;
         this.#piSessionId = params.piSessionId;
         this.#openedOnClient = created.sessionId;
+        this.#openedCatalogRevision = params.catalogRevision;
         this.#configOptions = created.configOptions;
         this.#turns = 0;
         return { sessionId: created.sessionId, configOptions: created.configOptions };
@@ -778,8 +797,15 @@ export class AgyRuntime {
         this.#skipHistorySeed = false;
         const markerId = branchState.state.conversationId;
         if (this.#failedResumeIds.has(markerId)) {
-          if (this.#openedOnClient && this.#client === client) {
+          if (
+            this.#openedOnClient &&
+            this.#client === client &&
+            this.#openedCatalogRevision === params.catalogRevision
+          ) {
             return { sessionId: this.#openedOnClient, configOptions: this.#configOptions };
+          }
+          if (this.#openedOnClient) {
+            await closeOpenedOnClient();
           }
           if (this.#conversationId && this.#conversationId !== markerId) {
             const resumed = await tryResume(this.#conversationId);
@@ -790,12 +816,16 @@ export class AgyRuntime {
           break;
         }
 
-        if (this.#openedOnClient === markerId && this.#client === client) {
+        if (
+          this.#openedOnClient === markerId &&
+          this.#client === client &&
+          this.#openedCatalogRevision === params.catalogRevision
+        ) {
           this.#turns = Math.max(this.#turns, branchState.state.turns);
           return { sessionId: markerId, configOptions: this.#configOptions };
         }
-        if (this.#openedOnClient && this.#openedOnClient !== markerId) {
-          closeOpenedOnClient();
+        if (this.#openedOnClient) {
+          await closeOpenedOnClient();
         }
         const resumed = await tryResume(markerId, branchState.state.turns);
         if (resumed) return resumed;
@@ -812,11 +842,12 @@ export class AgyRuntime {
           this.#openedOnClient &&
           this.#client === client &&
           this.#piSessionId === params.piSessionId &&
-          this.#turns === 0
+          this.#turns === 0 &&
+          this.#openedCatalogRevision === params.catalogRevision
         ) {
           return { sessionId: this.#openedOnClient, configOptions: this.#configOptions };
         }
-        closeOpenedOnClient();
+        await closeOpenedOnClient();
         this.#conversationId = undefined;
         this.#turns = 0;
         break;
@@ -827,9 +858,16 @@ export class AgyRuntime {
         if (
           this.#openedOnClient &&
           this.#client === client &&
-          this.#piSessionId === params.piSessionId
+          this.#piSessionId === params.piSessionId &&
+          this.#openedCatalogRevision === params.catalogRevision
         ) {
           return { sessionId: this.#openedOnClient, configOptions: this.#configOptions };
+        }
+        if (this.#openedOnClient) {
+          await closeOpenedOnClient();
+          if (this.#turns === 0) {
+            this.#conversationId = undefined;
+          }
         }
         if (this.#conversationId && this.#piSessionId === params.piSessionId) {
           const resumed = await tryResume(this.#conversationId);
@@ -850,6 +888,7 @@ export class AgyRuntime {
     this.#conversationId = created.sessionId;
     this.#piSessionId = params.piSessionId;
     this.#openedOnClient = created.sessionId;
+    this.#openedCatalogRevision = params.catalogRevision;
     this.#configOptions = created.configOptions;
     this.#turns = 0;
     return { sessionId: created.sessionId, configOptions: created.configOptions };
@@ -930,6 +969,7 @@ export class AgyRuntime {
     modelId: string;
     effort?: string;
     executionMode: AgyExecutionMode;
+    tools?: readonly BridgeToolDef[];
     sessionId: string;
     branchEntries: readonly SessionEntryLike[];
     allEntries?: readonly SessionEntryLike[];
@@ -950,8 +990,15 @@ export class AgyRuntime {
       deadlineMs !== undefined ? Math.max(1, deadlineMs - Date.now()) : undefined;
 
     const toolMode = this.#deps.getToolMode?.() ?? "pi";
-    this.#deps.bridge?.refreshTools();
+    if (toolMode === "pi") {
+      if (params.tools !== undefined) {
+        this.#deps.bridge?.setTools(params.tools);
+      } else {
+        this.#deps.bridge?.refreshTools();
+      }
+    }
     const { agentName, bridgeServerName, mcpServers } = await this.#ensurePiToolsAgent(toolMode);
+    const catalogRevision = mcpServers.length > 0 ? (this.#deps.bridge?.catalogRevision ?? 0) : 0;
     const client = await this.#ensureClient({
       agentName,
       mcpServers,
@@ -965,6 +1012,7 @@ export class AgyRuntime {
         branchEntries: params.branchEntries,
         allEntries: params.allEntries,
         mcpServers,
+        catalogRevision,
         signal: params.signal,
         timeoutMs: remainingMs(),
       });
@@ -1015,6 +1063,7 @@ export class AgyRuntime {
         modelId: params.modelId,
         effort: params.effort,
         executionMode,
+        tools: params.tools,
         sessionId: params.sessionId,
         branchEntries: params.branchEntries,
         allEntries: params.allEntries,
@@ -1030,110 +1079,170 @@ export class AgyRuntime {
         ),
       };
     } catch (err) {
-      if (params.signal?.aborted || isAbortError(err)) {
-        throw makeAbortError("Antigravity turn aborted.");
-      }
-      if (err instanceof AcpRequestStallError) {
-        if (this.#turns === 0) this.#conversationId = undefined;
-        throw new AgyFirstResponseTimeoutError(effectiveTimeoutMs);
+      if (err instanceof AcpRequestStallError && this.#turns === 0) {
+        this.#conversationId = undefined;
       }
       if (err instanceof Error && isAgyQuotaError(err.message)) {
         this.#lastQuotaError = err.message;
-        throw new AgyQuotaError(err.message);
       }
-      throw err;
+      throw mapSessionSetupError(err, effectiveTimeoutMs, params.signal);
     }
   }
 
-  async #drivePromptTurn(ctx: {
-    client: AgyAcpClientLike;
-    sessionId: string;
-    piSessionId: string;
-    bridgeServerName?: string;
-    outboundPrompt: AcpContentBlock[];
-    activeTurn: ActiveTurn;
-    controller: AgyTurnController;
-    acpTools: Map<string, AgyToolView>;
-    quotaTracker: AgyQuotaTurnTracker;
-    workingTracker: AgyWorkingStatusTracker;
-    promptAbort: AbortController;
-    externalSignal?: AbortSignal;
-    onExternalAbort: () => void;
-    noteFirstResponse: () => void;
-    isTimedOut: () => boolean;
-    cleanupActive: (dropTurn?: boolean) => void;
-    dropIfConsumed: () => void;
-    setWorkingStatus: (next: string | undefined) => void;
-    notifyAckWaiters: () => void;
-  }): Promise<void> {
-    const {
-      client,
-      sessionId,
-      piSessionId,
-      bridgeServerName,
-      outboundPrompt,
+  async #openIsolatedSession(params: {
+    agentName: string;
+    modelId: string;
+    effort?: string;
+    mcpServers: readonly AcpHttpMcpServer[];
+    env?: Record<string, string>;
+    signal?: AbortSignal;
+    effectiveTimeoutMs: number;
+  }): Promise<{ client: AgyAcpClientLike; sessionId: string; remainingWatchdogMs: number }> {
+    const deadlineMs =
+      params.effectiveTimeoutMs > 0 ? Date.now() + params.effectiveTimeoutMs : undefined;
+    const remainingMs = () =>
+      deadlineMs !== undefined ? Math.max(1, deadlineMs - Date.now()) : undefined;
+
+    const verified = this.#deps.checkBinary
+      ? await this.#deps.checkBinary(this.#deps.binaryPath, params.signal)
+      : await checkAgyBinary({ binaryPath: this.#deps.binaryPath, signal: params.signal });
+
+    if (params.signal?.aborted) {
+      throw makeAbortError("Antigravity turn aborted.");
+    }
+
+    const effectiveEnv = resolveAgyChildEnv({
+      hostHindsightActive: this.#deps.isHostHindsightActive?.(),
+      env: params.env,
+    });
+    const clientOptions: AgyAcpClientOptions = {
+      binary: verified.binary,
+      cwd: this.#deps.cwd,
+      agentName: params.agentName,
+      extraDirs: this.#deps.extraDirs,
+      sandbox: this.#deps.sandbox,
+      env: effectiveEnv,
+    };
+    const client = this.#deps.createClient
+      ? this.#deps.createClient(clientOptions)
+      : new AgyAcpClient(clientOptions);
+
+    const setupStartedAt = Date.now();
+    try {
+      await client.initialize({ signal: params.signal, timeoutMs: remainingMs() });
+      const created = await client.newSession({
+        cwd: this.#deps.cwd,
+        mcpServers: params.mcpServers,
+        signal: params.signal,
+        timeoutMs: remainingMs(),
+      });
+      await this.#syncSessionConfigTo(
+        client,
+        created.sessionId,
+        { modelId: params.modelId, effort: params.effort, executionMode: "default" },
+        created.configOptions,
+        { signal: params.signal, timeoutMs: remainingMs() },
+      );
+      return {
+        client,
+        sessionId: created.sessionId,
+        remainingWatchdogMs: Math.max(
+          1,
+          params.effectiveTimeoutMs - Math.max(0, Date.now() - setupStartedAt),
+        ),
+      };
+    } catch (err) {
+      await client.dispose(50).catch(() => {});
+      throw mapSessionSetupError(err, params.effectiveTimeoutMs, params.signal);
+    }
+  }
+
+  #createTurnGuard(externalSignal: AbortSignal | undefined, onAbort?: () => void): TurnGuard {
+    const controller = new AgyTurnController();
+    const acpTools = new Map<string, AgyToolView>();
+    const quotaTracker = new AgyQuotaTurnTracker();
+    const promptAbort = new AbortController();
+
+    let sawFirstResponse = false;
+    let timedOut = false;
+    let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const clearTimeoutTimer = () => {
+      if (timeoutTimer) {
+        clearTimeout(timeoutTimer);
+        timeoutTimer = undefined;
+      }
+    };
+
+    const noteFirstResponse = () => {
+      if (sawFirstResponse) return;
+      sawFirstResponse = true;
+      clearTimeoutTimer();
+    };
+
+    const requestAbort = () => {
+      clearTimeoutTimer();
+      promptAbort.abort();
+      onAbort?.();
+    };
+
+    const onExternalAbort = () => {
+      requestAbort();
+    };
+
+    if (externalSignal) {
+      if (externalSignal.aborted) {
+        requestAbort();
+      } else {
+        externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+      }
+    }
+
+    return {
       controller,
       acpTools,
       quotaTracker,
-      workingTracker,
       promptAbort,
-      externalSignal,
-      onExternalAbort,
       noteFirstResponse,
-      isTimedOut,
-      cleanupActive,
-      dropIfConsumed,
-      setWorkingStatus,
-      notifyAckWaiters,
-    } = ctx;
-
-    let turnRecorded = false;
-    const recordTurnState = (requireFirstResponse: boolean) => {
-      if (turnRecorded) return;
-      if (requireFirstResponse && !ctx.activeTurn.isFirstResponseSeen?.()) return;
-      turnRecorded = true;
-      this.#turns += 1;
-      this.#deps.onPersistedState?.({
-        version: 1,
-        kind: "conversation",
-        sessionId: piSessionId,
-        conversationId: sessionId,
-        cwd: this.#deps.cwd,
-        turns: this.#turns,
-      });
+      isFirstResponseSeen: () => sawFirstResponse,
+      isTimedOut: () => timedOut,
+      armWatchdog: (remainingWatchdogMs, onTimeout) => {
+        timeoutTimer = setTimeout(() => {
+          if (sawFirstResponse || controller.isSettled || promptAbort.signal.aborted) return;
+          timedOut = true;
+          clearTimeoutTimer();
+          onTimeout();
+        }, remainingWatchdogMs);
+        timeoutTimer.unref?.();
+      },
+      disarm: () => {
+        externalSignal?.removeEventListener("abort", onExternalAbort);
+        clearTimeoutTimer();
+      },
+      requestAbort,
     };
+  }
 
-    const clearOwnedInTurnContinuation = () => {
-      if (this.#inTurnContinuation?.owner === ctx.activeTurn) {
-        this.#inTurnContinuation = undefined;
-      }
-    };
-
-    const flushBackgroundNativeTools = () => {
-      for (const [callId, tool] of acpTools.entries()) {
-        if (
-          tool.status !== "in_progress" ||
-          tool.finishedEmitted ||
-          tool.deferredEmitted ||
-          isBridgedMcpTool(tool, bridgeServerName)
-        ) {
-          continue;
-        }
-        tool.deferredEmitted = true;
-        const doneActivity: AgyActivity = {
-          type: "tool_done",
-          callId,
-          title: tool.title,
-          ...(tool.name ? { name: tool.name } : {}),
-          ...(tool.kind ? { kind: tool.kind } : {}),
-          ...(tool.locations ? { locations: tool.locations } : {}),
-          ...(tool.rawInput ? { rawInput: tool.rawInput } : {}),
-          output: tool.output ?? BACKGROUND_ACP_TOOL_MESSAGE,
-        };
-        setWorkingStatus(workingTracker.onActivity(doneActivity));
-        controller.pushActivity(doneActivity);
-      }
-    };
+  async #runWatchedPromptTurn(opts: {
+    client: AgyAcpClientLike;
+    sessionId: string;
+    outboundPrompt: AcpContentBlock[];
+    guard: TurnGuard;
+    onThinkingDelta?: (activity: Extract<AgyActivity, { type: "thinking_delta" }>) => void;
+    onBeforeTextDelta?: () => void;
+    onTextDelta?: (activity: Extract<AgyActivity, { type: "text_delta" }>) => void;
+    onToolActivity?: (activity: AgyToolActivity) => void;
+    onBeforeExit?: () => void;
+    onQuotaError?: (message: string) => void;
+    onCancelled?: () => void;
+    onCompleted?: () => void;
+    onUnhandledError?: () => void;
+    onSettled?: () => void;
+    onFinally?: () => Promise<void> | void;
+  }): Promise<void> {
+    const { client, sessionId, outboundPrompt, guard } = opts;
+    const { controller, acpTools, quotaTracker, promptAbort, noteFirstResponse, isTimedOut } =
+      guard;
 
     try {
       const promptResult = await client.prompt(sessionId, outboundPrompt, {
@@ -1157,110 +1266,90 @@ export class AgyRuntime {
 
           if (activity.type === "thinking_delta") {
             quotaTracker.noteThought();
-            setWorkingStatus(workingTracker.onActivity(activity));
+            opts.onThinkingDelta?.(activity);
             controller.pushActivity(activity);
             return;
           }
 
           if (activity.type === "text_delta") {
-            flushBackgroundNativeTools();
+            opts.onBeforeTextDelta?.();
             quotaTracker.noteText(activity.text);
-            setWorkingStatus(workingTracker.onActivity(activity));
+            opts.onTextDelta?.(activity);
             controller.pushActivity(activity);
             return;
           }
 
-          if (isBridgedMcpTool(activity, bridgeServerName)) {
-            quotaTracker.noteToolActivity();
-            notifyAckWaiters();
-            return;
-          }
-
-          quotaTracker.noteToolActivity();
-          setWorkingStatus(workingTracker.onActivity(activity));
-          controller.pushActivity(activity);
-          notifyAckWaiters();
+          opts.onToolActivity?.(activity);
         },
       });
 
-      externalSignal?.removeEventListener("abort", onExternalAbort);
+      guard.disarm();
       if (isTimedOut() || controller.isSettled) return;
-      cleanupActive(false);
+      opts.onBeforeExit?.();
 
       const normalizedUsage = normalizeAcpPromptUsage(promptResult.usage);
       const errorBanner = quotaTracker.detectTurnErrorBanner({
-        totalTokens: normalizedUsage?.total_tokens,
-        outputTokens: normalizedUsage?.output_tokens,
+        totalTokens: normalizedUsage?.totalTokens,
+        outputTokens: normalizedUsage?.outputTokens,
       });
       if (errorBanner?.kind === "quota") {
-        this.#lastQuotaError = errorBanner.message;
+        opts.onQuotaError?.(errorBanner.message);
         controller.fail(new AgyQuotaError(errorBanner.message, { resetsIn: errorBanner.resetsIn }));
-        dropIfConsumed();
+        opts.onSettled?.();
         return;
       }
       if (errorBanner?.kind === "api_error") {
         controller.fail(new Error(errorBanner.message));
-        dropIfConsumed();
+        opts.onSettled?.();
         return;
       }
 
       if (promptResult.stopReason === "cancelled") {
-        clearOwnedInTurnContinuation();
-        recordTurnState(true);
+        opts.onCancelled?.();
         controller.finish({ status: "aborted", stopReason: "aborted" });
-        dropIfConsumed();
+        opts.onSettled?.();
         return;
       }
 
       const stopError = classifyAcpStopReasonFailure(promptResult.stopReason);
       if (stopError) {
         controller.fail(new Error(stopError));
-        dropIfConsumed();
+        opts.onSettled?.();
         return;
       }
 
-      // Materialize background native tool steps before settling so Pi renders their non-error state.
-      flushBackgroundNativeTools();
-
-      this.#lastQuotaError = undefined;
-      clearOwnedInTurnContinuation();
-      recordTurnState(false);
-
+      opts.onCompleted?.();
       controller.finish({
         status: "completed",
         stopReason: promptResult.stopReason,
         usage: normalizedUsage,
       });
-      dropIfConsumed();
+      opts.onSettled?.();
     } catch (err) {
-      externalSignal?.removeEventListener("abort", onExternalAbort);
+      guard.disarm();
       if (isTimedOut() || controller.isSettled) return;
-      cleanupActive(false);
+      opts.onBeforeExit?.();
 
       if (promptAbort.signal.aborted || isAbortError(err)) {
-        clearOwnedInTurnContinuation();
-        recordTurnState(true);
+        opts.onCancelled?.();
         controller.finish({ status: "aborted", stopReason: "aborted" });
-        dropIfConsumed();
+        opts.onSettled?.();
         return;
       }
 
       const error = err instanceof Error ? err : new Error(String(err));
       if (isAgyQuotaError(error.message)) {
-        this.#lastQuotaError = error.message;
+        opts.onQuotaError?.(error.message);
         controller.fail(new AgyQuotaError(error.message));
-        dropIfConsumed();
+        opts.onSettled?.();
         return;
       }
 
-      if (!ctx.activeTurn.isFirstResponseSeen?.() || !client.isAlive) {
-        if (this.#turns === 0) this.#conversationId = undefined;
-        void this.#disposeClient(50);
-      }
+      opts.onUnhandledError?.();
       controller.fail(error);
-      dropIfConsumed();
+      opts.onSettled?.();
     } finally {
-      notifyAckWaiters();
+      await opts.onFinally?.();
     }
   }
 
@@ -1469,44 +1558,24 @@ export class AgyRuntime {
 
     await this.#awaitActiveWarmup(params.signal);
 
-    const baseTimeoutMs = this.#deps.firstResponseTimeoutMs ?? DEFAULT_FIRST_RESPONSE_TIMEOUT_MS;
-    const effectiveTimeoutMs =
-      typeof params.timeoutMs === "number" && params.timeoutMs > 0
-        ? Math.min(params.timeoutMs, baseTimeoutMs)
-        : baseTimeoutMs;
+    const effectiveTimeoutMs = computeEffectiveTimeoutMs(
+      params.timeoutMs,
+      this.#deps.firstResponseTimeoutMs,
+    );
 
     // 2. Fresh ACP prompt turn.
     const { client, sessionId, toolMode, bridgeServerName, remainingWatchdogMs } =
       await this.#openTurnSession(params, effectiveTimeoutMs);
 
-    const controller = new AgyTurnController();
-    const acpTools = new Map<string, AgyToolView>();
-    const quotaTracker = new AgyQuotaTurnTracker();
+    const guard = this.#createTurnGuard(params.signal);
+    const { controller, acpTools, quotaTracker, noteFirstResponse, isFirstResponseSeen } = guard;
     const workingTracker = new AgyWorkingStatusTracker();
-    const promptAbort = new AbortController();
     let lastWorkingStatus: string | undefined;
 
     const setWorkingStatus = (next: string | undefined) => {
       if (next === lastWorkingStatus) return;
       lastWorkingStatus = next;
       this.#deps.onWorkingStatus?.(next);
-    };
-
-    let sawFirstResponse = false;
-    let timedOut = false;
-    let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
-
-    const clearTimeoutTimer = () => {
-      if (timeoutTimer) {
-        clearTimeout(timeoutTimer);
-        timeoutTimer = undefined;
-      }
-    };
-
-    const noteFirstResponse = () => {
-      if (sawFirstResponse) return;
-      sawFirstResponse = true;
-      clearTimeoutTimer();
     };
 
     const ackWaiters = new Set<() => void>();
@@ -1567,12 +1636,9 @@ export class AgyRuntime {
       bridgeCallLabels: new Map(),
       pendingToolImageBatches: [],
       noteFirstResponse,
-      isFirstResponseSeen: () => sawFirstResponse,
+      isFirstResponseSeen,
       noteBridgeCall: () => quotaTracker.noteToolActivity(),
-      requestAbort: () => {
-        clearTimeoutTimer();
-        promptAbort.abort();
-      },
+      requestAbort: guard.requestAbort,
       done: Promise.resolve(),
       waitForBridgedToolsAck,
     };
@@ -1586,7 +1652,7 @@ export class AgyRuntime {
     }
 
     const cleanupActive = (dropTurn = false) => {
-      clearTimeoutTimer();
+      guard.disarm();
       setWorkingStatus(undefined);
       if (this.#activeTurn === activeTurn && (dropTurn || controller.isConsumed)) {
         this.#activeTurn = undefined;
@@ -1599,9 +1665,7 @@ export class AgyRuntime {
       }
     };
 
-    timeoutTimer = setTimeout(() => {
-      if (sawFirstResponse || controller.isSettled || promptAbort.signal.aborted) return;
-      timedOut = true;
+    guard.armWatchdog(remainingWatchdogMs, () => {
       cleanupActive(true);
       try {
         client.cancelSession(sessionId);
@@ -1613,19 +1677,55 @@ export class AgyRuntime {
       }
       void this.#disposeClient(50);
       controller.fail(new AgyFirstResponseTimeoutError(effectiveTimeoutMs));
-    }, remainingWatchdogMs);
-    timeoutTimer.unref?.();
+    });
 
-    const onExternalAbort = () => {
-      activeTurn.requestAbort();
+    let turnRecorded = false;
+    const recordTurnState = (requireFirstResponse: boolean) => {
+      if (turnRecorded) return;
+      if (requireFirstResponse && !isFirstResponseSeen()) return;
+      turnRecorded = true;
+      this.#turns += 1;
+      this.#deps.onPersistedState?.({
+        version: 1,
+        kind: "conversation",
+        sessionId: params.sessionId,
+        conversationId: sessionId,
+        cwd: this.#deps.cwd,
+        turns: this.#turns,
+      });
     };
-    if (params.signal) {
-      if (params.signal.aborted) {
-        onExternalAbort();
-      } else {
-        params.signal.addEventListener("abort", onExternalAbort, { once: true });
+
+    const clearOwnedInTurnContinuation = () => {
+      if (this.#inTurnContinuation?.owner === activeTurn) {
+        this.#inTurnContinuation = undefined;
       }
-    }
+    };
+
+    const flushBackgroundNativeTools = () => {
+      for (const [callId, tool] of acpTools.entries()) {
+        if (
+          tool.status !== "in_progress" ||
+          tool.finishedEmitted ||
+          tool.deferredEmitted ||
+          isBridgedMcpTool(tool, bridgeServerName)
+        ) {
+          continue;
+        }
+        tool.deferredEmitted = true;
+        const doneActivity: AgyActivity = {
+          type: "tool_done",
+          callId,
+          title: tool.title,
+          ...(tool.name ? { name: tool.name } : {}),
+          ...(tool.kind ? { kind: tool.kind } : {}),
+          ...(tool.locations ? { locations: tool.locations } : {}),
+          ...(tool.rawInput ? { rawInput: tool.rawInput } : {}),
+          output: tool.output ?? BACKGROUND_ACP_TOOL_MESSAGE,
+        };
+        setWorkingStatus(workingTracker.onActivity(doneActivity));
+        controller.pushActivity(doneActivity);
+      }
+    };
 
     const shouldSeedHistory = this.#turns === 0 && !this.#skipHistorySeed && !params.promptReplaced;
     this.#skipHistorySeed = false;
@@ -1649,33 +1749,52 @@ export class AgyRuntime {
     }
 
     // Fire `session/prompt` asynchronously while `streamSimple` consumes `controller.drainWave()`.
-    activeTurn.done = this.#drivePromptTurn({
+    activeTurn.done = this.#runWatchedPromptTurn({
       client,
       sessionId,
-      piSessionId: params.sessionId,
-      bridgeServerName,
       outboundPrompt,
-      activeTurn,
-      controller,
-      acpTools,
-      quotaTracker,
-      workingTracker,
-      promptAbort,
-      externalSignal: params.signal,
-      onExternalAbort,
-      noteFirstResponse,
-      isTimedOut: () => timedOut,
-      cleanupActive,
-      dropIfConsumed,
-      setWorkingStatus,
-      notifyAckWaiters,
+      guard,
+      onThinkingDelta: (activity) => setWorkingStatus(workingTracker.onActivity(activity)),
+      onBeforeTextDelta: flushBackgroundNativeTools,
+      onTextDelta: (activity) => setWorkingStatus(workingTracker.onActivity(activity)),
+      onToolActivity: (activity) => {
+        quotaTracker.noteToolActivity();
+        if (!isBridgedMcpTool(activity, bridgeServerName)) {
+          setWorkingStatus(workingTracker.onActivity(activity));
+          controller.pushActivity(activity);
+        }
+        notifyAckWaiters();
+      },
+      onBeforeExit: () => cleanupActive(false),
+      onQuotaError: (message) => {
+        this.#lastQuotaError = message;
+      },
+      onCancelled: () => {
+        clearOwnedInTurnContinuation();
+        recordTurnState(true);
+      },
+      onCompleted: () => {
+        // Materialize background native tool steps before settling so Pi renders their non-error state.
+        flushBackgroundNativeTools();
+        this.#lastQuotaError = undefined;
+        clearOwnedInTurnContinuation();
+        recordTurnState(false);
+      },
+      onUnhandledError: () => {
+        if (!isFirstResponseSeen() || !client.isAlive) {
+          if (this.#turns === 0) this.#conversationId = undefined;
+          void this.#disposeClient(50);
+        }
+      },
+      onSettled: dropIfConsumed,
+      onFinally: notifyAckWaiters,
     });
 
     return {
       controller,
       attachExisting: false,
       bridgeServerName,
-      signalTurnAbort: () => activeTurn.requestAbort(),
+      signalTurnAbort: guard.requestAbort,
     };
   }
 
@@ -1689,226 +1808,52 @@ export class AgyRuntime {
       throw makeAbortError("Antigravity turn aborted.");
     }
 
-    const baseTimeoutMs = this.#deps.firstResponseTimeoutMs ?? DEFAULT_FIRST_RESPONSE_TIMEOUT_MS;
-    const effectiveTimeoutMs =
-      typeof params.timeoutMs === "number" && params.timeoutMs > 0
-        ? Math.min(params.timeoutMs, baseTimeoutMs)
-        : baseTimeoutMs;
-    const deadlineMs = effectiveTimeoutMs > 0 ? Date.now() + effectiveTimeoutMs : undefined;
-    const remainingMs = () =>
-      deadlineMs !== undefined ? Math.max(1, deadlineMs - Date.now()) : undefined;
+    const effectiveTimeoutMs = computeEffectiveTimeoutMs(
+      params.timeoutMs,
+      this.#deps.firstResponseTimeoutMs,
+    );
 
     this.#ephemeralAgentHandle ??= createToollessAgent({ agentsDir: this.#deps.agentsDir });
     await this.#ephemeralAgentHandle.write();
 
-    const verified = this.#deps.checkBinary
-      ? await this.#deps.checkBinary(this.#deps.binaryPath, params.signal)
-      : await checkAgyBinary({ binaryPath: this.#deps.binaryPath, signal: params.signal });
-
-    if (params.signal?.aborted) {
-      throw makeAbortError("Antigravity turn aborted.");
-    }
-
-    const effectiveEnv = resolveAgyChildEnv({
-      hostHindsightActive: this.#deps.isHostHindsightActive?.(),
-      env: params.env,
-    });
-    const clientOptions: AgyAcpClientOptions = {
-      binary: verified.binary,
-      cwd: this.#deps.cwd,
+    const { client, sessionId, remainingWatchdogMs } = await this.#openIsolatedSession({
       agentName: this.#ephemeralAgentHandle.agentName,
-      extraDirs: this.#deps.extraDirs,
-      sandbox: this.#deps.sandbox,
-      env: effectiveEnv,
-    };
-    const client = this.#deps.createClient
-      ? this.#deps.createClient(clientOptions)
-      : new AgyAcpClient(clientOptions);
+      modelId: params.modelId,
+      effort: params.effort,
+      mcpServers: [],
+      env: params.env,
+      signal: params.signal,
+      effectiveTimeoutMs,
+    });
 
-    const setupStartedAt = Date.now();
-    let sessionId: string;
-    try {
-      await client.initialize({ signal: params.signal, timeoutMs: remainingMs() });
-      const created = await client.newSession({
-        cwd: this.#deps.cwd,
-        mcpServers: [],
-        signal: params.signal,
-        timeoutMs: remainingMs(),
-      });
-      sessionId = created.sessionId;
-      await this.#syncSessionConfigTo(
-        client,
-        sessionId,
-        { modelId: params.modelId, effort: params.effort, executionMode: "default" },
-        created.configOptions,
-        { signal: params.signal, timeoutMs: remainingMs() },
-      );
-    } catch (err) {
-      await client.dispose(50).catch(() => {});
-      if (params.signal?.aborted || isAbortError(err)) {
-        throw makeAbortError("Antigravity turn aborted.");
-      }
-      if (err instanceof AcpRequestStallError) {
-        throw new AgyFirstResponseTimeoutError(effectiveTimeoutMs);
-      }
-      if (err instanceof Error && isAgyQuotaError(err.message)) {
-        throw new AgyQuotaError(err.message);
-      }
-      throw err;
-    }
-
-    const remainingWatchdogMs = Math.max(
-      1,
-      effectiveTimeoutMs - Math.max(0, Date.now() - setupStartedAt),
-    );
-    const controller = new AgyTurnController();
-    const acpTools = new Map<string, AgyToolView>();
-    const quotaTracker = new AgyQuotaTurnTracker();
-    const promptAbort = new AbortController();
-
-    let sawFirstResponse = false;
-    let timedOut = false;
-    let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
-
-    const clearTimeoutTimer = () => {
-      if (timeoutTimer) {
-        clearTimeout(timeoutTimer);
-        timeoutTimer = undefined;
-      }
-    };
-
-    const noteFirstResponse = () => {
-      if (sawFirstResponse) return;
-      sawFirstResponse = true;
-      clearTimeoutTimer();
-    };
-
-    timeoutTimer = setTimeout(() => {
-      if (sawFirstResponse || controller.isSettled || promptAbort.signal.aborted) return;
-      timedOut = true;
-      clearTimeoutTimer();
+    const guard = this.#createTurnGuard(params.signal);
+    guard.armWatchdog(remainingWatchdogMs, () => {
       try {
         client.cancelSession(sessionId);
       } catch {
         // Best-effort cancel before hard client disposal.
       }
       void client.dispose(50).catch(() => {});
-      controller.fail(new AgyFirstResponseTimeoutError(effectiveTimeoutMs));
-    }, remainingWatchdogMs);
-    timeoutTimer.unref?.();
-
-    const onExternalAbort = () => {
-      clearTimeoutTimer();
-      promptAbort.abort();
-    };
-    if (params.signal) {
-      if (params.signal.aborted) {
-        onExternalAbort();
-      } else {
-        params.signal.addEventListener("abort", onExternalAbort, { once: true });
-      }
-    }
+      guard.controller.fail(new AgyFirstResponseTimeoutError(effectiveTimeoutMs));
+    });
 
     const outboundPrompt = prependSystemContext(params.prompt, params.systemPromptAppend);
 
-    void (async () => {
-      try {
-        const promptResult = await client.prompt(sessionId, outboundPrompt, {
-          signal: promptAbort.signal,
-          onUpdate: (update) => {
-            if (timedOut || controller.isSettled) return;
-            const activity = acpUpdateToActivity(update, acpTools);
-            if (!activity) return;
-
-            if (activity.type === "context_usage") {
-              if (activity.usedTokens > 0) {
-                noteFirstResponse();
-                quotaTracker.noteUsageUpdate();
-              }
-              controller.pushActivity(activity);
-              return;
-            }
-
-            noteFirstResponse();
-
-            if (activity.type === "thinking_delta") {
-              quotaTracker.noteThought();
-              controller.pushActivity(activity);
-              return;
-            }
-
-            if (activity.type === "text_delta") {
-              quotaTracker.noteText(activity.text);
-              controller.pushActivity(activity);
-            }
-          },
-        });
-
-        params.signal?.removeEventListener("abort", onExternalAbort);
-        clearTimeoutTimer();
-        if (timedOut || controller.isSettled) return;
-
-        const normalizedUsage = normalizeAcpPromptUsage(promptResult.usage);
-        const errorBanner = quotaTracker.detectTurnErrorBanner({
-          totalTokens: normalizedUsage?.total_tokens,
-          outputTokens: normalizedUsage?.output_tokens,
-        });
-        if (errorBanner?.kind === "quota") {
-          controller.fail(
-            new AgyQuotaError(errorBanner.message, { resetsIn: errorBanner.resetsIn }),
-          );
-          return;
-        }
-        if (errorBanner?.kind === "api_error") {
-          controller.fail(new Error(errorBanner.message));
-          return;
-        }
-
-        if (promptResult.stopReason === "cancelled") {
-          controller.finish({ status: "aborted", stopReason: "aborted" });
-          return;
-        }
-
-        const stopError = classifyAcpStopReasonFailure(promptResult.stopReason);
-        if (stopError) {
-          controller.fail(new Error(stopError));
-          return;
-        }
-
-        controller.finish({
-          status: "completed",
-          stopReason: promptResult.stopReason,
-          usage: normalizedUsage,
-        });
-      } catch (err) {
-        params.signal?.removeEventListener("abort", onExternalAbort);
-        clearTimeoutTimer();
-        if (timedOut || controller.isSettled) return;
-
-        if (promptAbort.signal.aborted || isAbortError(err)) {
-          controller.finish({ status: "aborted", stopReason: "aborted" });
-          return;
-        }
-
-        const error = err instanceof Error ? err : new Error(String(err));
-        if (isAgyQuotaError(error.message)) {
-          controller.fail(new AgyQuotaError(error.message));
-          return;
-        }
-        controller.fail(error);
-      } finally {
+    void this.#runWatchedPromptTurn({
+      client,
+      sessionId,
+      outboundPrompt,
+      guard,
+      onFinally: async () => {
         await client.closeSession?.(sessionId).catch(() => {});
-        await client.dispose(100).catch(() => {});
-      }
-    })();
+        await client.dispose(2_500).catch(() => {});
+      },
+    });
 
     return {
-      controller,
+      controller: guard.controller,
       attachExisting: false,
-      signalTurnAbort: () => {
-        clearTimeoutTimer();
-        promptAbort.abort();
-      },
+      signalTurnAbort: guard.requestAbort,
     };
   }
 
@@ -1954,14 +1899,10 @@ export class AgyRuntime {
       throw makeAbortError("Antigravity turn aborted.");
     }
 
-    const baseTimeoutMs = this.#deps.firstResponseTimeoutMs ?? DEFAULT_FIRST_RESPONSE_TIMEOUT_MS;
-    const effectiveTimeoutMs =
-      typeof params.timeoutMs === "number" && params.timeoutMs > 0
-        ? Math.min(params.timeoutMs, baseTimeoutMs)
-        : baseTimeoutMs;
-    const deadlineMs = effectiveTimeoutMs > 0 ? Date.now() + effectiveTimeoutMs : undefined;
-    const remainingMs = () =>
-      deadlineMs !== undefined ? Math.max(1, deadlineMs - Date.now()) : undefined;
+    const effectiveTimeoutMs = computeEffectiveTimeoutMs(
+      params.timeoutMs,
+      this.#deps.firstResponseTimeoutMs,
+    );
 
     const auxId = randomUUID().replaceAll("-", "").slice(0, 12);
     const auxServerName = `pi-aux-${auxId}`;
@@ -1969,124 +1910,62 @@ export class AgyRuntime {
     const auxBridge = new AgyPiBridge(auxServerName, undefined, auxServerName);
     auxBridge.requireToken(auxToken);
     const toolSnapshot = params.tools.map((tool) => ({ ...tool }));
-    auxBridge.setToolSource(() => toolSnapshot);
-    auxBridge.refreshTools();
+    auxBridge.setTools(toolSnapshot);
 
     const auxAgent = createAuxiliaryToolsAgent(
       { serverName: auxServerName },
       { agentsDir: this.#deps.agentsDir },
     );
 
-    let client: AgyAcpClientLike | undefined;
-    let sessionId = "";
-    const setupStartedAt = Date.now();
+    let activeClient: AgyAcpClientLike;
+    let sessionId: string;
+    let remainingWatchdogMs: number;
     try {
       await auxBridge.start();
       await auxAgent.write();
-
-      const verified = this.#deps.checkBinary
-        ? await this.#deps.checkBinary(this.#deps.binaryPath, params.signal)
-        : await checkAgyBinary({ binaryPath: this.#deps.binaryPath, signal: params.signal });
-
-      if (params.signal?.aborted) {
-        throw makeAbortError("Antigravity turn aborted.");
-      }
       if (!auxBridge.url) {
         throw new Error("antigravity: auxiliary MCP bridge failed to expose a URL.");
       }
 
-      const effectiveEnv = resolveAgyChildEnv({
-        hostHindsightActive: this.#deps.isHostHindsightActive?.(),
-        env: params.env,
-      });
-      const clientOptions: AgyAcpClientOptions = {
-        binary: verified.binary,
-        cwd: this.#deps.cwd,
+      const opened = await this.#openIsolatedSession({
         agentName: auxAgent.agentName,
-        extraDirs: this.#deps.extraDirs,
-        sandbox: this.#deps.sandbox,
-        env: effectiveEnv,
-      };
-      client = this.#deps.createClient
-        ? this.#deps.createClient(clientOptions)
-        : new AgyAcpClient(clientOptions);
-
-      const mcpServers: AcpHttpMcpServer[] = [
-        {
-          type: "http",
-          name: auxServerName,
-          url: auxBridge.url,
-          headers: [{ name: "x-pi-bridge-token", value: auxToken }],
-        },
-      ];
-
-      await client.initialize({ signal: params.signal, timeoutMs: remainingMs() });
-      const created = await client.newSession({
-        cwd: this.#deps.cwd,
-        mcpServers,
+        modelId: params.modelId,
+        effort: params.effort,
+        mcpServers: [
+          {
+            type: "http",
+            name: auxServerName,
+            url: auxBridge.url,
+            headers: [{ name: "x-pi-bridge-token", value: auxToken }],
+          },
+        ],
+        env: params.env,
         signal: params.signal,
-        timeoutMs: remainingMs(),
+        effectiveTimeoutMs,
       });
-      sessionId = created.sessionId;
-      await this.#syncSessionConfigTo(
-        client,
-        sessionId,
-        { modelId: params.modelId, effort: params.effort, executionMode: "default" },
-        created.configOptions,
-        { signal: params.signal, timeoutMs: remainingMs() },
-      );
+      activeClient = opened.client;
+      sessionId = opened.sessionId;
+      remainingWatchdogMs = opened.remainingWatchdogMs;
     } catch (err) {
-      await client?.dispose(50).catch(() => {});
       await auxBridge.close().catch(() => {});
       await auxAgent.remove().catch(() => {});
-      if (params.signal?.aborted || isAbortError(err)) {
-        throw makeAbortError("Antigravity turn aborted.");
-      }
-      if (err instanceof AcpRequestStallError) {
-        throw new AgyFirstResponseTimeoutError(effectiveTimeoutMs);
-      }
-      if (err instanceof Error && isAgyQuotaError(err.message)) {
-        throw new AgyQuotaError(err.message);
-      }
       throw err;
     }
 
-    const activeClient = client;
-    const remainingWatchdogMs = Math.max(
-      1,
-      effectiveTimeoutMs - Math.max(0, Date.now() - setupStartedAt),
-    );
-    const controller = new AgyTurnController();
-    const acpTools = new Map<string, AgyToolView>();
-    const quotaTracker = new AgyQuotaTurnTracker();
-    const promptAbort = new AbortController();
-
-    let sawFirstResponse = false;
-    let timedOut = false;
-    let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
     let cleanupPromise: Promise<void> | undefined;
-
-    const clearTimeoutTimer = () => {
-      if (timeoutTimer) {
-        clearTimeout(timeoutTimer);
-        timeoutTimer = undefined;
+    const guard = this.#createTurnGuard(params.signal, () => {
+      const cancelled = auxBridge.cancelPendingCalls(
+        "antigravity: auxiliary turn aborted while tool call was pending.",
+      );
+      if (cancelled > 0) {
+        void auxBridge.flushResponses().catch(() => {});
       }
-    };
+    });
+    const { controller, quotaTracker, promptAbort, noteFirstResponse, isTimedOut } = guard;
 
-    const noteFirstResponse = () => {
-      if (sawFirstResponse) return;
-      sawFirstResponse = true;
-      clearTimeoutTimer();
-    };
-
-    const onExternalAbort = () => {
-      auxTurn.requestAbort();
-    };
-
-    const cleanup = (): Promise<void> => {
+    const cleanup = (disposeGraceMs = 2_500): Promise<void> => {
       cleanupPromise ??= (async () => {
-        clearTimeoutTimer();
-        params.signal?.removeEventListener("abort", onExternalAbort);
+        guard.disarm();
         const cancelled = auxBridge.cancelPendingCalls(
           "antigravity: auxiliary turn ended while tool call was pending.",
         );
@@ -2094,7 +1973,7 @@ export class AgyRuntime {
           await auxBridge.flushResponses().catch(() => {});
         }
         await activeClient.closeSession?.(sessionId).catch(() => {});
-        await activeClient.dispose(100).catch(() => {});
+        await activeClient.dispose(disposeGraceMs).catch(() => {});
         await auxBridge.close().catch(() => {});
         await auxAgent.remove().catch(() => {});
       })();
@@ -2104,23 +1983,14 @@ export class AgyRuntime {
     const auxTurn: AuxiliaryTurn = {
       controller,
       bridge: auxBridge,
-      requestAbort: () => {
-        clearTimeoutTimer();
-        promptAbort.abort();
-        const cancelled = auxBridge.cancelPendingCalls(
-          "antigravity: auxiliary turn aborted while tool call was pending.",
-        );
-        if (cancelled > 0) {
-          void auxBridge.flushResponses().catch(() => {});
-        }
-      },
+      requestAbort: guard.requestAbort,
       cleanup,
       promptDone: false,
     };
     this.#auxTurns.add(auxTurn);
 
     auxBridge.setOnCall((call) => {
-      if (timedOut || controller.isSettled || promptAbort.signal.aborted) return false;
+      if (isTimedOut() || controller.isSettled || promptAbort.signal.aborted) return false;
       noteFirstResponse();
       quotaTracker.noteToolActivity();
       controller.pushActivity({
@@ -2132,135 +2002,43 @@ export class AgyRuntime {
       return true;
     });
 
-    timeoutTimer = setTimeout(() => {
-      if (sawFirstResponse || controller.isSettled || promptAbort.signal.aborted) return;
-      timedOut = true;
-      clearTimeoutTimer();
+    guard.armWatchdog(remainingWatchdogMs, () => {
       try {
         activeClient.cancelSession(sessionId);
       } catch {
         // Best-effort cancel before hard client disposal.
       }
-      void cleanup();
+      void cleanup(50);
       this.#auxTurns.delete(auxTurn);
       controller.fail(new AgyFirstResponseTimeoutError(effectiveTimeoutMs));
-    }, remainingWatchdogMs);
-    timeoutTimer.unref?.();
-
-    if (params.signal) {
-      if (params.signal.aborted) {
-        onExternalAbort();
-      } else {
-        params.signal.addEventListener("abort", onExternalAbort, { once: true });
-      }
-    }
+    });
 
     const outboundPrompt = prependSystemContext(params.prompt, params.systemPromptAppend);
 
-    void (async () => {
-      try {
-        const promptResult = await activeClient.prompt(sessionId, outboundPrompt, {
-          signal: promptAbort.signal,
-          onUpdate: (update) => {
-            if (timedOut || controller.isSettled) return;
-            const activity = acpUpdateToActivity(update, acpTools);
-            if (!activity) return;
-
-            if (activity.type === "context_usage") {
-              if (activity.usedTokens > 0) {
-                noteFirstResponse();
-                quotaTracker.noteUsageUpdate();
-              }
-              controller.pushActivity(activity);
-              return;
-            }
-
-            noteFirstResponse();
-
-            if (activity.type === "thinking_delta") {
-              quotaTracker.noteThought();
-              controller.pushActivity(activity);
-              return;
-            }
-
-            if (activity.type === "text_delta") {
-              quotaTracker.noteText(activity.text);
-              controller.pushActivity(activity);
-              return;
-            }
-
-            if (isBridgedMcpTool(activity, auxServerName)) {
-              quotaTracker.noteToolActivity();
-            }
-          },
-        });
-
-        params.signal?.removeEventListener("abort", onExternalAbort);
-        clearTimeoutTimer();
-        if (timedOut || controller.isSettled) return;
-
-        const normalizedUsage = normalizeAcpPromptUsage(promptResult.usage);
-        const errorBanner = quotaTracker.detectTurnErrorBanner({
-          totalTokens: normalizedUsage?.total_tokens,
-          outputTokens: normalizedUsage?.output_tokens,
-        });
-        if (errorBanner?.kind === "quota") {
-          controller.fail(
-            new AgyQuotaError(errorBanner.message, { resetsIn: errorBanner.resetsIn }),
-          );
-          return;
+    void this.#runWatchedPromptTurn({
+      client: activeClient,
+      sessionId,
+      outboundPrompt,
+      guard,
+      onToolActivity: (activity) => {
+        if (isBridgedMcpTool(activity, auxServerName)) {
+          quotaTracker.noteToolActivity();
         }
-        if (errorBanner?.kind === "api_error") {
-          controller.fail(new Error(errorBanner.message));
-          return;
-        }
-
-        if (promptResult.stopReason === "cancelled") {
-          controller.finish({ status: "aborted", stopReason: "aborted" });
-          return;
-        }
-
-        const stopError = classifyAcpStopReasonFailure(promptResult.stopReason);
-        if (stopError) {
-          controller.fail(new Error(stopError));
-          return;
-        }
-
-        controller.finish({
-          status: "completed",
-          stopReason: promptResult.stopReason,
-          usage: normalizedUsage,
-        });
-      } catch (err) {
-        params.signal?.removeEventListener("abort", onExternalAbort);
-        clearTimeoutTimer();
-        if (timedOut || controller.isSettled) return;
-
-        if (promptAbort.signal.aborted || isAbortError(err)) {
-          controller.finish({ status: "aborted", stopReason: "aborted" });
-          return;
-        }
-
-        const error = err instanceof Error ? err : new Error(String(err));
-        if (isAgyQuotaError(error.message)) {
-          controller.fail(new AgyQuotaError(error.message));
-          return;
-        }
-        controller.fail(error);
-      } finally {
+      },
+      onFinally: async () => {
         auxTurn.promptDone = true;
-        await cleanup();
+        await cleanup(2_500);
         if (controller.isConsumed || promptAbort.signal.aborted) {
           this.#auxTurns.delete(auxTurn);
         }
-      }
-    })();
+      },
+    });
 
     return {
       controller,
       attachExisting: false,
       bridgeServerName: auxServerName,
-      signalTurnAbort: () => auxTurn.requestAbort(),
+      signalTurnAbort: guard.requestAbort,
       onConsumed: () => {
         if (auxTurn.promptDone) {
           this.#auxTurns.delete(auxTurn);

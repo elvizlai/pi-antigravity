@@ -5,11 +5,11 @@ import { gte, valid } from "semver";
 import which from "which";
 import { execAgyCommand } from "./process-tree.ts";
 
-/** Minimum `agy` CLI version required for `agy acp` (`--process-per-session`, `session/resume`). */
-const MIN_AGY_VERSION = "1.5.0";
+/** Minimum `agy` CLI version required (`--process-per-session`, `session/resume`, native `~/.agents/skills`). */
+const MIN_AGY_VERSION = "1.5.16";
 
 const AGY_INSTALL_HINT =
-  "Install Antigravity CLI >= 1.5.0 (`npm i -g @google/antigravity` or official installer) and ensure `agy` is on PATH.";
+  "Install or upgrade Antigravity CLI >= 1.5.16 (`agy update`, `npm i -g @google/antigravity`, or official installer) and ensure `agy` is on PATH.";
 
 const AGY_PROBE_TIMEOUT_MS = 10_000;
 
