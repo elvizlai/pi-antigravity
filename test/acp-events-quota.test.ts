@@ -133,6 +133,34 @@ test("quota detection catches fake end_turn quota banners while avoiding prose f
     resetsIn: "2h 15m",
   });
   assert.equal(isAgyQuotaError("You have exhausted your capacity for this model"), true);
+  assert.equal(isAgyQuotaError("You have exhausted your quota on this model."), true);
+  assert.equal(
+    isAgyQuotaError(
+      "Your organization's prepaid balance is insufficient. Contact your administrator to add funds.",
+    ),
+    true,
+  );
+  assert.deepEqual(
+    parseAgyQuotaNotice(
+      "Your organization's prepaid balance is insufficient. Contact your administrator to add funds.",
+    ),
+    {
+      message:
+        "Your organization's prepaid balance is insufficient. Contact your administrator to add funds.",
+      resetsIn: undefined,
+    },
+  );
+
+  const prepaidTracker = new AgyQuotaTurnTracker();
+  prepaidTracker.noteText(
+    "⚠ Your organization's prepaid balance is insufficient. Contact your administrator to add funds.",
+  );
+  assert.deepEqual(prepaidTracker.detectTurnErrorBanner({ totalTokens: 0, outputTokens: 0 }), {
+    kind: "quota",
+    message:
+      "Your organization's prepaid balance is insufficient. Contact your administrator to add funds.",
+    resetsIn: undefined,
+  });
 
   const tracker = new AgyQuotaTurnTracker();
   tracker.noteText("⚠ Individual quota reached. Resets in 10m.");

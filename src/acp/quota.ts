@@ -19,7 +19,7 @@ export type AgyTurnBanner =
 
 const QUOTA_PREFIX = "⚠";
 const QUOTA_CORE_REGEX =
-  /(?:Individual quota reached|quota(?:\s+limit)?\s+reached|You have exhausted your capacity)/i;
+  /(?:Individual quota reached|quota(?:\s+limit)?\s+reached|You have exhausted your (?:capacity|quota)|prepaid balance is insufficient)/i;
 const RESETS_IN_REGEX = /Resets in\s+([^\n.]+)/i;
 const API_ERROR_BANNER_REGEX =
   /^(?:[A-Z][A-Z0-9_]{2,}(?:\s*\(code\s*\d+\))?:\s+\S+|(?:API|RPC|Authentication|Network|Internal)\s+error\b.*|Error(?:\s*\(code\s*\d+\))?:\s+\S+)/;
@@ -32,7 +32,9 @@ export function parseAgyQuotaNotice(text: string): AgyQuotaNotice | undefined {
   const firstLine = trimmed.split("\n", 1)[0]?.trim() ?? "";
   const looksLikeBanner =
     firstLine.startsWith(QUOTA_PREFIX) ||
-    /^(?:Error:\s*)?Individual quota reached\b/i.test(firstLine);
+    /^(?:Error:\s*)?(?:Individual quota reached|Your organization's prepaid balance)\b/i.test(
+      firstLine,
+    );
   if (!looksLikeBanner || !QUOTA_CORE_REGEX.test(trimmed)) return undefined;
   if (trimmed.length > 400) return undefined;
 
